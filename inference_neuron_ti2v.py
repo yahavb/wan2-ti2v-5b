@@ -75,26 +75,32 @@ def main():
 
     config = WAN_CONFIGS['ti2v-5B']
 
-    # ── Load T5 on T5_RANK ──
+    # ── Load T5 on T5_RANK — on Neuron + compiled (like rolling-forcing) ──
     if rank == T5_RANK:
-        logger.info(f"Loading T5 on rank {T5_RANK}...")
+        logger.info(f"Loading T5 on rank {T5_RANK} (on Neuron with torch.compile)...")
         text_encoder = T5EncoderModel(
             text_len=config.text_len,
             dtype=config.t5_dtype,
             device=torch.device('cpu'),
             checkpoint_path=os.path.join(MODEL_PATH, config.t5_checkpoint),
             tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
-        logger.info("T5 loaded on CPU")
+        # Move T5 model to Neuron and compile
+        text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
+        text_encoder.model = torch.compile(text_encoder.model, backend='neuron', dynamic=False)
+        logger.info(f"T5 loaded on Neuron with torch.compile (rank {T5_RANK})")
     else:
         text_encoder = None
 
-    # ── Load VAE on VAE_RANK ──
+    # ── Load VAE on VAE_RANK — on Neuron + compiled (like rolling-forcing) ──
     if rank == VAE_RANK:
-        logger.info(f"Loading VAE on rank {VAE_RANK}...")
+        logger.info(f"Loading VAE on rank {VAE_RANK} (on Neuron with torch.compile)...")
         vae = Wan2_2_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
-        logger.info("VAE loaded on CPU")
+        # Move VAE model to Neuron and compile
+        vae.model = vae.model.to(dtype=torch.bfloat16, device=NEURON_DEVICE)
+        vae.model = torch.compile(vae.model, backend='neuron', dynamic=False)
+        logger.info(f"VAE loaded on Neuron with torch.compile (rank {VAE_RANK})")
     else:
         vae = None
 
@@ -139,17 +145,19 @@ def main():
     )
     n_prompt = config.sample_neg_prompt
 
+    # All ranks: allocate buffers on device (same operation everywhere)
+    ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+    ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+
     if rank == T5_RANK:
-        context = text_encoder([prompt], torch.device('cpu'))
-        context_null = text_encoder([n_prompt], torch.device('cpu'))
-        context = [t.to(NEURON_DEVICE) for t in context]
-        context_null = [t.to(NEURON_DEVICE) for t in context_null]
-        ctx_tensor = context[0].contiguous()
-        ctx_null_tensor = context_null[0].contiguous()
-    else:
-        # Allocate buffers - T5 output is [1, 512, 4096]
+        # T5 inference on Neuron — IDs go to device, model runs on device, output on device
+        context = text_encoder([prompt], NEURON_DEVICE)
+        context_null = text_encoder([n_prompt], NEURON_DEVICE)
+        # Pad to fixed size [1, 512, 4096] for broadcast
         ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+        ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
         ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
+        ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
 
     dist.broadcast(ctx_tensor, src=T5_RANK)
     dist.broadcast(ctx_null_tensor, src=T5_RANK)
@@ -208,9 +216,13 @@ def main():
     z_tensor_device = torch.zeros(z_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        z = vae.encode([img_tensor])
-        z_cpu = z[0].to(torch.bfloat16).contiguous()
-        z_tensor_device.copy_(z_cpu.to(NEURON_DEVICE))
+        # VAE encode on Neuron — input must be on device
+        img_device = img_tensor.to(dtype=torch.bfloat16, device=NEURON_DEVICE)
+        z = vae.encode([img_device])
+        z_result = z[0].to(torch.bfloat16).contiguous()
+        if z_result.device != NEURON_DEVICE:
+            z_result = z_result.to(NEURON_DEVICE)
+        z_tensor_device.copy_(z_result)
 
     dist.broadcast(z_tensor_device, src=VAE_RANK)
 
