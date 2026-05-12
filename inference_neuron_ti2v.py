@@ -123,17 +123,18 @@ def main():
     if rank == 0:
         logger.info("DiT moved to Neuron, compiling sub-modules...")
 
-    # Compile pure sub-modules
+    # Compile pure sub-modules (skip time_embedding/time_projection — they receive fp32
+    # sinusoidal input but have bf16 weights, which the Neuron compiler can't handle.
+    # They're tiny modules so eager mode is fine.)
     model.patch_embedding = torch.compile(model.patch_embedding, backend='neuron', dynamic=False)
     model.text_embedding = torch.compile(model.text_embedding, backend='neuron', dynamic=False)
-    model.time_embedding = torch.compile(model.time_embedding, backend='neuron', dynamic=False)
-    model.time_projection = torch.compile(model.time_projection, backend='neuron', dynamic=False)
+    # time_embedding and time_projection: keep in eager (fp32 input, bf16 weights)
     model.head = torch.compile(model.head, backend='neuron', dynamic=False)
     for block in model.blocks:
         block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
     if rank == 0:
-        logger.info(f"Compiled: patch_embed, text_embed, time_embed, time_proj, head, FFN x{len(model.blocks)}")
+        logger.info(f"Compiled: patch_embed, text_embed, head, FFN x{len(model.blocks)} (time_embed/proj in eager)")
 
     dist.barrier()
     if rank == 0:
