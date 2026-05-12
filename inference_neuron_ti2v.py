@@ -295,24 +295,26 @@ def main():
     # ── Decode with VAE on rank 0 ──
     if rank == VAE_RANK:
         logger.info("Decoding latents with VAE...")
-        x0 = [latent.cpu()]
+        # Pass latent on-device (VAE model + scale tensors are on Neuron)
+        x0 = [latent]
         videos = vae.decode(x0)
         video = videos[0]
 
         # Save video
         from torchvision.io import write_video
         output_path = "/tmp/wan2_ti2v_output.mp4"
-        video_np = ((video.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+        video_cpu = video.cpu().float()
+        video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
         if video_np.dim() == 4 and video_np.shape[0] == 3:
             video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
-        write_video(output_path, video_np.cpu(), fps=24)
+        write_video(output_path, video_np, fps=24)
         logger.info(f"Video saved to {output_path}")
 
-        # Copy to S3 PVC
+        # Copy to /var/mdl
         import shutil
         os.makedirs("/var/mdl/wan2_2_ti2v/outputs", exist_ok=True)
         shutil.copy(output_path, "/var/mdl/wan2_2_ti2v/outputs/")
-        logger.info("Video copied to S3 PVC")
+        logger.info(f"Video copied to /var/mdl/wan2_2_ti2v/outputs/")
 
     dist.barrier()
     if rank == 0:
