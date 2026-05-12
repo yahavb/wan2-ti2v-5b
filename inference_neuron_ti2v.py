@@ -1,4 +1,4 @@
- cuicrles """Wan2.2-TI2V-5B inference with TP4 on Neuron.
+"""Wan2.2-TI2V-5B inference with TP4 on Neuron.
 
 Uses torchrun --nproc_per_node=4 for tensor parallelism.
 DiT is TP-sharded across 4 NeuronCores.
