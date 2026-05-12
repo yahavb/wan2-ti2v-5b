@@ -255,8 +255,10 @@ def main():
     sample_scheduler.set_timesteps(50, device=torch.device("cpu"), shift=config.sample_shift)
     timesteps = sample_scheduler.timesteps
 
-    arg_c = {'context': [context[0]], 'seq_len': seq_len}
-    arg_null = {'context': context_null, 'seq_len': seq_len}
+    # Model expects context as list of 2D tensors [text_len, hidden_dim] (one per batch item)
+    # Our tensors are [1, 512, 4096] — squeeze batch dim to get [512, 4096]
+    arg_c = {'context': [context[0][0]], 'seq_len': seq_len}
+    arg_null = {'context': [context_null[0][0]], 'seq_len': seq_len}
 
     start_time = time.time()
     for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0))):
