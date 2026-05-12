@@ -16,6 +16,9 @@ sed -i "s/@torch.amp.autocast(.*)/# @autocast removed for Neuron/g" wan/modules/
 sed -i '/assert e.dtype == torch.float32/d' wan/modules/model.py
 sed -i '/assert e\[0\].dtype == torch.float32/d' wan/modules/model.py
 
+# model.py: cast sinusoidal embedding to bf16 (Neuron can't do mixed fp32×bf16 matmul)
+sed -i 's/\.float()/\.to(torch.bfloat16)/g' wan/modules/model.py
+
 # model.py: redirect flash_attention to SDPA attention
 sed -i 's/from .attention import flash_attention/from .attention import attention as flash_attention/g' wan/modules/model.py
 
