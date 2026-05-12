@@ -5,10 +5,9 @@ set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ─── Clone repos ─────────────────────────────────────────────
+# ─── Clone Wan2.2 source ─────────────────────────────────────
 cd /tmp
 git clone https://github.com/Wan-Video/Wan2.2.git
-git clone -b rolling-forcing https://yahavb:${GITHUB_TOKEN}@github.com/aws-neuron/aws-neuron-eks-samples.git
 
 # ─── Install deps from Wan2.2 ────────────────────────────────
 cd /tmp/Wan2.2
@@ -49,7 +48,6 @@ echo "Model weights ready at $MODEL_LOCAL"
 
 # ─── Launch with torchrun (TP=4) ─────────────────────────────
 export WAN_DIR=/tmp/Wan2.2
-export RF_DIR=/tmp/aws-neuron-eks-samples/rolling-forcing/app
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
 cd /tmp/Wan2.2

@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B inference with TP4 on Neuron.
+ cuicrles """Wan2.2-TI2V-5B inference with TP4 on Neuron.
 
 Uses torchrun --nproc_per_node=4 for tensor parallelism.
 DiT is TP-sharded across 4 NeuronCores.
@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 WAN_DIR = os.environ.get("WAN_DIR", "/tmp/Wan2.2")
 sys.path.insert(0, WAN_DIR)
 
-# Add rolling-forcing tp_utils to path
-RF_DIR = os.environ.get("RF_DIR", "/tmp/aws-neuron-eks-samples/rolling-forcing/app")
-sys.path.insert(0, RF_DIR)
+# Add this repo's root to path for models.tp_utils
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-TI2V-5B")
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "4"))
@@ -73,7 +73,7 @@ def main():
     # Import TP utilities from rolling-forcing
     from models.tp_utils import init_tp_group, shard_model_tp, get_tp_rank
 
-    config = WAN_CONFIGS['wan2.2-ti2v-5B']
+    config = WAN_CONFIGS['ti2v-5B']
 
     # ── Load T5 on T5_RANK ──
     if rank == T5_RANK:
