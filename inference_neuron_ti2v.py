@@ -100,6 +100,8 @@ def main():
         # Move VAE model to Neuron and compile
         vae.model = vae.model.to(dtype=torch.bfloat16, device=NEURON_DEVICE)
         vae.model = torch.compile(vae.model, backend='neuron', dynamic=False)
+        # Move VAE scale tensors to Neuron (used in encode/decode for normalization)
+        vae.scale = [s.to(NEURON_DEVICE) if isinstance(s, torch.Tensor) else s for s in vae.scale]
         logger.info(f"VAE loaded on Neuron with torch.compile (rank {VAE_RANK})")
     else:
         vae = None
