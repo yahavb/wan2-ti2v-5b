@@ -16,13 +16,12 @@ sed -i '/^from .attention/a from .rope_neuron import rope_params_neuron, rope_ap
 sed -i 's/rope_apply(q, grid_sizes, freqs)/rope_apply_neuron(q, grid_sizes, freqs)/g' wan/modules/model.py
 sed -i 's/rope_apply(k, grid_sizes, freqs)/rope_apply_neuron(k, grid_sizes, freqs)/g' wan/modules/model.py
 
-# Replace rope_params in __init__ (freqs = rope_params(...))
-# The original stores complex freqs; we store (cos, sin) tuple instead
-sed -i 's/self\.freqs = rope_params/self.freqs = rope_params_neuron/g' wan/modules/model.py
+# Replace all rope_params( calls with rope_params_neuron( in model.py
+# This covers the torch.cat([rope_params(1024, ...), ...]) in __init__
+sed -i 's/rope_params(/rope_params_neuron(/g' wan/modules/model.py
 
-# Remove torch.polar from rope_params (it will use rope_params_neuron instead)
-# Also patch the original rope_params function to not crash if still referenced
-sed -i 's/freqs = torch.polar(torch.ones_like(freqs), freqs)/freqs_cos = torch.cos(freqs); freqs_sin = torch.sin(freqs); return (freqs_cos, freqs_sin)  # Neuron: no complex/g' wan/modules/model.py
+# Note: rope_params_neuron returns a plain angles tensor (no complex/polar)
+# so the torch.cat in __init__ works unchanged. rope_apply_neuron computes cos/sin inline.
 
 # t5.py: replace CUDA device with CPU
 sed -i 's/device=torch.cuda.current_device()/device=torch.device("cpu")/g' wan/modules/t5.py
