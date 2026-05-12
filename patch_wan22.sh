@@ -26,6 +26,9 @@ sed -i 's/FLASH_ATTN_2_AVAILABLE = True/FLASH_ATTN_2_AVAILABLE = False/g' wan/mo
 # vae2_1.py: patch CUDA amp import
 sed -i 's/import torch.cuda.amp as amp/# import torch.cuda.amp as amp (patched)/g' wan/modules/vae2_1.py
 
+# vae2_2.py: patch CUDA amp import
+sed -i 's/import torch.cuda.amp as amp/# import torch.cuda.amp as amp (patched)/g' wan/modules/vae2_2.py
+
 # __init__.py: remove unused imports that pull heavy CUDA deps
 sed -i 's/from .speech2video import WanS2V/# patched/g' wan/__init__.py
 sed -i 's/from .animate import WanAnimate/# patched/g' wan/__init__.py

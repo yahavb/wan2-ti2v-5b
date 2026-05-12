@@ -66,7 +66,7 @@ def main():
     from wan.configs import WAN_CONFIGS
     from wan.modules.model import WanModel
     from wan.modules.t5 import T5EncoderModel
-    from wan.modules.vae2_1 import Wan2_1_VAE
+    from wan.modules.vae2_2 import Wan2_2_VAE
     from wan.utils.utils import best_output_size, masks_like
     from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
@@ -91,7 +91,7 @@ def main():
     # ── Load VAE on VAE_RANK ──
     if rank == VAE_RANK:
         logger.info(f"Loading VAE on rank {VAE_RANK}...")
-        vae = Wan2_1_VAE(
+        vae = Wan2_2_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
         logger.info("VAE loaded on CPU")
