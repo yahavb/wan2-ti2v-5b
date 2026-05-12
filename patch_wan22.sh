@@ -16,8 +16,11 @@ sed -i '/^from .attention/a from .rope_neuron import rope_params_neuron, rope_ap
 sed -i 's/rope_apply(q, grid_sizes, freqs)/rope_apply_neuron(q, grid_sizes, freqs)/g' wan/modules/model.py
 sed -i 's/rope_apply(k, grid_sizes, freqs)/rope_apply_neuron(k, grid_sizes, freqs)/g' wan/modules/model.py
 
-# Replace all rope_params( calls with rope_params_neuron( in model.py
-# This covers the torch.cat([rope_params(1024, ...), ...]) in __init__
+# Replace rope_params( calls with rope_params_neuron( in model.py
+# But don't rename the original function definition line
+# First: comment out the original rope_params function definition (it returns complex)
+sed -i 's/^def rope_params(/def _rope_params_original(/' wan/modules/model.py
+# Then: replace all call sites
 sed -i 's/rope_params(/rope_params_neuron(/g' wan/modules/model.py
 
 # Note: rope_params_neuron returns a plain angles tensor (no complex/polar)

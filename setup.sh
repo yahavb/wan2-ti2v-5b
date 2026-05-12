@@ -46,12 +46,12 @@ snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='${MODEL_LOCAL}', local_dir
 fi
 echo "Model weights ready at $MODEL_LOCAL"
 
-# ─── Launch with torchrun (TP=4) ─────────────────────────────
+# ─── Launch with torchrun (TP=8) ─────────────────────────────
 export WAN_DIR=/tmp/Wan2.2
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
 cd /tmp/Wan2.2
-torchrun --nproc_per_node=${TP_DEGREE:-4} --master_port=29500 \
+torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
   "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1
 
 echo "═══════════════════════════════════════════"

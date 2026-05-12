@@ -1,12 +1,12 @@
-"""Wan2.2-TI2V-5B inference with TP4 on Neuron.
+"""Wan2.2-TI2V-5B inference with TP8 on Neuron.
 
-Uses torchrun --nproc_per_node=4 for tensor parallelism.
-DiT is TP-sharded across 4 NeuronCores.
-T5 on rank 2 (ND1), VAE on rank 0 (ND0).
+Uses torchrun --nproc_per_node=8 for tensor parallelism.
+DiT is TP-sharded across 8 NeuronCores (2 NDs).
+T5 on rank 4 (ND1:NC0), VAE on rank 0 (ND0:NC0).
 
 Architecture (Wan2.2-TI2V-5B):
   dim=3072, 24 heads, 30 layers, ffn_dim=14336
-  TP=4: 6 heads/rank, ~1.25B params/rank (~2.5GB bf16)
+  TP=8: 3 heads/rank, ~660M params/rank (~1.3GB bf16)
 """
 import os
 import sys
@@ -41,8 +41,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-TI2V-5B")
-TP_DEGREE = int(os.environ.get("TP_DEGREE", "4"))
-T5_RANK = int(os.environ.get("T5_RANK", "2"))
+TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
+T5_RANK = int(os.environ.get("T5_RANK", "4"))
 VAE_RANK = 0
 
 NEURON_DEVICE = torch.device("neuron")
@@ -167,6 +167,11 @@ def main():
     dist.broadcast(ctx_null_tensor, src=T5_RANK)
     context = [ctx_tensor]
     context_null = [ctx_null_tensor]
+
+    # Free T5 after encoding to reclaim memory
+    if rank == T5_RANK:
+        del text_encoder
+        gc.collect()
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast to all ranks")
