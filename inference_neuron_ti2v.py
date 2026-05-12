@@ -201,22 +201,23 @@ def main():
         oh // vae_stride[1], ow // vae_stride[2],
         dtype=torch.float32, generator=seed_g, device=torch.device("cpu"))
 
-    # Encode image with VAE on rank 0
+    # Encode image with VAE on rank 0, broadcast z to all ranks
+    z_shape = (z_dim, (F - 1) // vae_stride[0] + 1, oh // vae_stride[1], ow // vae_stride[2])
+
+    # All ranks: allocate z buffer on NEURON_DEVICE with SAME dtype (critical for collective signature match)
+    z_tensor_device = torch.zeros(z_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
+
     if rank == VAE_RANK:
         z = vae.encode([img_tensor])
-        z_tensor = z[0].contiguous()
-    else:
-        z_shape = (z_dim, (F - 1) // vae_stride[0] + 1, oh // vae_stride[1], ow // vae_stride[2])
-        z_tensor = torch.zeros(z_shape, dtype=torch.float32)
+        z_cpu = z[0].to(torch.bfloat16).contiguous()
+        z_tensor_device.copy_(z_cpu.to(NEURON_DEVICE))
 
-    # Broadcast z to all ranks
-    z_tensor_device = z_tensor.to(NEURON_DEVICE)
     dist.broadcast(z_tensor_device, src=VAE_RANK)
 
-    # Move noise to neuron
-    noise = noise.to(NEURON_DEVICE)
+    # All ranks: move noise to neuron (same dtype everywhere)
+    noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
     mask1, mask2 = masks_like([noise.cpu()], zero=True)
-    mask2_device = [m.to(NEURON_DEVICE) for m in mask2]
+    mask2_device = [m.to(torch.bfloat16).to(NEURON_DEVICE) for m in mask2]
 
     latent = noise
     latent = (1. - mask2_device[0]) * z_tensor_device + mask2_device[0] * latent
