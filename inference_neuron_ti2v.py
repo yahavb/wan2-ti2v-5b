@@ -205,17 +205,22 @@ def main():
     seed_g = torch.Generator(device=torch.device("cpu"))
     seed_g.manual_seed(seed)
 
-    z_dim = 16  # Wan VAE z_dim
+    # Wan2.2 VAE z_dim from config (48 for Wan2.2, 16 for Wan2.1)
+    z_dim = config.vae_dim[0] if hasattr(config, 'vae_dim') else 48
+    T_latent = (F - 1) // vae_stride[0] + 1  # 21 for 81 frames
+    H_latent = oh // vae_stride[1]
+    W_latent = ow // vae_stride[2]
+
     noise = torch.randn(
-        z_dim, (F - 1) // vae_stride[0] + 1,
-        oh // vae_stride[1], ow // vae_stride[2],
+        z_dim, T_latent, H_latent, W_latent,
         dtype=torch.float32, generator=seed_g, device=torch.device("cpu"))
 
     # Encode image with VAE on rank 0, broadcast z to all ranks
-    z_shape = (z_dim, (F - 1) // vae_stride[0] + 1, oh // vae_stride[1], ow // vae_stride[2])
+    # VAE encode of a single image gives [z_dim, 1, H', W']
+    z_img_shape = (z_dim, 1, H_latent, W_latent)
 
-    # All ranks: allocate z buffer on NEURON_DEVICE with SAME dtype (critical for collective signature match)
-    z_tensor_device = torch.zeros(z_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
+    # All ranks: allocate z buffer for image encoding
+    z_img_device = torch.zeros(z_img_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
         # VAE encode on Neuron — input must be on device
@@ -224,17 +229,19 @@ def main():
         z_result = z[0].to(torch.bfloat16).contiguous()
         if z_result.device != NEURON_DEVICE:
             z_result = z_result.to(NEURON_DEVICE)
-        z_tensor_device.copy_(z_result)
+        z_img_device.copy_(z_result)
 
-    dist.broadcast(z_tensor_device, src=VAE_RANK)
+    dist.broadcast(z_img_device, src=VAE_RANK)
 
     # All ranks: move noise to neuron (same dtype everywhere)
     noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
     mask1, mask2 = masks_like([noise.cpu()], zero=True)
     mask2_device = [m.to(torch.bfloat16).to(NEURON_DEVICE) for m in mask2]
 
-    latent = noise
-    latent = (1. - mask2_device[0]) * z_tensor_device + mask2_device[0] * latent
+    # Build latent: image occupies temporal position 0, noise fills the rest
+    # z_img_device is [z_dim, 1, H', W'], noise is [z_dim, T_latent, H', W']
+    latent = noise.clone()
+    latent = (1. - mask2_device[0]) * z_img_device.expand_as(noise) + mask2_device[0] * latent
 
     if rank == 0:
         logger.info(f"Image encoded, noise prepared. Starting denoising (50 steps)...")
@@ -270,7 +277,7 @@ def main():
             latent.cpu().unsqueeze(0),
             return_dict=False, generator=seed_g)[0]
         latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
-        latent = (1. - mask2_device[0]) * z_tensor_device + mask2_device[0] * latent
+        latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
 
     denoise_time = time.time() - start_time
     if rank == 0:
