@@ -90,16 +90,17 @@ def main():
     else:
         text_encoder = None
 
-    # ── Load VAE on VAE_RANK — on Neuron + compiled (like rolling-forcing) ──
+    # ── Load VAE on VAE_RANK — on Neuron with NKI kernels ──
     if rank == VAE_RANK:
-        logger.info(f"Loading VAE on rank {VAE_RANK} (on Neuron with torch.compile)...")
+        logger.info(f"Loading VAE on rank {VAE_RANK} (on Neuron with NKI kernels)...")
         vae = Wan2_2_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
-        # Keep VAE on CPU (eager) — avoids HBM OOM from 400+ compiled NEFFs
-        vae.model = vae.model.to(dtype=torch.float32)
-        vae.scale = [s.cpu().float() if isinstance(s, torch.Tensor) else s for s in vae.scale]
-        logger.info(f"VAE loaded on CPU eager (rank {VAE_RANK})")
+        # Move VAE to Neuron — NKI kernels handle conv2d/attention natively
+        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        # Move scale tensors to Neuron too
+        vae.scale = [s.to(device=NEURON_DEVICE, dtype=torch.bfloat16) if isinstance(s, torch.Tensor) else s for s in vae.scale]
+        logger.info("VAE loaded on Neuron with NKI kernels")
     else:
         vae = None
 
@@ -287,11 +288,10 @@ def main():
     if rank == 0:
         logger.info(f"Denoising done in {denoise_time:.1f}s")
 
-    # ── Decode with VAE on rank 0 ──
+    # ── Decode with VAE on rank 0 (on Neuron with NKI kernels) ──
     if rank == VAE_RANK:
-        logger.info("Decoding latents with VAE...")
-        # VAE decode on CPU (eager) — Neuron OOMs with compiled VAE NEFFs
-        x0 = [latent.cpu().float()]
+        logger.info("Decoding latents with VAE on Neuron (NKI kernels)...")
+        x0 = [latent.to(torch.bfloat16)]
         videos = vae.decode(x0)
         video = videos[0]
 
