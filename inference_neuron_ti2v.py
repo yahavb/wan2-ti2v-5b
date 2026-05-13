@@ -42,7 +42,7 @@ sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-TI2V-5B")
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
-T5_RANK = int(os.environ.get("T5_RANK", "4"))
+T5_RANK = int(os.environ.get("T5_RANK", "8"))
 VAE_RANK = 0
 
 NEURON_DEVICE = torch.device("neuron")
