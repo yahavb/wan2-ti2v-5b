@@ -47,7 +47,14 @@ export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
 cd "${SCRIPT_DIR}"
 torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
-  "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1
+  "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1 || true
+
+# Copy output video to S3-backed PVC (shutil.copy fails on S3 FUSE)
+if [[ -f /tmp/wan2_ti2v_output.mp4 ]]; then
+  mkdir -p /var/mdl/wan2_2_ti2v/outputs
+  cp /tmp/wan2_ti2v_output.mp4 /var/mdl/wan2_2_ti2v/outputs/
+  echo "Video copied to /var/mdl/wan2_2_ti2v/outputs/"
+fi
 
 echo "═══════════════════════════════════════════"
 echo "  Done!"

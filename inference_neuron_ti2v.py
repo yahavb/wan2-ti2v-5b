@@ -306,11 +306,7 @@ def main():
         imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
         logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
-        # Copy to /var/mdl
-        import shutil
-        os.makedirs("/var/mdl/wan2_2_ti2v/outputs", exist_ok=True)
-        shutil.copy(output_path, "/var/mdl/wan2_2_ti2v/outputs/")
-        logger.info(f"Video copied to /var/mdl/wan2_2_ti2v/outputs/")
+        # Note: copy to S3-backed PVC done via bash cp in setup.sh (shutil.copy fails on S3 FUSE)
 
     dist.barrier()
     if rank == 0:
