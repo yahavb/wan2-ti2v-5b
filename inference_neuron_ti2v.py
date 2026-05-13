@@ -295,8 +295,11 @@ def main():
     # ── Decode with VAE on rank 0 ──
     if rank == VAE_RANK:
         logger.info("Decoding latents with VAE...")
-        # Pass latent on-device (VAE model + scale tensors are on Neuron)
-        x0 = [latent]
+        # Move VAE to CPU for decode (avoids Neuron dtype promotion issues:
+        # z / scale promotes to float32 but Conv3d weights are bf16)
+        vae.model = vae.model.cpu().float()
+        vae.scale = [s.cpu().float() if isinstance(s, torch.Tensor) else s for s in vae.scale]
+        x0 = [latent.cpu().float()]
         videos = vae.decode(x0)
         video = videos[0]
 
