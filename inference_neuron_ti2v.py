@@ -228,10 +228,12 @@ def main():
     z_img_device = torch.zeros(z_img_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        # VAE encode on CPU (eager) — then move result to Neuron for broadcast
-        img_cpu = img_tensor.to(dtype=torch.float32)
-        z = vae.encode([img_cpu])
-        z_result = z[0].to(torch.bfloat16).contiguous().to(NEURON_DEVICE)
+        # VAE encode on Neuron — input must be bf16 to match model weights
+        img_neuron = img_tensor.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        z = vae.encode([img_neuron])
+        z_result = z[0].to(torch.bfloat16).contiguous()
+        if z_result.device != NEURON_DEVICE:
+            z_result = z_result.to(NEURON_DEVICE)
         z_img_device.copy_(z_result)
 
     dist.broadcast(z_img_device, src=VAE_RANK)
