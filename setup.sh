@@ -51,23 +51,11 @@ export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
 cd "${SCRIPT_DIR}"
-echo "═══════════════════════════════════════════"
-echo "  Run 1 (includes compilation)"
-echo "═══════════════════════════════════════════"
-RUN1_START=$(date +%s)
+# Runs NUM_RUNS iterations inside the same process (default 2).
+# Run 1 = cold (includes compilation), Run 2 = warm (no recompile).
+# NUM_STEPS controls denoising steps (default 10).
 torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
   "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1 || true
-RUN1_END=$(date +%s)
-echo ">>> Run 1 total time: $((RUN1_END - RUN1_START))s"
-
-echo "═══════════════════════════════════════════"
-echo "  Run 2 (warm — no compilation)"
-echo "═══════════════════════════════════════════"
-RUN2_START=$(date +%s)
-torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29501 \
-  "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1 || true
-RUN2_END=$(date +%s)
-echo ">>> Run 2 total time: $((RUN2_END - RUN2_START))s"
 
 # Copy output video to S3-backed PVC (shutil.copy fails on S3 FUSE)
 if [[ -f /tmp/wan2_ti2v_output.mp4 ]]; then

@@ -248,72 +248,85 @@ def main():
     latent = noise.clone()
     latent = (1. - mask2_device[0]) * z_img_device.expand_as(noise) + mask2_device[0] * latent
 
-    if rank == 0:
-        logger.info(f"Image encoded, noise prepared. Starting denoising (20 steps)...")
-
-    # ── Denoising loop ──
-    sample_scheduler = FlowUniPCMultistepScheduler(
-        num_train_timesteps=config.num_train_timesteps,
-        shift=1, use_dynamic_shifting=False)
-    sample_scheduler.set_timesteps(20, device=torch.device("cpu"), shift=config.sample_shift)
-    timesteps = sample_scheduler.timesteps
+    NUM_STEPS = int(os.environ.get("NUM_STEPS", "10"))
+    NUM_RUNS = int(os.environ.get("NUM_RUNS", "2"))
 
     # Model expects context as list of 2D tensors [text_len, hidden_dim] (one per batch item)
     # Our tensors are [1, 512, 4096] — squeeze batch dim to get [512, 4096]
     arg_c = {'context': [context[0][0]], 'seq_len': seq_len}
     arg_null = {'context': [context_null[0][0]], 'seq_len': seq_len}
 
-    start_time = time.time()
-    for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0))):
-        latent_model_input = [latent]
+    # Save original latent for re-use across runs
+    latent_orig = latent.clone()
 
-        t_device = t.to(NEURON_DEVICE)
-        temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
-        temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
-        timestep = temp_ts.unsqueeze(0)
+    for run_idx in range(NUM_RUNS):
+        run_label = f"Run {run_idx+1}/{NUM_RUNS}"
+        if rank == 0:
+            logger.info(f"═══ {run_label} ({NUM_STEPS} steps) ═══")
 
-        noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-        noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+        # Reset latent to original for each run
+        latent = latent_orig.clone()
 
-        guide_scale = config.sample_guide_scale
-        noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+        # ── Denoising loop ──
+        sample_scheduler = FlowUniPCMultistepScheduler(
+            num_train_timesteps=config.num_train_timesteps,
+            shift=1, use_dynamic_shifting=False)
+        sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
+        timesteps = sample_scheduler.timesteps
 
-        # Scheduler step on CPU
-        temp_x0 = sample_scheduler.step(
-            noise_pred.cpu().unsqueeze(0), t,
-            latent.cpu().unsqueeze(0),
-            return_dict=False, generator=seed_g)[0]
-        latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
-        latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
+        run_start = time.time()
+        denoise_start = time.time()
+        for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
+            latent_model_input = [latent]
 
-    denoise_time = time.time() - start_time
-    if rank == 0:
-        logger.info(f"Denoising done in {denoise_time:.1f}s")
+            t_device = t.to(NEURON_DEVICE)
+            temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
+            temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
+            timestep = temp_ts.unsqueeze(0)
 
-    # ── Decode with VAE on rank 0 (on Neuron with NKI kernels) ──
-    if rank == VAE_RANK:
-        logger.info("Decoding latents with VAE on Neuron (NKI kernels)...")
-        x0 = [latent.to(torch.bfloat16)]
-        videos = vae.decode(x0)
-        video = videos[0]
+            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
-        # Save video using imageio (no PyAV dependency)
-        import imageio
-        output_path = "/tmp/wan2_ti2v_output.mp4"
-        video_cpu = video.cpu().float()
-        video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
-        if video_np.dim() == 4 and video_np.shape[0] == 3:
-            video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
-        frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-        imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
-        logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+            guide_scale = config.sample_guide_scale
+            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
-        # Note: copy to S3-backed PVC done via bash cp in setup.sh (shutil.copy fails on S3 FUSE)
+            # Scheduler step on CPU
+            temp_x0 = sample_scheduler.step(
+                noise_pred.cpu().unsqueeze(0), t,
+                latent.cpu().unsqueeze(0),
+                return_dict=False, generator=seed_g)[0]
+            latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
+            latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
 
-    dist.barrier()
-    if rank == 0:
-        logger.info(f"Total denoising time: {denoise_time:.1f}s")
-        logger.info("Done!")
+        denoise_time = time.time() - denoise_start
+        if rank == 0:
+            logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
+
+        # ── Decode with VAE on rank 0 (on Neuron with NKI kernels) ──
+        vae_start = time.time()
+        if rank == VAE_RANK:
+            logger.info(f"{run_label} VAE decode on Neuron...")
+            x0 = [latent.to(torch.bfloat16)]
+            videos = vae.decode(x0)
+            video = videos[0]
+
+            # Save video using imageio (no PyAV dependency)
+            import imageio
+            output_path = "/tmp/wan2_ti2v_output.mp4"
+            video_cpu = video.cpu().float()
+            video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+            if video_np.dim() == 4 and video_np.shape[0] == 3:
+                video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
+            frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
+            imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+            logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+
+        dist.barrier()
+        vae_time = time.time() - vae_start
+        run_time = time.time() - run_start
+
+        if rank == 0:
+            logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
 
     dist.destroy_process_group()
 
