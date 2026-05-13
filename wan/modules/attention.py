@@ -184,3 +184,6 @@ def attention(
     
     out = out.transpose(1, 2).contiguous()
     return out
+
+# Alias for backward compatibility (wan/modules/__init__.py imports flash_attention)
+flash_attention = attention
