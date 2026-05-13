@@ -32,8 +32,8 @@ for name in ['torch', 'transformers', 'torch_neuronx', 'torch_mlir']:
     logging.getLogger(name).setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
-# Add Wan2.2 to path
-WAN_DIR = os.environ.get("WAN_DIR", "/tmp/Wan2.2")
+# Add Wan2.2 to path (pre-patched wan/ directory is in this repo)
+WAN_DIR = os.environ.get("WAN_DIR", os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, WAN_DIR)
 
 # Add this repo's root to path for models.tp_utils

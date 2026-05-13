@@ -1,25 +1,19 @@
 #!/bin/bash
 # setup.sh - Main entrypoint for Wan2.2-TI2V-5B on Neuron
-# Clones deps, installs packages, patches Wan2.2, downloads model, launches torchrun
+# Installs deps, downloads model, launches torchrun
+# Wan2.2 source is pre-patched and included in this repo (wan/ directory)
 set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ─── Clone Wan2.2 source ─────────────────────────────────────
-cd /tmp
-git clone https://github.com/Wan-Video/Wan2.2.git
-
-# ─── Install deps from Wan2.2 ────────────────────────────────
-cd /tmp/Wan2.2
-sed -i '/flash_attn/d' requirements.txt
-sed -i '/torchaudio/d' requirements.txt
-uv pip install -r requirements.txt
+# ─── Install deps ─────────────────────────────────────────────
+cd "${SCRIPT_DIR}"
+# Remove CUDA-only deps from requirements
+sed -i '/flash_attn/d' wan_requirements.txt
+sed -i '/torchaudio/d' wan_requirements.txt
+uv pip install -r wan_requirements.txt
 uv pip install "setuptools<81"
 uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
-
-# ─── Patch Wan2.2 for Neuron ─────────────────────────────────
-cd /tmp/Wan2.2
-bash "${SCRIPT_DIR}/patch_wan22.sh"
 
 # ─── Model caching (S3-backed PVC tar pattern) ───────────────
 MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
@@ -47,10 +41,10 @@ fi
 echo "Model weights ready at $MODEL_LOCAL"
 
 # ─── Launch with torchrun (TP=8) ─────────────────────────────
-export WAN_DIR=/tmp/Wan2.2
+export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
-cd /tmp/Wan2.2
+cd "${SCRIPT_DIR}"
 torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
   "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1
 
