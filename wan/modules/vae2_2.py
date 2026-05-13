@@ -816,6 +816,8 @@ class WanVAE_(nn.Module):
                 1, self.z_dim, 1, 1, 1)
         else:
             z = z / scale[1] + scale[0]
+        # Cast back to model dtype after scale division (avoids float32 vs bf16 mismatch in conv2)
+        z = z.to(self.conv2.weight.dtype)
         iter_ = z.shape[2]
         x = self.conv2(z)
         for i in range(iter_):
