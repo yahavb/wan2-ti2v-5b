@@ -51,7 +51,16 @@ export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
 cd "${SCRIPT_DIR}"
+echo "═══════════════════════════════════════════"
+echo "  Run 1 (includes compilation)"
+echo "═══════════════════════════════════════════"
 torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
+  "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1 || true
+
+echo "═══════════════════════════════════════════"
+echo "  Run 2 (warm — no compilation)"
+echo "═══════════════════════════════════════════"
+torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29501 \
   "${SCRIPT_DIR}/inference_neuron_ti2v.py" 2>&1 || true
 
 # Copy output video to S3-backed PVC (shutil.copy fails on S3 FUSE)
