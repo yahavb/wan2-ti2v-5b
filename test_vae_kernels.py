@@ -1,7 +1,7 @@
 """Test suite for VAE NKI kernels — conv2d_k1, conv2d_k3_shifted, vae_self_attention.
 
-Run on Neuron instance:
-    NEURON_RT_NUM_CORES=2 python test_vae_kernels.py
+Run on Neuron instance (DRA populates NEURON_RT_NUM_CORES):
+    python test_vae_kernels.py
 
 Tests each kernel against a CPU PyTorch reference implementation.
 Follows the exact same pattern as test_all_kernels.py from rolling-forcing.
@@ -17,9 +17,6 @@ import os
 import sys
 import math
 import traceback
-
-if "NEURON_RT_NUM_CORES" not in os.environ:
-    os.environ["NEURON_RT_NUM_CORES"] = "2"
 
 import torch
 import torch.nn as nn

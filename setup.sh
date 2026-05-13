@@ -44,7 +44,7 @@ echo "Model weights ready at $MODEL_LOCAL"
 # ─── Run VAE NKI kernel tests ─────────────────────────────────
 echo "Running VAE NKI kernel accuracy tests..."
 cd "${SCRIPT_DIR}"
-NEURON_RT_NUM_CORES=2 python test_vae_kernels.py
+python test_vae_kernels.py
 echo "VAE kernel tests passed!"
 
 # ─── Launch with torchrun (TP=8) ─────────────────────────────
