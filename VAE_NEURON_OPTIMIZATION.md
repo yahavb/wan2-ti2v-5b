@@ -192,3 +192,90 @@ wan2-ti2v-5b/
 2. **No fused ResidualBlock kernel** — instead, we use vae_conv2d_k3 as a building block and keep RMSNorm + SiLU in eager. This is simpler to debug and still reduces NEFFs drastically (each unique shape → 1 NEFF instead of 6-8).
 3. **Cache management stays in eager** — the causal cache logic (feat_cache, feat_idx, torch.cat) runs in Python, not in the NKI kernel. This avoids graph breaks entirely.
 4. **VAE dtype fix** — `z.to(self.conv2.weight.dtype)` after scale division prevents NaN from fp32/bf16 mismatch.
+
+---
+
+## Future: VAE Tensor Parallelism (TP) Analysis
+
+Currently the VAE runs on a **single NeuronCore** (rank 0). Below is the analysis of what it would take to shard it across multiple cores.
+
+### Current Architecture (Decoder)
+
+| Layer Type | Count | Params | Notes |
+|------------|-------|--------|-------|
+| CausalConv3d (3×3×3) | ~35 | ~150M | Main compute |
+| CausalConv3d (1×1×1) | ~5 | ~15M | Shortcuts + head/tail |
+| AttentionBlock | 1 | ~12M | Single-head, dim=1024 |
+| Upsample + Conv2d | 3 | ~10M | Spatial upsampling |
+| RMS_norm + SiLU | ~40 | ~0.5M | Element-wise (trivially parallel) |
+
+### Why TP is Non-Trivial for VAE
+
+#### 1. CausalConv3d — 840 collective ops per decode
+
+Each CausalConv3d has input `(B, C_in, T, H, W)` → output `(B, C_out, T, H, W)`.
+
+**TP strategy**: Split `C_out` across ranks. Each rank computes `C_out/TP` output channels.
+
+**Problem**: The NEXT conv needs ALL `C_in` channels as input (each output pixel depends on all input channels). So you need an **allgather** after every conv layer:
+
+```python
+# Current (single rank):
+x = conv3d(x)  # full C_in → full C_out
+
+# With TP (shard output channels):
+x = conv3d_sharded(x)        # full C_in → C_out/TP (local)
+x = allgather(x, dim=1)      # C_out/TP → C_out (global) ← COMMUNICATION
+```
+
+The decoder has ~40 CausalConv3d layers. Decode processes 21 temporal frames sequentially:
+- **40 convs × 21 frames = 840 allgather/allreduce ops per decode**
+
+#### 2. AttentionBlock — Single-head, can't split heads
+
+The VAE attention is single-head: `(B*T, 1, seq, dim=1024)`. Standard attention TP splits across heads — but there's only 1 head.
+
+**Workaround**: Fake multi-head by reshaping `dim=1024` → `(TP, dim/TP)`, shard across ranks, allgather output. But this changes the computation semantics slightly (interleaved vs. contiguous channel blocks).
+
+#### 3. ResidualBlock skip connections
+
+```python
+x = main_path(x) + shortcut(x)
+```
+
+If main path and shortcut are sharded differently (different C_out dims), the `+` requires both tensors in the same layout. Need allgather before the add.
+
+#### 4. Temporal cache consistency
+
+Each CausalConv3d caches last 2 frames (`feat_cache`). With sharded channels, each rank only has `C/TP` channels in its cache. This works IF sharding is consistent across temporal steps (it is). But debugging is harder.
+
+### Performance Estimate
+
+| Metric | Single Core | TP=4 (theoretical) |
+|--------|-------------|---------------------|
+| Conv compute per frame | ~500ms | ~125ms |
+| Allgather per op (3MB, 4 ranks) | — | ~200μs |
+| Allgathers per frame (40 ops) | — | ~8ms |
+| Total per frame | ~500ms | ~133ms |
+| Total 21 frames | ~10.5s | ~2.8s |
+| Communication overhead | 0 | ~168ms total |
+
+**Theoretical speedup**: ~3.7× with TP=4 (diminishing returns beyond that for 200M params).
+
+### Alternative: Pipeline Parallelism (temporal)
+
+The decoder already processes frames sequentially (`for i in range(21)`). Instead of TP within a frame, we could **pipeline frames across cores**:
+
+- Core 0: processes frame 0, then frame 4, then frame 8...
+- Core 1: processes frame 1, then frame 5, then frame 9...
+- Etc.
+
+**Problem**: Causal caching — frame `i` depends on frame `i-1`'s cache. Frames can't be processed independently. The decoder is inherently **sequential** in the temporal dimension.
+
+### Recommendation
+
+1. **Current approach (single core + NKI kernels)** is the right first step
+2. **Measure actual single-core latency** (Run 2 warm timing) before deciding
+3. **If VAE decode > 15s**, consider TP=2 or TP=4 with allreduce-based sharding
+4. **If VAE decode < 5s**, TP is not worth the 840 collective ops overhead
+5. **Alternative optimization**: reduce temporal frames (81→41 frames = 11 decode iterations instead of 21)
