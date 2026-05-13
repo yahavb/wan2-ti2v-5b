@@ -303,9 +303,6 @@ def test_vae_attention():
             v = torch.randn(1, seq_raw, d, dtype=torch.bfloat16)
             identity = torch.eye(128, dtype=torch.bfloat16)
 
-            # CPU reference
-            ref = _sdpa_ref(q, k, v, scale)  # (seq_raw, 1, d)
-
             # Pad for NKI kernel (seq to multiple of 512)
             if pad > 0:
                 q_padded = F.pad(q, (0, pad))
@@ -316,6 +313,9 @@ def test_vae_attention():
                 k_padded = k
                 v_padded = v
 
+            # CPU reference on PADDED inputs (apples-to-apples: NKI sees padding too)
+            ref_padded = _sdpa_ref(q_padded, k_padded, v_padded, scale)  # (seq, 1, d)
+
             out = wrapped(
                 q_padded.to(DEVICE),
                 k_padded.to(DEVICE),
@@ -324,8 +324,9 @@ def test_vae_attention():
                 softmax_scale=scale
             ).cpu()
 
-            # Trim to actual seq length
+            # Trim both to actual seq length
             out = out[:seq_raw]
+            ref = ref_padded[:seq_raw]
 
             diff = (out.float() - ref.float()).abs().max().item()
             record(f"vae_attn: {name} (d={d},seq={seq_raw}→{seq})", diff)
