@@ -251,13 +251,13 @@ def main():
     latent = (1. - mask2_device[0]) * z_img_device.expand_as(noise) + mask2_device[0] * latent
 
     if rank == 0:
-        logger.info(f"Image encoded, noise prepared. Starting denoising (50 steps)...")
+        logger.info(f"Image encoded, noise prepared. Starting denoising (20 steps)...")
 
     # ── Denoising loop ──
     sample_scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=config.num_train_timesteps,
         shift=1, use_dynamic_shifting=False)
-    sample_scheduler.set_timesteps(50, device=torch.device("cpu"), shift=config.sample_shift)
+    sample_scheduler.set_timesteps(20, device=torch.device("cpu"), shift=config.sample_shift)
     timesteps = sample_scheduler.timesteps
 
     # Model expects context as list of 2D tensors [text_len, hidden_dim] (one per batch item)
