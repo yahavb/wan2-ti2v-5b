@@ -184,7 +184,7 @@ def main():
 
     vae_stride = config.vae_stride  # (4, 16, 16)
     patch_size = config.patch_size   # (1, 2, 2)
-    frame_num = 81
+    frame_num = 17
     max_area = 704 * 1280
 
     ih, iw = img.height, img.width
