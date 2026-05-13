@@ -14,6 +14,7 @@ sed -i '/torchaudio/d' wan_requirements.txt
 uv pip install -r wan_requirements.txt
 uv pip install "setuptools<81"
 uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+uv pip install imageio imageio-ffmpeg
 
 # ─── Model caching (S3-backed PVC tar pattern) ───────────────
 MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
