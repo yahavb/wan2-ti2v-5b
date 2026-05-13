@@ -41,6 +41,12 @@ snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='${MODEL_LOCAL}', local_dir
 fi
 echo "Model weights ready at $MODEL_LOCAL"
 
+# ─── Run VAE NKI kernel tests ─────────────────────────────────
+echo "Running VAE NKI kernel accuracy tests..."
+cd "${SCRIPT_DIR}"
+NEURON_RT_NUM_CORES=2 python test_vae_kernels.py
+echo "VAE kernel tests passed!"
+
 # ─── Launch with torchrun (TP=8) ─────────────────────────────
 export WAN_DIR="${SCRIPT_DIR}"
 export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
