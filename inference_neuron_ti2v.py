@@ -86,8 +86,7 @@ def main():
             tokenizer_path=os.path.join(MODEL_PATH, config.t5_tokenizer))
         # Move T5 model to Neuron and compile
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
-        text_encoder.model = torch.compile(text_encoder.model, backend='neuron', dynamic=False)
-        logger.info(f"T5 loaded on Neuron with torch.compile (rank {T5_RANK})")
+        logger.info(f"T5 loaded on Neuron eager (rank {T5_RANK})")
     else:
         text_encoder = None
 
@@ -97,12 +96,10 @@ def main():
         vae = Wan2_2_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
-        # Move VAE model to Neuron and compile
-        vae.model = vae.model.to(dtype=torch.bfloat16, device=NEURON_DEVICE)
-        vae.model = torch.compile(vae.model, backend='neuron', dynamic=False)
-        # Move VAE scale tensors to Neuron (used in encode/decode for normalization)
-        vae.scale = [s.to(NEURON_DEVICE) if isinstance(s, torch.Tensor) else s for s in vae.scale]
-        logger.info(f"VAE loaded on Neuron with torch.compile (rank {VAE_RANK})")
+        # Keep VAE on CPU (eager) — avoids HBM OOM from 400+ compiled NEFFs
+        vae.model = vae.model.to(dtype=torch.float32)
+        vae.scale = [s.cpu().float() if isinstance(s, torch.Tensor) else s for s in vae.scale]
+        logger.info(f"VAE loaded on CPU eager (rank {VAE_RANK})")
     else:
         vae = None
 
@@ -184,8 +181,8 @@ def main():
 
     vae_stride = config.vae_stride  # (4, 16, 16)
     patch_size = config.patch_size   # (1, 2, 2)
-    frame_num = 17
-    max_area = 704 * 1280
+    frame_num = 5
+    max_area = 480 * 832
 
     ih, iw = img.height, img.width
     dh = patch_size[1] * vae_stride[1]
@@ -230,12 +227,10 @@ def main():
     z_img_device = torch.zeros(z_img_shape, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == VAE_RANK:
-        # VAE encode on Neuron — input must be on device
-        img_device = img_tensor.to(dtype=torch.bfloat16, device=NEURON_DEVICE)
-        z = vae.encode([img_device])
-        z_result = z[0].to(torch.bfloat16).contiguous()
-        if z_result.device != NEURON_DEVICE:
-            z_result = z_result.to(NEURON_DEVICE)
+        # VAE encode on CPU (eager) — then move result to Neuron for broadcast
+        img_cpu = img_tensor.to(dtype=torch.float32)
+        z = vae.encode([img_cpu])
+        z_result = z[0].to(torch.bfloat16).contiguous().to(NEURON_DEVICE)
         z_img_device.copy_(z_result)
 
     dist.broadcast(z_img_device, src=VAE_RANK)
@@ -251,13 +246,13 @@ def main():
     latent = (1. - mask2_device[0]) * z_img_device.expand_as(noise) + mask2_device[0] * latent
 
     if rank == 0:
-        logger.info(f"Image encoded, noise prepared. Starting denoising (20 steps)...")
+        logger.info(f"Image encoded, noise prepared. Starting denoising (10 steps)...")
 
     # ── Denoising loop ──
     sample_scheduler = FlowUniPCMultistepScheduler(
         num_train_timesteps=config.num_train_timesteps,
         shift=1, use_dynamic_shifting=False)
-    sample_scheduler.set_timesteps(20, device=torch.device("cpu"), shift=config.sample_shift)
+    sample_scheduler.set_timesteps(10, device=torch.device("cpu"), shift=config.sample_shift)
     timesteps = sample_scheduler.timesteps
 
     # Model expects context as list of 2D tensors [text_len, hidden_dim] (one per batch item)
@@ -295,8 +290,8 @@ def main():
     # ── Decode with VAE on rank 0 ──
     if rank == VAE_RANK:
         logger.info("Decoding latents with VAE...")
-        # VAE stays on Neuron — vae2_2.py now casts z to conv2.weight.dtype after scale division
-        x0 = [latent]
+        # VAE decode on CPU (eager) — Neuron OOMs with compiled VAE NEFFs
+        x0 = [latent.cpu().float()]
         videos = vae.decode(x0)
         video = videos[0]
 
