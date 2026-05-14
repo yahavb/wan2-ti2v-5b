@@ -44,6 +44,8 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-TI2V-5B")
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
 T5_RANK = int(os.environ.get("T5_RANK", "8"))
 VAE_RANK = 0
+VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "1"))  # 1=single rank (existing), 2=channel-parallel TP
+VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 
 NEURON_DEVICE = torch.device("neuron")
 
@@ -90,15 +92,33 @@ def main():
     else:
         text_encoder = None
 
-    # ── Load VAE on VAE_RANK — on Neuron with NKI kernels ──
-    if rank == VAE_RANK:
+    # ── Load VAE ──
+    # VAE_TP_DEGREE=1 (default): single rank, NKI kernels, existing path
+    # VAE_TP_DEGREE=2: 2-way channel TP, no NKI, PyTorch SDPA fallback
+    if VAE_TP_DEGREE > 1 and rank in VAE_TP_RANKS:
+        # VAE TP path: load on all VAE TP ranks, shard decoder
+        from models.vae_tp import create_vae_tp_group, shard_vae_model_tp
+        if rank == VAE_TP_RANKS[0]:
+            logger.info(f"Loading VAE with TP={VAE_TP_DEGREE} on ranks {VAE_TP_RANKS}...")
+        # Disable NKI for TP (channel dims don't align to P=128 tile size)
+        os.environ["USE_NKI_VAE"] = "0"
+        vae = Wan2_2_VAE(
+            vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
+            device=torch.device('cpu'))
+        vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+        vae.scale = [s.to(device=NEURON_DEVICE, dtype=torch.bfloat16) if isinstance(s, torch.Tensor) else s for s in vae.scale]
+        # Create VAE TP group and shard decoder
+        create_vae_tp_group(VAE_TP_RANKS)
+        vae_tp_rank = VAE_TP_RANKS.index(rank)
+        shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
+        logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on rank {rank} (vae_tp_rank={vae_tp_rank})")
+    elif VAE_TP_DEGREE <= 1 and rank == VAE_RANK:
+        # Original single-rank path with NKI kernels
         logger.info(f"Loading VAE on rank {VAE_RANK} (on Neuron with NKI kernels)...")
         vae = Wan2_2_VAE(
             vae_pth=os.path.join(MODEL_PATH, config.vae_checkpoint),
             device=torch.device('cpu'))
-        # Move VAE to Neuron — NKI kernels handle conv2d/attention natively
         vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
-        # Move scale tensors to Neuron too
         vae.scale = [s.to(device=NEURON_DEVICE, dtype=torch.bfloat16) if isinstance(s, torch.Tensor) else s for s in vae.scale]
         logger.info("VAE loaded on Neuron with NKI kernels")
     else:
@@ -302,15 +322,32 @@ def main():
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
 
-        # ── Decode with VAE on rank 0 (on Neuron with NKI kernels) ──
+        # ── Decode with VAE ──
         vae_start = time.time()
-        if rank == VAE_RANK:
+        if VAE_TP_DEGREE > 1 and rank in VAE_TP_RANKS:
+            # VAE TP decode: all VAE TP ranks decode together (sharded channels)
+            if rank == VAE_TP_RANKS[0]:
+                logger.info(f"{run_label} VAE decode with TP={VAE_TP_DEGREE}...")
+            x0 = [latent.to(torch.bfloat16)]
+            videos = vae.decode(x0)
+            # Only rank 0 saves the video (output is all-reduced, same on all VAE ranks)
+            if rank == VAE_RANK:
+                video = videos[0]
+                import imageio
+                output_path = "/tmp/wan2_ti2v_output.mp4"
+                video_cpu = video.cpu().float()
+                video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+                if video_np.dim() == 4 and video_np.shape[0] == 3:
+                    video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
+                frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
+                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+                logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+        elif rank == VAE_RANK:
+            # Original single-rank decode with NKI kernels
             logger.info(f"{run_label} VAE decode on Neuron...")
             x0 = [latent.to(torch.bfloat16)]
             videos = vae.decode(x0)
             video = videos[0]
-
-            # Save video using imageio (no PyAV dependency)
             import imageio
             output_path = "/tmp/wan2_ti2v_output.mp4"
             video_cpu = video.cpu().float()
