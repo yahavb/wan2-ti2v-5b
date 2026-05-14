@@ -273,11 +273,28 @@ def _shard_residual_block(block, tp_rank, tp_degree):
         block.residual[idx1] = RowParallelCausalConv3d(
             block.residual[idx1], tp_rank, tp_degree)
 
-    # RMS_norm between convs: needs to work on sharded channels
-    # After column-parallel conv, channels are local (C/tp).
-    # RMS_norm normalizes along channel dim — with sharded channels,
-    # each rank normalizes its local channels independently.
-    # This is approximate but acceptable for VAE (not a transformer norm).
+    # Data flow through residual path (Megatron-style column→row TP):
+    #   Input: FULL channels (from previous row-parallel all-reduce)
+    #   residual[0] RMS_norm(in_dim): FULL → keep full, DON'T shard
+    #   residual[2] Conv(in→out) column-parallel: FULL input → LOCAL output
+    #   residual[3] RMS_norm(out_dim): LOCAL → MUST shard gamma to out_dim/tp
+    #   residual[6] Conv(out→out) row-parallel: LOCAL input → all-reduce → FULL output
+    #   Shortcut: FULL→FULL (keep replicated)
+    #   x + h: FULL + FULL ✓
+    from wan.modules.vae2_2 import RMS_norm
+    for i, layer in enumerate(block.residual):
+        if isinstance(layer, RMS_norm) and len(conv_indices) >= 2 and i > conv_indices[0]:
+            # Only shard the norm AFTER the first (column-parallel) conv
+            full_ch = layer.gamma.shape[0]
+            chunk = full_ch // tp_degree
+            start = tp_rank * chunk
+            end = start + chunk
+            layer.gamma = nn.Parameter(layer.gamma.data[start:end].contiguous())
+            if isinstance(layer.bias, nn.Parameter):
+                layer.bias = nn.Parameter(layer.bias.data[start:end].contiguous())
+            layer.scale = chunk ** 0.5
+
+    # Shortcut: input is FULL, output is FULL → keep replicated (no sharding)
 
     return block
 
@@ -288,7 +305,10 @@ def _shard_attention_block(block, tp_rank, tp_degree):
     QKV conv2d → column-parallel, proj conv2d → row-parallel.
     NKI kernels disabled (320 % 128 != 0), uses PyTorch SDPA fallback.
     """
-    # to_qkv: Conv2d(dim, dim*3, 1) → column-parallel
+    # Norm: input is FULL channels (AttentionBlock receives FULL from previous row-parallel)
+    # Keep norm replicated — it operates on full channels.
+
+    # to_qkv: Conv2d(dim, dim*3, 1) → column-parallel (input FULL, output LOCAL 3*dim/tp)
     block.to_qkv = ColumnParallelConv2d(block.to_qkv, tp_rank, tp_degree)
 
     # proj: Conv2d(dim, dim, 1) → row-parallel
@@ -307,8 +327,7 @@ def _shard_attention_block(block, tp_rank, tp_degree):
         b, c, t, h, w = x.size()
         x = rearrange(x, "b c t h w -> (b t) c h w")
 
-        # RMS norm on local channels
-        block.norm.scale = block.dim ** 0.5  # keep original scale for correctness
+        # RMS norm on local channels (already sharded)
         x_normed = block.norm(x)
 
         # QKV via column-parallel conv2d (local channels)
@@ -371,9 +390,8 @@ def shard_vae_decoder_tp(decoder, tp_rank: int, tp_degree: int):
     """
     logger.info(f"[VAE-TP] Sharding decoder: tp_rank={tp_rank}, tp_degree={tp_degree}")
 
-    # Shard conv1: CausalConv3d(z_dim, dims[0], 3) — column-parallel
-    # Input is full z_dim (48), output sharded to dims[0]/2 (320)
-    decoder.conv1 = ColumnParallelCausalConv3d(decoder.conv1, tp_rank, tp_degree)
+    # conv1: CausalConv3d(z_dim, dims[0], 3) — keep replicated (tiny: 48→640, ~830K params)
+    # Output is FULL channels. All subsequent blocks expect FULL input at their entry.
 
     # Shard middle blocks
     for i, layer in enumerate(decoder.middle):
@@ -391,11 +409,9 @@ def shard_vae_decoder_tp(decoder, tp_rank: int, tp_degree: int):
             elif type(layer).__name__ == 'Resample':
                 up_block.upsamples[j] = _shard_resample(layer, tp_rank, tp_degree)
 
-    # Shard head: last CausalConv3d(out_dim, 12, 3) — row-parallel
-    # Input is sharded channels, output is full 12 channels (all-reduced)
-    for i, layer in enumerate(decoder.head):
-        if _is_causal_conv3d(layer):
-            decoder.head[i] = RowParallelCausalConv3d(layer, tp_rank, tp_degree)
+    # Head: [RMS_norm(out_dim), SiLU, CausalConv3d(out_dim, 12, 3)]
+    # After last ResidualBlock row-parallel all-reduce → FULL channels in.
+    # Keep head replicated (tiny: 128→12, ~50K params).
 
     total_params = sum(p.numel() for p in decoder.parameters())
     logger.info(f"[VAE-TP] Decoder sharded: {total_params / 1e6:.1f}M params (local, rank {tp_rank})")
