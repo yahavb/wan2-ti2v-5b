@@ -272,10 +272,28 @@ The decoder already processes frames sequentially (`for i in range(21)`). Instea
 
 **Problem**: Causal caching — frame `i` depends on frame `i-1`'s cache. Frames can't be processed independently. The decoder is inherently **sequential** in the temporal dimension.
 
+### Experimental Results: TP=2 on Wan 2.1 (1.3B, Rolling Forcing)
+
+Implemented and benchmarked VAE TP=2 on the Wan 2.1-T2V-1.3B model (dim=128, channels 128/256/512):
+
+| Metric | TP=1 (single core) | TP=2 (channel shard) | Change |
+|--------|-------------------|---------------------|--------|
+| Total time | 1455s | 609s | 2.4× faster |
+| TTFF (compilation) | 1194s | 412s | 2.9× faster |
+| **Steady-state FPS** | **4.50** | **3.91** | **13% worse** ❌ |
+| Real-time ratio | 0.282× | 0.244× | Worse |
+
+**Analysis:**
+- **TTFF improvement confirms TP is working**: half-size conv kernels → smaller NEFFs → faster compilation
+- **Steady-state regression**: The Wan 2.1 VAE is tiny (~660K params). Splitting 128/256/512 channels by 2 gives 64/128/256 per rank — the all-reduce after every `RowParallelCausalConv3d` costs more than the compute savings from halving channels
+- **Break-even estimate**: VAE TP would start helping at ~dim≥512 (channels ≥512/1024/2048), i.e., Wan 2.2 VAE with dim=160 and wider channels
+
+**Conclusion:** Keep `VAE_TP_DEGREE=1` for Wan 2.1 (1.3B). TP=2 only useful for Wan 2.2 (5B) which has a 4× larger VAE decoder.
+
 ### Recommendation
 
-1. **Current approach (single core + NKI kernels)** is the right first step
-2. **Measure actual single-core latency** (Run 2 warm timing) before deciding
-3. **If VAE decode > 15s**, consider TP=2 or TP=4 with allreduce-based sharding
-4. **If VAE decode < 5s**, TP is not worth the 840 collective ops overhead
+1. **Wan 2.1 (1.3B)**: `VAE_TP_DEGREE=1` — single core + torch.compile is optimal
+2. **Wan 2.2 (5B)**: `VAE_TP_DEGREE=2` may help (larger channels, more compute per conv)
+3. **NKI kernel fusion** remains the best optimization for both model sizes
+4. **NEFF caching** eliminates the compilation penalty entirely (no need for TP=2 compilation speedup)
 5. **Alternative optimization**: reduce temporal frames (81→41 frames = 11 decode iterations instead of 21)
