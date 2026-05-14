@@ -419,9 +419,6 @@ def main():
             prompt: str
             image_url: Optional[str] = None
             image_base64: Optional[str] = None
-            num_steps: Optional[int] = 10
-            seed: Optional[int] = 42
-            frame_num: Optional[int] = 81
 
         class GenerateResponse(BaseModel):
             video: str  # base64 encoded mp4
@@ -455,18 +452,18 @@ def main():
                     img_path = "/tmp/serve_input_image.png"
                     Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path)
                     image_source = img_path
-                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image=base64 ({len(request.image_base64)} chars), steps={request.num_steps}")
+                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image=base64 ({len(request.image_base64)} chars)")
                 else:
                     image_source = request.image_url
-                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}', steps={request.num_steps}")
+                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}'")
 
-                # Save request params for other ranks
+                # Hardcoded params — must match warmup to avoid recompilation
                 req_data = {
                     'prompt': request.prompt,
                     'image_url': image_source,
-                    'num_steps': request.num_steps or 10,
-                    'seed': request.seed or 42,
-                    'frame_num': request.frame_num or 81,
+                    'num_steps': 10,
+                    'seed': 42,
+                    'frame_num': 81,
                 }
                 torch.save(req_data, INPUTS_PATH)
 
