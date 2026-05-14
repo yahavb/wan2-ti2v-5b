@@ -417,7 +417,8 @@ def main():
 
         class GenerateRequest(BaseModel):
             prompt: str
-            image_url: str
+            image_url: Optional[str] = None
+            image_base64: Optional[str] = None
             num_steps: Optional[int] = 10
             seed: Optional[int] = 42
             frame_num: Optional[int] = 81
@@ -442,13 +443,27 @@ def main():
             if not _model_ready:
                 raise HTTPException(status_code=503, detail="Model not ready")
 
+            if not request.image_url and not request.image_base64:
+                raise HTTPException(status_code=400, detail="Either image_url or image_base64 is required")
+
             with inference_lock:
-                logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}', steps={request.num_steps}")
+                # Resolve image source
+                if request.image_base64:
+                    # Save base64 image to temp file
+                    import io as _io
+                    img_bytes = base64.b64decode(request.image_base64)
+                    img_path = "/tmp/serve_input_image.png"
+                    Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path)
+                    image_source = img_path
+                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image=base64 ({len(request.image_base64)} chars), steps={request.num_steps}")
+                else:
+                    image_source = request.image_url
+                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}', steps={request.num_steps}")
 
                 # Save request params for other ranks
                 req_data = {
                     'prompt': request.prompt,
-                    'image_url': request.image_url,
+                    'image_url': image_source,
                     'num_steps': request.num_steps or 10,
                     'seed': request.seed or 42,
                     'frame_num': request.frame_num or 81,
