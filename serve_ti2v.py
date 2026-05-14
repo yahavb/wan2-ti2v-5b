@@ -20,6 +20,7 @@ import gc
 import base64
 import threading
 import tempfile
+import queue
 
 import torch
 import torch.distributed as dist
@@ -404,6 +405,9 @@ def main():
 
     # ═══════════════════════════════════════════════════════════════
     # SERVING: FastAPI on rank 0, all ranks participate in generate
+    # Neuron collectives MUST be called from the main thread (same
+    # thread that did warmup) — so FastAPI puts requests on a queue,
+    # and the main thread processes them.
     # ═══════════════════════════════════════════════════════════════
 
     if rank == 0:
@@ -412,8 +416,11 @@ def main():
         from pydantic import BaseModel
         from typing import Optional
 
+        # Queues for main-thread ↔ FastAPI-thread communication
+        _request_queue = queue.Queue(maxsize=1)
+        _response_queue = queue.Queue(maxsize=1)
+
         app = FastAPI(title="Wan2.2-TI2V-5B (PyTorch Native, TP-8)")
-        inference_lock = threading.Lock()
 
         class GenerateRequest(BaseModel):
             prompt: str
@@ -437,43 +444,73 @@ def main():
 
         @app.post("/generate")
         def generate(request: GenerateRequest):
+            """FastAPI thread: prepare request, hand off to main thread for Neuron ops."""
             if not _model_ready:
                 raise HTTPException(status_code=503, detail="Model not ready")
 
             if not request.image_url and not request.image_base64:
                 raise HTTPException(status_code=400, detail="Either image_url or image_base64 is required")
 
-            with inference_lock:
-                # Resolve image source
-                if request.image_base64:
-                    # Save base64 image to temp file
-                    import io as _io
-                    img_bytes = base64.b64decode(request.image_base64)
-                    img_path = "/tmp/serve_input_image.png"
-                    Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path)
-                    image_source = img_path
-                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image=base64 ({len(request.image_base64)} chars)")
-                else:
-                    image_source = request.image_url
-                    logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}'")
+            # Resolve image source (CPU work — fine in FastAPI thread)
+            if request.image_base64:
+                import io as _io
+                img_bytes = base64.b64decode(request.image_base64)
+                img_path = "/tmp/serve_input_image.png"
+                Image.open(_io.BytesIO(img_bytes)).convert("RGB").save(img_path)
+                image_source = img_path
+                logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image=base64 ({len(request.image_base64)} chars)")
+            else:
+                image_source = request.image_url
+                logger.info(f"[REQUEST] prompt='{request.prompt[:80]}...', image_url='{request.image_url[:80]}'")
 
-                # Hardcoded params — must match warmup to avoid recompilation
-                req_data = {
-                    'prompt': request.prompt,
-                    'image_url': image_source,
-                    'num_steps': 10,
-                    'seed': 42,
-                    'frame_num': 81,
-                }
+            # Hardcoded params — must match warmup to avoid recompilation
+            req_data = {
+                'prompt': request.prompt,
+                'image_url': image_source,
+                'num_steps': 10,
+                'seed': 42,
+                'frame_num': 81,
+            }
+
+            # Hand off to main thread (which owns Neuron collectives)
+            _request_queue.put(req_data)
+
+            # Block until main thread finishes and posts result
+            try:
+                result = _response_queue.get(timeout=600)
+            except queue.Empty:
+                raise HTTPException(status_code=504, detail="Inference timed out")
+
+            if isinstance(result, Exception):
+                raise HTTPException(status_code=500, detail=str(result))
+
+            return result
+
+        def start_server():
+            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+
+        server_thread = threading.Thread(target=start_server, daemon=True)
+        server_thread.start()
+        logger.info(f"\n[SERVER] FastAPI running on port 8000")
+
+        # ── Rank 0 main thread: poll queue, run Neuron ops here ──
+        while True:
+            try:
+                req_data = _request_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                # Save for other ranks to load
                 torch.save(req_data, INPUTS_PATH)
 
-                # Broadcast signal to other ranks: [num_steps, seed, frame_num, 1=generate]
+                # Broadcast signal from MAIN thread (same as warmup)
                 signal = torch.tensor(
                     [req_data['num_steps'], req_data['seed'], req_data['frame_num'], 1],
                     dtype=torch.long).to(NEURON_DEVICE)
                 dist.broadcast(signal, src=0)
 
-                # Run full pipeline (all ranks participate)
+                # Run full pipeline from MAIN thread
                 exec_time, num_frames = run_full_pipeline(
                     rank, config, text_encoder, vae, model,
                     prompt=req_data['prompt'],
@@ -490,22 +527,14 @@ def main():
 
                 logger.info(f"[RESPONSE] {exec_time:.1f}s, {num_frames} frames, {len(video_bytes)} bytes")
 
-                return GenerateResponse(
+                _response_queue.put(GenerateResponse(
                     video=video_b64,
                     execution_time=round(exec_time, 2),
                     frames=num_frames,
-                )
-
-        def start_server():
-            uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
-        server_thread = threading.Thread(target=start_server, daemon=True)
-        server_thread.start()
-        logger.info(f"\n[SERVER] FastAPI running on port 8000")
-
-        # Rank 0 main thread: keep alive
-        while True:
-            time.sleep(0.1)
+                ))
+            except Exception as e:
+                logger.error(f"[Rank 0] Pipeline error: {e}")
+                _response_queue.put(e)
 
     else:
         # Non-rank-0: wait for broadcast signals from rank 0
