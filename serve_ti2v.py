@@ -356,9 +356,9 @@ def run_full_pipeline(rank, config, text_encoder, vae, model,
     total_time = time.time() - total_start
 
     if rank == 0:
-        logger.info(f"Pipeline done: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={total_time:.1f}s")
+        logger.info(f"Pipeline done: denoise={denoise_time:.1f}s, vae_decode={vae_time:.1f}s, total={total_time:.1f}s")
 
-    return total_time, num_frames
+    return total_time, denoise_time, vae_time, num_frames
 
 
 def main():
@@ -385,7 +385,7 @@ def main():
     )
     warmup_image = os.path.join(MODEL_PATH, "examples/i2v_input.JPG")
 
-    warmup_time, _ = run_full_pipeline(
+    warmup_time, warmup_denoise, warmup_vae, _ = run_full_pipeline(
         rank, config, text_encoder, vae, model,
         prompt=warmup_prompt,
         image_url_or_path=warmup_image,
@@ -511,7 +511,7 @@ def main():
                 dist.broadcast(signal, src=0)
 
                 # Run full pipeline from MAIN thread
-                exec_time, num_frames = run_full_pipeline(
+                exec_time, denoise_time, vae_time, num_frames = run_full_pipeline(
                     rank, config, text_encoder, vae, model,
                     prompt=req_data['prompt'],
                     image_url_or_path=req_data['image_url'],
@@ -525,7 +525,7 @@ def main():
                     video_bytes = f.read()
                 video_b64 = base64.b64encode(video_bytes).decode('utf-8')
 
-                logger.info(f"[RESPONSE] {exec_time:.1f}s, {num_frames} frames, {len(video_bytes)} bytes")
+                logger.info(f"[RESPONSE] total={exec_time:.1f}s, denoise={denoise_time:.1f}s, vae_decode={vae_time:.1f}s, {num_frames} frames, {len(video_bytes)} bytes")
 
                 _response_queue.put(GenerateResponse(
                     video=video_b64,
