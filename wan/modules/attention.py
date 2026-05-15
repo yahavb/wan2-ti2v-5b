@@ -24,18 +24,14 @@ _NKI_SELF_AVAILABLE = False
 
 if USE_NKI_KERNELS:
     try:
-        from torch_neuronx.nki_hop import wrap_nki
-        from kernels.cross_attention import wan_cross_attn as _raw_cross_attn
-        _nki_cross_attn = wrap_nki(_raw_cross_attn)
+        from kernels.cross_attention import wan_cross_attn as _nki_cross_attn
         _NKI_CROSS_AVAILABLE = True
         print("[attention.py] NKI cross_attention kernel: LOADED")
     except Exception as e:
         print(f"[attention.py] NKI cross_attention kernel: FAILED ({e})")
 
     try:
-        from torch_neuronx.nki_hop import wrap_nki as _wrap_nki_self
-        from kernels.self_attention import wan_flash_self_attn as _raw_self_attn
-        _nki_self_attn = _wrap_nki_self(_raw_self_attn)
+        from kernels.self_attention import wan_flash_self_attn as _nki_self_attn
         _NKI_SELF_AVAILABLE = True
         print("[attention.py] NKI self_attention kernel: LOADED")
     except Exception as e:
