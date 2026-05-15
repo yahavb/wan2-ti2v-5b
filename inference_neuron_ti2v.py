@@ -57,12 +57,32 @@ def setup_distributed():
     return dist.get_rank(), dist.get_world_size()
 
 
+FRAME_NUM = int(os.environ.get("FRAME_NUM", "81"))
+INSTANCE_TYPE = os.environ.get("INSTANCE_TYPE", "unknown")
+LNC_CONFIG = os.environ.get("LNC_CONFIG", "unknown")
+NUM_NEURON_DEVICES = os.environ.get("NUM_NEURON_DEVICES", "unknown")
+USE_NKI_KERNELS = os.environ.get("USE_NKI_KERNELS", "0")
+USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "0")
+
+
 def main():
     rank, world_size = setup_distributed()
     torch.set_grad_enabled(False)
 
     if rank == 0:
-        logger.info(f"Wan2.2-TI2V-5B TP={TP_DEGREE}, world_size={world_size}")
+        logger.info("=" * 70)
+        logger.info("  Wan2.2-TI2V-5B  BENCHMARK")
+        logger.info("=" * 70)
+        logger.info(f"  Instance:        {INSTANCE_TYPE}")
+        logger.info(f"  LNC config:      {LNC_CONFIG}")
+        logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
+        logger.info(f"  TP degree:       {TP_DEGREE}")
+        logger.info(f"  World size:      {world_size}")
+        logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}")
+        logger.info(f"  VAE TP degree:   {VAE_TP_DEGREE}")
+        logger.info(f"  T5 rank:         {T5_RANK}")
+        logger.info(f"  Frame count:     {FRAME_NUM}")
+        logger.info("=" * 70)
 
     # ── Import Wan modules ──
     from wan.configs import WAN_CONFIGS
@@ -193,6 +213,7 @@ def main():
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast to all ranks")
+        logger.info(f"  T5 context shape:  {ctx_tensor.shape} (dtype={ctx_tensor.dtype})")
 
     # ── Prepare image and noise ──
     import torchvision.transforms.functional as TF
@@ -258,6 +279,22 @@ def main():
 
     dist.broadcast(z_img_device, src=VAE_RANK)
 
+    if rank == 0:
+        logger.info("-" * 70)
+        logger.info("  INPUT SHAPES & MODEL CONFIG")
+        logger.info("-" * 70)
+        logger.info(f"  Image:           {oh}x{ow} (original {ih}x{iw})")
+        logger.info(f"  Frames:          {frame_num}")
+        logger.info(f"  VAE stride:      {vae_stride}")
+        logger.info(f"  Patch size:      {patch_size}")
+        logger.info(f"  Latent shape:    [{z_dim}, {T_latent}, {H_latent}, {W_latent}]")
+        logger.info(f"  VAE encode out:  {list(z_img_device.shape)} (dtype={z_img_device.dtype})")
+        logger.info(f"  Noise shape:     [{z_dim}, {T_latent}, {H_latent}, {W_latent}]")
+        logger.info(f"  Seq len (DiT):   {seq_len}")
+        logger.info(f"  DiT config:      dim={config.dim}, heads={config.num_heads}, layers={config.num_layers}, ffn_dim={config.ffn_dim}")
+        logger.info(f"  Heads/rank (TP): {config.num_heads // TP_DEGREE}")
+        logger.info("-" * 70)
+
     # All ranks: move noise to neuron (same dtype everywhere)
     noise = noise.to(torch.bfloat16).to(NEURON_DEVICE)
     mask1, mask2 = masks_like([noise.cpu()], zero=True)
@@ -278,6 +315,7 @@ def main():
 
     # Save original latent for re-use across runs
     latent_orig = latent.clone()
+    run_results = []
 
     for run_idx in range(NUM_RUNS):
         run_label = f"Run {run_idx+1}/{NUM_RUNS}"
@@ -364,6 +402,39 @@ def main():
 
         if rank == 0:
             logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
+            run_results.append({
+                'run': run_idx + 1,
+                'denoise': denoise_time,
+                'vae': vae_time,
+                'total': run_time,
+            })
+
+    # ── Final benchmark summary ──
+    if rank == 0 and run_results:
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("  BENCHMARK SUMMARY")
+        logger.info("=" * 70)
+        logger.info(f"  Instance:        {INSTANCE_TYPE}")
+        logger.info(f"  LNC config:      {LNC_CONFIG}")
+        logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
+        logger.info(f"  TP degree:       {TP_DEGREE}  (DiT)  |  VAE TP: {VAE_TP_DEGREE}")
+        logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}")
+        logger.info(f"  Resolution:      {oh}x{ow}, {frame_num} frames")
+        logger.info(f"  Latent:          [{z_dim}, {T_latent}, {H_latent}, {W_latent}]")
+        logger.info(f"  Seq len:         {seq_len}")
+        logger.info(f"  Steps:           {NUM_STEPS}")
+        logger.info("-" * 70)
+        logger.info(f"  {'Run':<6} {'Denoise':>10} {'s/step':>10} {'VAE dec':>10} {'Total':>10}")
+        logger.info("-" * 70)
+        for r in run_results:
+            s_per_step = r['denoise'] / NUM_STEPS
+            logger.info(f"  {r['run']:<6} {r['denoise']:>9.1f}s {s_per_step:>9.1f}s {r['vae']:>9.1f}s {r['total']:>9.1f}s")
+        # Warm run = last run (compilation done)
+        warm = run_results[-1]
+        logger.info("-" * 70)
+        logger.info(f"  Warm run:  denoise={warm['denoise']:.1f}s ({warm['denoise']/NUM_STEPS:.1f}s/step), vae={warm['vae']:.1f}s, total={warm['total']:.1f}s")
+        logger.info("=" * 70)
 
     dist.destroy_process_group()
 
