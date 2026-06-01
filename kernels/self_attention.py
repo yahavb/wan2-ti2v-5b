@@ -60,12 +60,12 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
         pv_all = nl.ndarray((P, num_q_grps, d), dtype=nl.float32, buffer=nl.sbuf)
 
         for gi in range(num_q_grps):
-            r_max[:, nl.ds(gi, 1)] = nisa.memset(
-                (P, 1), value=float('-inf'), dtype=nl.float32)
-            r_sum[:, nl.ds(gi, 1)] = nisa.memset(
-                (P, 1), value=0.0, dtype=nl.float32)
-            pv_all[:, gi, :] = nisa.memset(
-                (P, d), value=0.0, dtype=nl.float32)
+            r_max[:, nl.ds(gi, 1)] = nl.full(
+                (P, 1), fill_value=float('-inf'), dtype=nl.float32)
+            r_sum[:, nl.ds(gi, 1)] = nl.zeros(
+                (P, 1), dtype=nl.float32)
+            pv_all[:, gi, :] = nl.zeros(
+                (P, d), dtype=nl.float32)
 
         # ── Section loop (LoopVar — no Python list indexing!) ──
         for section_i in nl.sequential_range(num_sections):
@@ -147,7 +147,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                     scaled_sum, sec_sum, nl.add)
 
                 # ═══ Phase 3: Transpose + PV matmul ═══
-                pv_acc = nisa.memset((P, d), value=0.0, dtype=nl.float32)
+                pv_acc = nl.zeros((P, d), dtype=nl.float32)
 
                 for v_ti in range(tiles_128):
                     col = v_ti * P

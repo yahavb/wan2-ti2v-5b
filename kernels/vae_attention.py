@@ -70,7 +70,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
             # ── Phase 1: QK^T = sum over d-tiles ──
             # Tile along seq_k in CHUNK=512 pieces to stay within nc_matmul limit
             # Build QK result (P, seqlen_k) by tiling both d and seq_k
-            qk_acc = nisa.memset((P, seqlen_k), value=0.0, dtype=nl.float32)
+            qk_acc = nl.zeros((P, seqlen_k), dtype=nl.float32)
 
             for dt in range(num_d_tiles):
                 d_off = dt * P
@@ -130,7 +130,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
             # ── Phase 3: PV matmul ──
             # attn @ V: [P, seq_k] @ [seq_k, d] → [P, d]
             # Tile over seq_k (P=128 chunks) for both attn weights and V
-            pv_accum = nisa.memset((P, d), value=0.0, dtype=nl.float32)
+            pv_accum = nl.zeros((P, d), dtype=nl.float32)
 
             for vi in range(num_v_tiles):
                 v_start = vi * P

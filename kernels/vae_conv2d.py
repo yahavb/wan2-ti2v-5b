@@ -58,7 +58,7 @@ def vae_conv2d_k1(input_2d, weight_T, bias, HW):
             sp = sp_t * SPATIAL_TILE
 
             # Accumulator in float32
-            acc = nisa.memset((P, SPATIAL_TILE), value=0.0, dtype=nl.float32)
+            acc = nl.zeros((P, SPATIAL_TILE), dtype=nl.float32)
 
             for ci_t in range(num_ci_tiles):
                 ci = ci_t * P
@@ -129,7 +129,7 @@ def vae_conv2d_k3_shifted(shifted_inputs, weight_slices_T, bias, num_positions):
         for sp_t in nl.sequential_range(num_sp_tiles):
             sp = sp_t * SPATIAL_TILE
 
-            acc = nisa.memset((P, SPATIAL_TILE), value=0.0, dtype=nl.float32)
+            acc = nl.zeros((P, SPATIAL_TILE), dtype=nl.float32)
 
             # 9 kernel positions × C_in/P contraction tiles
             for k_idx in range(9):
