@@ -1,4 +1,4 @@
-import neuronxcc.nki as nki
+import nki
 import nki.compiler.kernel_builder as nb
 from nki.compiler.kernel_builder import Tensor
 from nki.compiler.kernel_builder import isa as nisa

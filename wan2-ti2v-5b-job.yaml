@@ -64,15 +64,16 @@ spec:
               echo "Model weights ready at $MODEL_LOCAL"
 
               # ========================================
-              # Profiling: capture neuron device traces
+              # Profiling: DISABLED to save HBM (~2.4GB per NC pair)
+              # Re-enable after confirming model fits in memory:
+              #   export NEURON_RT_INSPECT_ENABLE=1
+              #   export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
+              #   export NEURON_RT_INSPECT_DEVICE_PROFILE=session
               # ========================================
-              export NEURON_RT_INSPECT_ENABLE=1
-              export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
-              export NEURON_RT_INSPECT_DEVICE_PROFILE=session
               mkdir -p /tmp/neuron_profile
               echo "============================================"
               echo "  BENCHMARK: SP=2 TP=4 on s-lnc1-trn2"
-              echo "  Profiling ENABLED"
+              echo "  Profiling DISABLED (HBM constrained)"
               echo "============================================"
 
               # ─── Launch with torchrun (SP=2 x TP=4 = 8 ranks) ──────────
