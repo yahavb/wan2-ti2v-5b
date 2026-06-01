@@ -90,7 +90,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
 
                     # nc_matmul: Q[P,P].T @ K_chunk[P,512] → [P, 512]
                     # Moving operand is K_chunk[128,512] — within 512 limit ✓
-                    qk_psum = nisa.nc_matmul(q_buf, k_chunk)
+                    qk_psum = nisa.nc_matmul(stationary=q_buf, moving=k_chunk)
                     qk_sbuf = nl.copy(qk_psum)
 
                     # Accumulate into the right seq_k columns
@@ -153,7 +153,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                 attn_chunk = nl.copy(exp_bf16[:, nl.ds(v_start, P)])
 
                 # Transpose via identity matmul trick
-                attn_T_psum = nisa.nc_matmul(attn_chunk, id_sbuf)
+                attn_T_psum = nisa.nc_matmul(stationary=attn_chunk, moving=id_sbuf)
                 attn_T = nl.copy(attn_T_psum)
 
                 # nc_matmul: attn_T[P,P].T @ V[P,d]
@@ -164,7 +164,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                 for dmc in range(d_mat_chunks):
                     dmc_start = dmc * CHUNK
                     v_d_chunk = nl.copy(v_tile[:, nl.ds(dmc_start, CHUNK)])
-                    pv_chunk = nisa.nc_matmul(attn_T, v_d_chunk)
+                    pv_chunk = nisa.nc_matmul(stationary=attn_T, moving=v_d_chunk)
                     pv_s = nl.copy(pv_chunk)
                     existing = nl.copy(pv_accum[:, nl.ds(dmc_start, CHUNK)])
                     updated = nisa.tensor_tensor(existing, pv_s, nl.add)
@@ -173,7 +173,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                 if d_mat_rem > 0:
                     dmc_start_rem = d_mat_chunks * CHUNK
                     v_d_rem = nl.copy(v_tile[:, nl.ds(dmc_start_rem, d_mat_rem)])
-                    pv_rem = nisa.nc_matmul(attn_T, v_d_rem)
+                    pv_rem = nisa.nc_matmul(stationary=attn_T, moving=v_d_rem)
                     pv_rem_s = nl.copy(pv_rem)
                     existing_rem = nl.copy(pv_accum[:, nl.ds(dmc_start_rem, d_mat_rem)])
                     updated_rem = nisa.tensor_tensor(existing_rem, pv_rem_s, nl.add)

@@ -105,7 +105,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 pmaxes = nl.ndarray((P, tiles_512), dtype=nl.float32, buffer=nl.sbuf)
 
                 for ti in range(tiles_512):
-                    qk_psum = nisa.nc_matmul(q_tile, k_sec[:, nl.ds(ti * 512, 512)])
+                    qk_psum = nisa.nc_matmul(stationary=q_tile, moving=k_sec[:, nl.ds(ti * 512, 512)])
                     qk_sbuf = nl.copy(qk_psum)
                     qk_scaled = nisa.tensor_scalar(qk_sbuf, nl.multiply, softmax_scale)
                     # Add mask (0 for valid, -inf for invalid)
@@ -152,9 +152,9 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 for v_ti in range(tiles_128):
                     col = v_ti * P
                     attn_chunk = nl.copy(exp_sc[:, nl.ds(col, P)])
-                    attn_T_psum = nisa.nc_matmul(attn_chunk, id_sbuf)
+                    attn_T_psum = nisa.nc_matmul(stationary=attn_chunk, moving=id_sbuf)
                     attn_T = nl.copy(attn_T_psum)
-                    pv_psum = nisa.nc_matmul(attn_T, v_sec[:, v_ti, :])
+                    pv_psum = nisa.nc_matmul(stationary=attn_T, moving=v_sec[:, v_ti, :])
                     pv_tile = nl.copy(pv_psum)
                     pv_acc[...] = nisa.tensor_tensor(pv_acc, pv_tile, nl.add)
 

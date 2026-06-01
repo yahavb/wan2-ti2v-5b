@@ -73,7 +73,7 @@ def vae_conv2d_k1(input_2d, weight_T, bias, HW):
                 nisa.dma_copy(dst=inp_chunk, src=input_2d[nl.ds(ci, P), nl.ds(sp, SPATIAL_TILE)])
 
                 # nc_matmul: w_chunk.T @ inp_chunk = W[co:co+P, ci:ci+P] @ input[ci:ci+P, sp:sp+512]
-                mm = nisa.nc_matmul(w_chunk, inp_chunk)
+                mm = nisa.nc_matmul(stationary=w_chunk, moving=inp_chunk)
                 mm_sbuf = nl.copy(mm, dtype=nl.float32)
                 acc[...] = nisa.tensor_tensor(acc, mm_sbuf, nl.add)
 
@@ -151,7 +151,7 @@ def vae_conv2d_k3_shifted(shifted_inputs, weight_slices_T, bias, num_positions):
                                   src=shifted_inputs[nl.ds(inp_row, P), nl.ds(sp, SPATIAL_TILE)])
 
                     # nc_matmul: w_chunk.T @ inp_chunk = W_slice[co:co+P, ci:ci+P] @ shifted_input
-                    mm = nisa.nc_matmul(w_chunk, inp_chunk)
+                    mm = nisa.nc_matmul(stationary=w_chunk, moving=inp_chunk)
                     mm_sbuf = nl.copy(mm, dtype=nl.float32)
                     acc[...] = nisa.tensor_tensor(acc, mm_sbuf, nl.add)
 
