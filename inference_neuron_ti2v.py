@@ -42,10 +42,12 @@ sys.path.insert(0, SCRIPT_DIR)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "/tmp/Wan2.2-TI2V-5B")
 TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
+SP_DEGREE = int(os.environ.get("SP_DEGREE", "1"))
 T5_RANK = int(os.environ.get("T5_RANK", "8"))
 VAE_RANK = 0
 VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "1"))  # 1=single rank (existing), 2=channel-parallel TP
 VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
+USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 
 NEURON_DEVICE = torch.device("neuron")
 
@@ -69,6 +71,11 @@ def main():
     rank, world_size = setup_distributed()
     torch.set_grad_enabled(False)
 
+    # Initialize SP/TP parallel groups if SP > 1
+    if SP_DEGREE > 1:
+        from models.parallel_state import init_parallel_groups
+        init_parallel_groups(sp_degree=SP_DEGREE, tp_degree=TP_DEGREE)
+
     if rank == 0:
         logger.info("=" * 70)
         logger.info("  Wan2.2-TI2V-5B  BENCHMARK")
@@ -77,8 +84,10 @@ def main():
         logger.info(f"  LNC config:      {LNC_CONFIG}")
         logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
         logger.info(f"  TP degree:       {TP_DEGREE}")
+        logger.info(f"  SP degree:       {SP_DEGREE}")
         logger.info(f"  World size:      {world_size}")
         logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}")
+        logger.info(f"  NST self-attn:   {USE_NST_SELF_ATTN}")
         logger.info(f"  VAE TP degree:   {VAE_TP_DEGREE}")
         logger.info(f"  T5 rank:         {T5_RANK}")
         logger.info(f"  Frame count:     {FRAME_NUM}")
@@ -151,7 +160,7 @@ def main():
     model.eval().requires_grad_(False)
 
     # Initialize TP group and shard model
-    init_tp_group(tp_degree=TP_DEGREE)
+    init_tp_group(tp_degree=TP_DEGREE, sp_degree=SP_DEGREE)
     tp_rank = get_tp_rank()
     shard_model_tp(model, tp_rank, TP_DEGREE)
 
@@ -418,8 +427,8 @@ def main():
         logger.info(f"  Instance:        {INSTANCE_TYPE}")
         logger.info(f"  LNC config:      {LNC_CONFIG}")
         logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
-        logger.info(f"  TP degree:       {TP_DEGREE}  (DiT)  |  VAE TP: {VAE_TP_DEGREE}")
-        logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}")
+        logger.info(f"  TP degree:       {TP_DEGREE}  (DiT)  |  SP: {SP_DEGREE}  |  VAE TP: {VAE_TP_DEGREE}")
+        logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}, NST_self_attn={USE_NST_SELF_ATTN}")
         logger.info(f"  Resolution:      {oh}x{ow}, {frame_num} frames")
         logger.info(f"  Latent:          [{z_dim}, {T_latent}, {H_latent}, {W_latent}]")
         logger.info(f"  Seq len:         {seq_len}")

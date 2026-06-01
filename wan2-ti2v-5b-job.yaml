@@ -1,0 +1,261 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wan2-ti2v-5b
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: wan2-ti2v-5b
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              cd /tmp
+              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              cd wan2-ti2v-5b
+
+              # ─── Install deps ─────────────────────────────────────────────
+              sed -i '/flash_attn/d' wan_requirements.txt
+              sed -i '/torchaudio/d' wan_requirements.txt
+              uv pip install -r wan_requirements.txt
+              uv pip install "setuptools<81"
+              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+              uv pip install imageio imageio-ffmpeg
+
+              # ─── Model caching (S3-backed PVC tar pattern) ───────────────
+              MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
+              MODEL_LOCAL="/tmp/Wan2.2-TI2V-5B"
+
+              if [[ -f "$MODEL_TAR" ]]; then
+                echo "Copying model tar from S3 cache..."
+                cp "$MODEL_TAR" /tmp/Wan2.2-TI2V-5B.tar
+                echo "Extracting..."
+                tar xf /tmp/Wan2.2-TI2V-5B.tar -C /tmp/
+                rm -f /tmp/Wan2.2-TI2V-5B.tar
+              else
+                echo "Downloading model from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
+              "
+                echo "Creating tar archive for S3 cache..."
+                tar cf /tmp/Wan2.2-TI2V-5B.tar -C /tmp Wan2.2-TI2V-5B
+                mkdir -p "$(dirname $MODEL_TAR)"
+                cp /tmp/Wan2.2-TI2V-5B.tar "$MODEL_TAR"
+                rm -f /tmp/Wan2.2-TI2V-5B.tar
+                echo "Cached tar to S3!"
+              fi
+              echo "Model weights ready at $MODEL_LOCAL"
+
+              # ========================================
+              # Profiling: capture neuron device traces
+              # ========================================
+              export NEURON_RT_INSPECT_ENABLE=1
+              export NEURON_RT_INSPECT_OUTPUT_DIR=/tmp/neuron_profile
+              export NEURON_RT_INSPECT_DEVICE_PROFILE=session
+              mkdir -p /tmp/neuron_profile
+              echo "============================================"
+              echo "  BENCHMARK: SP=2 TP=4 on s-lnc1-trn2"
+              echo "  Profiling ENABLED"
+              echo "============================================"
+
+              # ─── Launch with torchrun (SP=2 x TP=4 = 8 ranks) ──────────
+              export WAN_DIR="/tmp/wan2-ti2v-5b"
+              export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
+
+              torchrun --nproc_per_node=8 --master_port=29500 \
+                /tmp/wan2-ti2v-5b/inference_neuron_ti2v.py 2>&1 || true
+
+              # ========================================
+              # Collect outputs
+              # ========================================
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              RUN_DIR="/tmp/wan2_ti2v_run_${TIMESTAMP}"
+              mkdir -p "$RUN_DIR"
+
+              if [[ -f /tmp/wan2_ti2v_output.mp4 ]]; then
+                cp /tmp/wan2_ti2v_output.mp4 "$RUN_DIR/"
+              fi
+
+              # ========================================
+              # Copy profile artifacts into run directory
+              # ========================================
+              PROFILE_DEST="$RUN_DIR/profiles"
+              mkdir -p "$PROFILE_DEST"
+              if [[ -d /tmp/neuron_profile && -n "$(ls -A /tmp/neuron_profile 2>/dev/null)" ]]; then
+                cp -r /tmp/neuron_profile/* "$PROFILE_DEST/"
+                echo "Profile artifacts saved to $PROFILE_DEST"
+              fi
+
+              # ========================================
+              # Neuron Explorer: view + NEFF analysis
+              # ========================================
+              NTFF_DIR=$(find "$PROFILE_DEST" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | head -1)
+              if [[ -n "$NTFF_DIR" ]]; then
+                echo ""
+                echo "============================================"
+                echo "  NEURON EXPLORER ANALYSIS"
+                echo "============================================"
+
+                echo "=== neuron-explorer view (summary-text) ==="
+                neuron-explorer view -d "$NTFF_DIR" \
+                  --output-format summary-text \
+                  --ignore-dma-trace 2>&1 | tee "$RUN_DIR/neuron_explorer_summary.txt" || true
+
+                echo ""
+                echo "=== neuron-explorer view (JSON, skip DMA) ==="
+                neuron-explorer view -d "$NTFF_DIR" \
+                  --output-format json \
+                  --output-file "$RUN_DIR/neuron_explorer_profile.json" \
+                  --ignore-dma-trace 2>&1 | tee "$RUN_DIR/neuron_explorer_view.log" || true
+
+                echo ""
+                echo "=== NEFF COUNT AND SIZE DISTRIBUTION ==="
+                NEFF_COUNT=$(find "$NTFF_DIR" -name '*.neff' | wc -l)
+                echo "Total NEFFs: $NEFF_COUNT"
+                find "$NTFF_DIR" -name '*.neff' -exec ls -l '{}' ';' | awk '{print $5}' | sort -n | awk '
+                  BEGIN { count=0; sum=0 }
+                  { sizes[count++]=$1; sum+=$1 }
+                  END {
+                    if (count == 0) { print "No NEFFs found"; exit }
+                    printf "Total size: %.2f MB\n", sum/1024/1024
+                    printf "Min: %d bytes\n", sizes[0]
+                    printf "Max: %d bytes (%.2f MB)\n", sizes[count-1], sizes[count-1]/1024/1024
+                    printf "Median: %d bytes\n", sizes[int(count/2)]
+                    printf "Mean: %.0f bytes\n", sum/count
+                    printf "\nSize buckets:\n"
+                    small=0; med=0; large=0; xlarge=0
+                    for(i=0;i<count;i++) {
+                      if(sizes[i]<10000) small++
+                      else if(sizes[i]<100000) med++
+                      else if(sizes[i]<1000000) large++
+                      else xlarge++
+                    }
+                    printf "  <10KB  (tiny):   %d\n", small
+                    printf "  10-100KB (small): %d\n", med
+                    printf "  100KB-1MB (med):  %d\n", large
+                    printf "  >1MB  (large):    %d\n", xlarge
+                  }'
+
+                echo ""
+                echo "=== Top 15 LARGEST NEFFs ==="
+                find "$NTFF_DIR" -name '*.neff' -exec ls -lhS '{}' ';' | sort -k5 -h -r | head -15
+
+                echo ""
+                echo "=== Top 15 SMALLEST NEFFs ==="
+                find "$NTFF_DIR" -name '*.neff' -exec ls -lhS '{}' ';' | sort -k5 -h | head -15
+              else
+                echo "WARNING: No profile directory found for neuron-explorer"
+              fi
+
+              # ========================================
+              # ARCHIVE: Copy to S3 persistent storage
+              # ========================================
+              ARCHIVE_DIR="/var/mdl/wan2_2_ti2v/runs/${TIMESTAMP}"
+              echo ""
+              echo "============================================"
+              echo "  ARCHIVING to S3: $ARCHIVE_DIR"
+              echo "============================================"
+              mkdir -p "$ARCHIVE_DIR"
+              cp "$RUN_DIR/wan2_ti2v_output.mp4" "$ARCHIVE_DIR/" 2>/dev/null || true
+              cp "$RUN_DIR/neuron_explorer_summary.txt" "$ARCHIVE_DIR/" 2>/dev/null || true
+              cp "$RUN_DIR/neuron_explorer_profile.json" "$ARCHIVE_DIR/" 2>/dev/null || true
+              cp "$RUN_DIR/neuron_explorer_view.log" "$ARCHIVE_DIR/" 2>/dev/null || true
+              cp -r "$PROFILE_DEST" "$ARCHIVE_DIR/profiles" 2>/dev/null || true
+              echo "Archive complete!"
+              ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
+
+              echo "═══════════════════════════════════════════"
+              echo "  Done! SP=2 TP=4 benchmark complete"
+              echo "═══════════════════════════════════════════"
+          resources:
+            claims:
+              - name: s-lnc1-trn2
+            requests:
+              cpu: 44
+              memory: 440Gi
+            limits:
+              cpu: 44
+              memory: 440Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
+              value: "0"
+            - name: TP_DEGREE
+              value: "4"
+            - name: SP_DEGREE
+              value: "2"
+            - name: T5_RANK
+              value: "2"
+            - name: VAE_TP_DEGREE
+              value: "1"
+            - name: USE_NKI_KERNELS
+              value: "1"
+            - name: USE_NKI_VAE
+              value: "1"
+            - name: USE_NST_SELF_ATTN
+              value: "1"
+            - name: NUM_STEPS
+              value: "10"
+            - name: NUM_RUNS
+              value: "2"
+            - name: FRAME_NUM
+              value: "81"
+            - name: INSTANCE_TYPE
+              value: "trn2.48xlarge"
+            - name: LNC_CONFIG
+              value: "LNC1"
+            - name: NUM_NEURON_DEVICES
+              value: "1"
+            - name: CUDA_VISIBLE_DEVICES
+              value: ""
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

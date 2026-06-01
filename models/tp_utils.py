@@ -29,19 +29,22 @@ _TP_RANK: int = 0
 _TP_WORLD_SIZE: int = 1
 
 
-def init_tp_group(tp_degree: int = 4):
+def init_tp_group(tp_degree: int = 4, sp_degree: int = 1):
     """Initialize tensor parallelism process group.
 
     Must be called after torch.distributed.init_process_group().
-    On Trainium, the 4 NeuronCores within a chip form the TP group.
+    On Trainium, the NeuronCores within a chip form the TP group.
+
+    With SP enabled (sp_degree > 1), the TP group layout matches
+    parallel_state: TP groups are [0..tp-1], [tp..2*tp-1], etc.
 
     Args:
-        tp_degree: Number of ranks in the TP group (default 4 for trn2 chip).
+        tp_degree: Number of ranks in the TP group.
+        sp_degree: Sequence parallelism degree (default 1 = no SP).
     """
     global _TP_GROUP, _TP_RANK, _TP_WORLD_SIZE
 
     if not dist.is_initialized():
-        # Single-process fallback for testing
         _TP_RANK = 0
         _TP_WORLD_SIZE = 1
         _TP_GROUP = None
@@ -53,6 +56,19 @@ def init_tp_group(tp_degree: int = 4):
 
     assert world_size % tp_degree == 0, (
         f"World size {world_size} must be divisible by tp_degree {tp_degree}")
+
+    if sp_degree > 1:
+        # With SP: use parallel_state's attn-tp group if available
+        try:
+            from models.parallel_state import get_group, get_rank as ps_get_rank, get_world_size as ps_get_world_size
+            _TP_GROUP = get_group("attn-tp")
+            _TP_RANK = ps_get_rank("attn-tp")
+            _TP_WORLD_SIZE = ps_get_world_size("attn-tp")
+            print(f"[TP] Using parallel_state attn-tp group: rank={_TP_RANK}/{_TP_WORLD_SIZE}, "
+                  f"global_rank={rank}/{world_size}, SP={sp_degree}")
+            return
+        except Exception:
+            pass
 
     # Create TP groups: ranks [0,1,2,3], [4,5,6,7], etc.
     num_groups = world_size // tp_degree

@@ -1,0 +1,176 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: wan2-ti2v
+  namespace: default
+spec:
+  selector:
+    app: wan2-ti2v
+  ports:
+    - port: 8000
+      targetPort: 8000
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wan2-ti2v
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wan2-ti2v
+  template:
+    metadata:
+      labels:
+        app: wan2-ti2v
+    spec:
+      nodeSelector:
+        node-type: trn2
+      resourceClaims:
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
+      containers:
+        - name: app
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              # ─── Clone repo ─────────────────────────────────────────────
+              cd /tmp
+              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              cd wan2-ti2v-5b
+
+              # ─── Install deps (same as setup.sh but without torchrun launch) ──
+              sed -i '/flash_attn/d' wan_requirements.txt
+              sed -i '/torchaudio/d' wan_requirements.txt
+              uv pip install -r wan_requirements.txt
+              uv pip install "setuptools<81"
+              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+              uv pip install imageio imageio-ffmpeg
+              uv pip install fastapi uvicorn python-multipart
+
+              # ─── Model caching (S3-backed PVC tar pattern) ──────────────
+              MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
+              MODEL_LOCAL="/tmp/Wan2.2-TI2V-5B"
+
+              if [[ -f "$MODEL_TAR" ]]; then
+                echo "Copying model tar from S3 cache..."
+                cp "$MODEL_TAR" /tmp/Wan2.2-TI2V-5B.tar
+                echo "Extracting..."
+                tar xf /tmp/Wan2.2-TI2V-5B.tar -C /tmp/
+                rm -f /tmp/Wan2.2-TI2V-5B.tar
+              else
+                echo "Downloading model from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('Wan-AI/Wan2.2-TI2V-5B', local_dir='${MODEL_LOCAL}', local_dir_use_symlinks=False)
+              "
+                echo "Creating tar archive for S3 cache..."
+                tar cf /tmp/Wan2.2-TI2V-5B.tar -C /tmp Wan2.2-TI2V-5B
+                mkdir -p "$(dirname $MODEL_TAR)"
+                cp /tmp/Wan2.2-TI2V-5B.tar "$MODEL_TAR"
+                rm -f /tmp/Wan2.2-TI2V-5B.tar
+                echo "Cached tar to S3!"
+              fi
+              echo "Model weights ready at $MODEL_LOCAL"
+
+              # ─── Launch serving with torchrun TP-8 ──────────────────────
+              export WAN_DIR="/tmp/wan2-ti2v-5b"
+              export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
+
+              echo "Launching TP-8 serving with torchrun..."
+              torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
+                /tmp/wan2-ti2v-5b/serve_ti2v.py
+          resources:
+            claims:
+              - name: m-trn2
+            requests:
+              cpu: 22
+              memory: 220Gi
+            limits:
+              cpu: 22
+              memory: 220Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "2"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
+              value: "0"
+            - name: USE_NKI_KERNELS
+              value: "1"
+            - name: USE_NKI_VAE
+              value: "1"
+            - name: TP_DEGREE
+              value: "8"
+            - name: T5_RANK
+              value: "2"
+            - name: VAE_TP_DEGREE
+              value: "1"
+            - name: CUDA_VISIBLE_DEVICES
+              value: ""
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 100
+            failureThreshold: 475
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 3
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 300
+            successThreshold: 1
+            failureThreshold: 1000
+            timeoutSeconds: 60
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
