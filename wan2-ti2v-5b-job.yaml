@@ -225,7 +225,7 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: USE_NKI_VAE
-              value: "1"
+              value: "0"
             - name: USE_NST_SELF_ATTN
               value: "1"
             - name: NUM_STEPS
