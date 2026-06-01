@@ -90,7 +90,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 ms = section_i * SECTION + ti * 512
                 mask_tile = nl.ndarray((P, 512), dtype=mask.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=mask_tile, src=mask[:, nl.ds(ms, 512)])
-                mask_sec[:, nl.ds(ti * 512, 512)] = nisa.tensor_copy(
+                mask_sec[:, nl.ds(ti * 512, 512)] = nl.copy(
                     mask_tile, dtype=nl.float32)
 
             for grp_i in range(num_q_grps):
@@ -106,7 +106,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
 
                 for ti in range(tiles_512):
                     qk_psum = nisa.nc_matmul(q_tile, k_sec[:, nl.ds(ti * 512, 512)])
-                    qk_sbuf = nisa.tensor_copy(qk_psum)
+                    qk_sbuf = nl.copy(qk_psum)
                     qk_scaled = nisa.tensor_scalar(qk_sbuf, nl.multiply, softmax_scale)
                     # Add mask (0 for valid, -inf for invalid)
                     masked = nisa.tensor_tensor(
@@ -118,7 +118,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 sec_max = nisa.tensor_reduce(nl.maximum, pmaxes, axis=1)
 
                 # ═══ Phase 2: Online softmax (ALWAYS — no if/else) ═══
-                old_max = nisa.tensor_copy(r_max[:, nl.ds(grp_i, 1)])
+                old_max = nl.copy(r_max[:, nl.ds(grp_i, 1)])
                 new_max = nisa.tensor_tensor(old_max, sec_max, nl.maximum)
                 corr_arg = nisa.tensor_tensor(old_max, new_max, nl.subtract)
                 correction = nisa.activation(nl.exp, corr_arg)
@@ -133,7 +133,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                     chunk = scores[:, nl.ds(si * 2048, 2048)]
                     shifted = nisa.tensor_tensor(chunk, neg_max, nl.add)
                     exp_f32 = nisa.activation(nl.exp, shifted)
-                    exp_sc[:, nl.ds(si * 2048, 2048)] = nisa.tensor_copy(
+                    exp_sc[:, nl.ds(si * 2048, 2048)] = nl.copy(
                         exp_f32, dtype=nl.bfloat16)
                     p_sums[:, nl.ds(si, 1)] = nisa.tensor_reduce(
                         nl.add, exp_f32, axis=1)
@@ -141,7 +141,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
                 sec_sum = nisa.tensor_reduce(nl.add, p_sums, axis=1)
 
                 # Update running sum: r_sum = r_sum * correction + sec_sum
-                old_sum = nisa.tensor_copy(r_sum[:, nl.ds(grp_i, 1)])
+                old_sum = nl.copy(r_sum[:, nl.ds(grp_i, 1)])
                 scaled_sum = nisa.tensor_tensor(old_sum, correction, nl.multiply)
                 r_sum[:, nl.ds(grp_i, 1)] = nisa.tensor_tensor(
                     scaled_sum, sec_sum, nl.add)
@@ -151,15 +151,15 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
 
                 for v_ti in range(tiles_128):
                     col = v_ti * P
-                    attn_chunk = nisa.tensor_copy(exp_sc[:, nl.ds(col, P)])
+                    attn_chunk = nl.copy(exp_sc[:, nl.ds(col, P)])
                     attn_T_psum = nisa.nc_matmul(attn_chunk, id_sbuf)
-                    attn_T = nisa.tensor_copy(attn_T_psum)
+                    attn_T = nl.copy(attn_T_psum)
                     pv_psum = nisa.nc_matmul(attn_T, v_sec[:, v_ti, :])
-                    pv_tile = nisa.tensor_copy(pv_psum)
+                    pv_tile = nl.copy(pv_psum)
                     pv_acc[...] = nisa.tensor_tensor(pv_acc, pv_tile, nl.add)
 
                 # ═══ Phase 4: Update running PV ═══
-                old_pv = nisa.tensor_copy(pv_all[:, grp_i, :])
+                old_pv = nl.copy(pv_all[:, grp_i, :])
                 scaled_pv = nisa.tensor_tensor(old_pv, correction, nl.multiply)
                 pv_all[:, grp_i, :] = nisa.tensor_tensor(
                     scaled_pv, pv_acc, nl.add)
@@ -168,7 +168,7 @@ def wan_flash_self_attn(q, k, v, identity, mask, softmax_scale=None,
         for grp_i in range(num_q_grps):
             rcp = nisa.reciprocal(r_sum[:, nl.ds(grp_i, 1)])
             pv_normed = nisa.tensor_tensor(pv_all[:, grp_i, :], rcp, nl.multiply)
-            pv_out = nisa.tensor_copy(pv_normed, dtype=q.dtype)
+            pv_out = nl.copy(pv_normed, dtype=q.dtype)
             nisa.dma_copy(
                 dst=out[nl.ds(grp_i * P, P), batch_id, :d],
                 src=pv_out)
