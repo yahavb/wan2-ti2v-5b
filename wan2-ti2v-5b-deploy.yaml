@@ -29,8 +29,8 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: m-trn2
-          resourceClaimTemplateName: m-trn2
+        - name: s-lnc1-trn2
+          resourceClaimTemplateName: s-lnc1-trn2
       containers:
         - name: app
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -46,7 +46,7 @@ spec:
               git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
               cd wan2-ti2v-5b
 
-              # ─── Install deps (same as setup.sh but without torchrun launch) ──
+              # ─── Install deps ───────────────────────────────────────────
               sed -i '/flash_attn/d' wan_requirements.txt
               sed -i '/torchaudio/d' wan_requirements.txt
               uv pip install -r wan_requirements.txt
@@ -80,22 +80,22 @@ spec:
               fi
               echo "Model weights ready at $MODEL_LOCAL"
 
-              # ─── Launch serving with torchrun TP-8 ──────────────────────
+              # ─── Launch serving with torchrun (SP=2 x TP=4 = 8 ranks) ──
               export WAN_DIR="/tmp/wan2-ti2v-5b"
               export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
-              echo "Launching TP-8 serving with torchrun..."
-              torchrun --nproc_per_node=${TP_DEGREE:-8} --master_port=29500 \
+              echo "Launching SP=2 TP=4 serving with torchrun..."
+              torchrun --nproc_per_node=8 --master_port=29500 \
                 /tmp/wan2-ti2v-5b/serve_ti2v.py
           resources:
             claims:
-              - name: m-trn2
+              - name: s-lnc1-trn2
             requests:
-              cpu: 22
-              memory: 220Gi
+              cpu: 44
+              memory: 440Gi
             limits:
-              cpu: 22
-              memory: 220Gi
+              cpu: 44
+              memory: 440Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -110,22 +110,30 @@ spec:
               value: "ERROR"
             - name: TORCH_NEURONX_LOG_LEVEL
               value: "ERROR"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "2"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
             - name: NEURON_CC_FLAGS
               value: "--model-type=transformer"
             - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
               value: "0"
-            - name: USE_NKI_KERNELS
-              value: "1"
-            - name: USE_NKI_VAE
-              value: "1"
             - name: TP_DEGREE
-              value: "8"
+              value: "4"
+            - name: SP_DEGREE
+              value: "2"
             - name: T5_RANK
               value: "2"
             - name: VAE_TP_DEGREE
               value: "1"
+            - name: USE_NKI_KERNELS
+              value: "1"
+            - name: USE_NKI_VAE
+              value: "0"
+            - name: USE_NST_SELF_ATTN
+              value: "1"
+            - name: NUM_STEPS
+              value: "10"
+            - name: FRAME_NUM
+              value: "81"
             - name: CUDA_VISIBLE_DEVICES
               value: ""
             - name: HF_TOKEN
