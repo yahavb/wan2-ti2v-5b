@@ -164,6 +164,11 @@ def main():
     tp_rank = get_tp_rank()
     shard_model_tp(model, tp_rank, TP_DEGREE)
 
+    # Patch self-attention for SP if enabled
+    if SP_DEGREE > 1:
+        from models.sp_patch import patch_model_for_sp
+        patch_model_for_sp(model)
+
     # Cast to bf16 then move to Neuron (Conv3d requires matching weight/bias/input dtypes)
     model = model.to(torch.bfloat16)
     model = model.to(NEURON_DEVICE)
