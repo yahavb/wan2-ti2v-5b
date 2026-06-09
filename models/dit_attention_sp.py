@@ -140,4 +140,13 @@ class WanSelfAttentionSP(nn.Module):
 
         # O projection (RowParallel handles all-reduce within TP group)
         out = self.o(out)
+
+        # All-gather output across SP to return full [1, L, dim]
+        if self.sp_degree > 1:
+            out_full = torch.empty(b, L, self.dim, dtype=out.dtype, device=out.device)
+            ps.all_gather_into_tensor(
+                out_full.view(L, self.dim),
+                out.view(sp_shard_len, self.dim), "attn-sp")
+            out = out_full
+
         return out
