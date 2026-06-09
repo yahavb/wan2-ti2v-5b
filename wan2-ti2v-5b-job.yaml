@@ -72,7 +72,7 @@ spec:
               # ========================================
               mkdir -p /tmp/neuron_profile
               echo "============================================"
-              echo "  BENCHMARK: SP=2 TP=4 on s-lnc1-trn2"
+              echo "  BENCHMARK: TP=8 on s-lnc1-trn2"
               echo "  Profiling DISABLED (HBM constrained)"
               echo "============================================"
 
@@ -183,7 +183,7 @@ spec:
               ls -la "$ARCHIVE_DIR/" 2>/dev/null || true
 
               echo "═══════════════════════════════════════════"
-              echo "  Done! SP=2 TP=4 benchmark complete"
+              echo "  Done! TP=8 benchmark complete"
               echo "═══════════════════════════════════════════"
           resources:
             claims:
@@ -215,9 +215,9 @@ spec:
             - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
               value: "0"
             - name: TP_DEGREE
-              value: "4"
+              value: "8"
             - name: SP_DEGREE
-              value: "2"
+              value: "1"
             - name: T5_RANK
               value: "2"
             - name: VAE_TP_DEGREE

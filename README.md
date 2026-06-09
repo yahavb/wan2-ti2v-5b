@@ -4,14 +4,15 @@ Text+Image-to-Video generation (81 frames, 480p) using the Wan2.2-TI2V-5B diffus
 
 ## Benchmark Results
 
-**Single NeuronDevice** (`s-lnc1-trn2`, SP=2 TP=4, 8 NeuronCores):
+**Single NeuronDevice** (`s-lnc1-trn2`, 8 NeuronCores, 81 frames, 704x544, 10 steps):
 
-| | Denoise | s/step | VAE decode | Total |
+| Config | Denoise (warm) | s/step | VAE decode | Total |
 |---|---|---|---|---|
-| Run 1 (cold/compile) | 116.0s | 11.6s | 294.1s | 410.2s |
-| **Run 2 (warm)** | **48.5s** | **4.8s** | **31.7s** | **80.1s** |
+| **TP=8 SP=1 (best)** | **44.3s** | **4.4s** | 32.3s | **76.6s** |
+| TP=4 SP=2 | 50.8s | 5.1s | 31.6s | 82.4s |
 
-- 81 frames, 704x544, 10 denoising steps
+**Winner: TP=8 (no SP)** — 15% faster denoising. With only 3 heads/rank at TP=8, attention is already cheap. SP's all-gather overhead (K/V of 7854 tokens × 30 layers) exceeds the compute saved by halving Q.
+
 - DiT: NST flash self-attention NKI kernel + NKI cross-attention kernel
 - VAE: PyTorch eager on Neuron (NKI kernels pending SDK migration)
 
@@ -65,7 +66,7 @@ kubectl apply -f wan2-ti2v-5b-job.yaml
 kubectl logs -f job/wan2-ti2v-5b
 ```
 
-Configuration: SP=2, TP=4, 10 denoising steps, 81 frames, NST self-attention kernel.
+Configuration: TP=8, 10 denoising steps, 81 frames, NST self-attention kernel.
 
 ### Run Serving (Multi-NeuronDevice)
 
@@ -88,8 +89,8 @@ FastAPI server on port 8000:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TP_DEGREE` | 8 | DiT tensor parallelism degree |
-| `SP_DEGREE` | 1 | Sequence parallelism degree (2 for SP+TP on single ND) |
+| `TP_DEGREE` | 8 | DiT tensor parallelism degree (8 is optimal for this model) |
+| `SP_DEGREE` | 1 | Sequence parallelism degree (SP=2 tested, slower for this model) |
 | `T5_RANK` | 2 | Which rank hosts T5 encoder |
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Enable NKI kernels for DiT attention |
@@ -107,7 +108,7 @@ wan2-ti2v-5b/
 ├── inference_neuron_ti2v.py      # Benchmark script (torchrun entry point)
 ├── serve_ti2v.py                 # FastAPI server with TP-8
 ├── setup.sh                      # Container entrypoint (deps + model + launch)
-├── wan2-ti2v-5b-job.yaml         # K8s job: SP=2 TP=4, s-lnc1-trn2
+├── wan2-ti2v-5b-job.yaml         # K8s job: TP=8, s-lnc1-trn2
 ├── wan2-ti2v-5b-deploy.yaml      # K8s deployment: TP=8, serving
 ├── models/
 │   ├── tp_utils.py               # TP sharding (Column/RowParallelLinear)
