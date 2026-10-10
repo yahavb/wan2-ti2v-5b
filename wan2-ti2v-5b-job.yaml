@@ -229,6 +229,14 @@ spec:
               echo "═══════════════════════════════════════════"
               echo "  Done! TP=${TP_DEGREE} benchmark complete"
               echo "═══════════════════════════════════════════"
+
+              # Keep the pod alive so outputs can be pulled with kubectl cp (no S3 here):
+              #   kubectl cp <pod>:/tmp/wan2_ti2v_output.mp4 ./wan2_ti2v_output.mp4
+              # KEEP_ALIVE_SECONDS=0 exits immediately.
+              if [[ "${KEEP_ALIVE_SECONDS:-0}" != "0" ]]; then
+                echo "Keeping pod alive for ${KEEP_ALIVE_SECONDS}s; video at /tmp/wan2_ti2v_output.mp4"
+                sleep "${KEEP_ALIVE_SECONDS}"
+              fi
           resources:
             claims:
               - name: s-lnc2
@@ -278,6 +286,8 @@ spec:
               value: "1"
             - name: FAST_ATTN_IMPL
               value: "sdpa"
+            - name: KEEP_ALIVE_SECONDS
+              value: "86400"
             - name: NUM_STEPS
               value: "10"
             - name: NUM_RUNS
