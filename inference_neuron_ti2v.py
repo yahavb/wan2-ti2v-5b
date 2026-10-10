@@ -48,6 +48,9 @@ VAE_RANK = 0
 VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "1"))  # 1=single rank (existing), 2=channel-parallel TP
 VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
+# DIT_FAST=1: block-compiled DiT with in-graph collectives + batched CFG (models/fast_dit.py).
+# DIT_FAST=0: original eager path (per-FFN NEFFs, eager all-reduces, 2 forwards/step).
+DIT_FAST = os.environ.get("DIT_FAST", "1") == "1"
 
 NEURON_DEVICE = torch.device("neuron")
 
@@ -70,6 +73,12 @@ USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "0")
 def main():
     rank, world_size = setup_distributed()
     torch.set_grad_enabled(False)
+
+    global T5_RANK
+    if T5_RANK >= world_size:
+        T5_RANK = world_size - 1
+    if DIT_FAST:
+        assert SP_DEGREE == 1, "DIT_FAST requires SP_DEGREE=1"
 
     # Initialize SP/TP parallel groups if SP > 1
     if SP_DEGREE > 1:
@@ -175,18 +184,23 @@ def main():
     if rank == 0:
         logger.info("DiT moved to Neuron, compiling sub-modules...")
 
-    # Compile pure sub-modules (skip time_embedding/time_projection — they receive fp32
-    # sinusoidal input but have bf16 weights, which the Neuron compiler can't handle.
-    # They're tiny modules so eager mode is fine.)
-    model.patch_embedding = torch.compile(model.patch_embedding, backend='neuron', dynamic=False)
-    model.text_embedding = torch.compile(model.text_embedding, backend='neuron', dynamic=False)
-    # time_embedding and time_projection: keep in eager (fp32 input, bf16 weights)
-    model.head = torch.compile(model.head, backend='neuron', dynamic=False)
-    for block in model.blocks:
-        block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
+    if DIT_FAST:
+        # Compilation happens in FastWanDiT once the latent grid is known.
+        if rank == 0:
+            logger.info("DIT_FAST=1: blocks compiled as whole graphs (models/fast_dit.py)")
+    else:
+        # Compile pure sub-modules (skip time_embedding/time_projection — they receive fp32
+        # sinusoidal input but have bf16 weights, which the Neuron compiler can't handle.
+        # They're tiny modules so eager mode is fine.)
+        model.patch_embedding = torch.compile(model.patch_embedding, backend='neuron', dynamic=False)
+        model.text_embedding = torch.compile(model.text_embedding, backend='neuron', dynamic=False)
+        # time_embedding and time_projection: keep in eager (fp32 input, bf16 weights)
+        model.head = torch.compile(model.head, backend='neuron', dynamic=False)
+        for block in model.blocks:
+            block.ffn = torch.compile(block.ffn, backend='neuron', dynamic=False)
 
-    if rank == 0:
-        logger.info(f"Compiled: patch_embed, text_embed, head, FFN x{len(model.blocks)} (time_embed/proj in eager)")
+        if rank == 0:
+            logger.info(f"Compiled: patch_embed, text_embed, head, FFN x{len(model.blocks)} (time_embed/proj in eager)")
 
     dist.barrier()
     if rank == 0:
@@ -327,6 +341,15 @@ def main():
     arg_c = {'context': [context[0][0]], 'seq_len': seq_len}
     arg_null = {'context': [context_null[0][0]], 'seq_len': seq_len}
 
+    fast_dit = None
+    if DIT_FAST:
+        from models.fast_dit import FastWanDiT
+        grid = (T_latent, H_latent // patch_size[1], W_latent // patch_size[2])
+        assert grid[0] * grid[1] * grid[2] == seq_len, f"grid {grid} != seq_len {seq_len}"
+        fast_dit = FastWanDiT(model, grid=grid, guide_scale=config.sample_guide_scale,
+                              device=NEURON_DEVICE)
+        fast_dit.set_context(context[0], context_null[0])
+
     # Save original latent for re-use across runs
     latent_orig = latent.clone()
     run_results = []
@@ -349,18 +372,21 @@ def main():
         run_start = time.time()
         denoise_start = time.time()
         for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
-            latent_model_input = [latent]
+            if fast_dit is not None:
+                noise_pred = fast_dit(latent, t)
+            else:
+                latent_model_input = [latent]
 
-            t_device = t.to(NEURON_DEVICE)
-            temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
-            temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
-            timestep = temp_ts.unsqueeze(0)
+                t_device = t.to(NEURON_DEVICE)
+                temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
+                temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
+                timestep = temp_ts.unsqueeze(0)
 
-            noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-            noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+                noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
-            guide_scale = config.sample_guide_scale
-            noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                guide_scale = config.sample_guide_scale
+                noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             # Scheduler step on CPU
             temp_x0 = sample_scheduler.step(
@@ -372,7 +398,9 @@ def main():
 
         denoise_time = time.time() - denoise_start
         if rank == 0:
-            logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.1f}s/step)")
+            logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.2f}s/step)")
+            if fast_dit is not None and run_idx == 0:
+                fast_dit.log_graph_breaks()
 
         # ── Decode with VAE ──
         vae_start = time.time()

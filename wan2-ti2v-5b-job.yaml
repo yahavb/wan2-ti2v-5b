@@ -14,12 +14,13 @@ spec:
       nodeSelector:
         node-type: trn2
       resourceClaims:
-        - name: s-lnc1-trn2
-          resourceClaimTemplateName: s-lnc1-trn2
+        - name: s-lnc2
+          resourceClaimTemplateName: s-lnc2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-          imagePullPolicy: IfNotPresent
+          #image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: Always
           command:
             - /bin/bash
             - "-exc"
@@ -27,16 +28,59 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              git clone -b fast-dit https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
               cd wan2-ti2v-5b
+
+              # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
+              # errors with "No virtual environment found". Target the SAME interpreter
+              # python3 uses (where torch-neuronx already lives) via --python.
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
 
               # ─── Install deps ─────────────────────────────────────────────
               sed -i '/flash_attn/d' wan_requirements.txt
               sed -i '/torchaudio/d' wan_requirements.txt
-              uv pip install -r wan_requirements.txt
-              uv pip install "setuptools<81"
-              uv pip install git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
-              uv pip install imageio imageio-ffmpeg
+              # SDK 2.31 image ships numpy 2.5.1; the SDK's own NKI kernels (e.g.
+              # nki_..._set_rng_state_gpsimd fired at init_process_group) use np.long,
+              # re-added as an alias only in numpy>=2.0. The old `numpy<2` pin downgrades
+              # to 1.26.4 (np.long removed in 1.24) -> "module 'numpy' has no attribute
+              # 'long'" neuronx-cc exit 70. Strip the pin so the image's numpy 2.x stays.
+              sed -i '/numpy/d' wan_requirements.txt
+              uv pip install --python "$UVPY" -r wan_requirements.txt
+              uv pip install --python "$UVPY" "setuptools<81"
+              uv pip install --python "$UVPY" git+https://github.com/pytorch/vision.git@v0.25.0 --no-deps --no-cache --no-build-isolation
+
+              # SDK 2.31 DLC ships a python3 built WITHOUT the _lzma stdlib extension.
+              # torchvision eagerly imports datasets/utils.py -> `import lzma`, which
+              # crashes the whole `import torchvision` chain at import time. torchvision.io
+              # (all we actually use) never opens .xz files, so replace lzma with a stub
+              # namespace that exposes .open (raises only if actually called) so import
+              # succeeds.
+              "$UVPY" - <<'PY'
+              import importlib.util as u, pathlib
+              loc = u.find_spec('torchvision').submodule_search_locations[0]
+              p = pathlib.Path(loc) / 'datasets' / 'utils.py'
+              s = p.read_text()
+              if '_no_lzma' not in s:
+                  stub = (
+                      'try:\n'
+                      '    import lzma\n'
+                      'except ImportError:\n'
+                      '    import types as _t\n'
+                      '    def _no_lzma(*a, **k):\n'
+                      '        raise RuntimeError("lzma unavailable in this Python build")\n'
+                      '    lzma = _t.SimpleNamespace(open=_no_lzma, LZMAFile=_no_lzma)\n'
+                  )
+                  s = s.replace('import lzma\n', stub, 1)
+                  p.write_text(s)
+                  print('Patched torchvision datasets/utils.py: lzma replaced with stub')
+              else:
+                  print('torchvision datasets/utils.py already patched')
+              PY
+
+              # einops preinstalled on the old concourse image, absent from the SDK 2.31
+              # native-pytorch image and not in wan_requirements.txt -> add it explicitly.
+              uv pip install --python "$UVPY" imageio imageio-ffmpeg einops
 
               # ─── Model caching (S3-backed PVC tar pattern) ───────────────
               MODEL_TAR="/var/mdl/wan2_2_ti2v/Wan2.2-TI2V-5B.tar"
@@ -187,13 +231,15 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: s-lnc1-trn2
+              - name: s-lnc2
             requests:
               cpu: 44
               memory: 440Gi
+              ephemeral-storage: 120Gi
             limits:
-              cpu: 44
-              memory: 440Gi
+              cpu: 90
+              memory: 900Gi
+              ephemeral-storage: 200Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -235,7 +281,7 @@ spec:
             - name: FRAME_NUM
               value: "81"
             - name: INSTANCE_TYPE
-              value: "trn2.48xlarge"
+              value: "trn3-dev1.48xlarge"
             - name: LNC_CONFIG
               value: "LNC1"
             - name: NUM_NEURON_DEVICES
