@@ -243,8 +243,8 @@ spec:
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
-            - name: 621547421844-ap-southeast-4-pvc
-              mountPath: /var/mdl
+            #- name: 621547421844-ap-southeast-4-pvc
+            #  mountPath: /var/mdl
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
@@ -297,6 +297,7 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: HF_TOKEN
+                  optional: true
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -307,6 +308,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 32Gi
-        - name: 621547421844-ap-southeast-4-pvc
-          persistentVolumeClaim:
-            claimName: 621547421844-ap-southeast-4-pvc
+        #- name: 621547421844-ap-southeast-4-pvc
+        #  persistentVolumeClaim:
+        #    claimName: 621547421844-ap-southeast-4-pvc
