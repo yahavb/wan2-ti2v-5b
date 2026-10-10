@@ -192,8 +192,12 @@ spec:
               value: "10"
             - name: NUM_RUNS
               value: "2"
+            - name: HEIGHT
+              value: "368"
+            - name: WIDTH
+              value: "480"
             - name: FRAME_NUM
-              value: "81"
+              value: "21"
             - name: INSTANCE_TYPE
               value: "trn2"
             - name: LNC_CONFIG

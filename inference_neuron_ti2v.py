@@ -63,6 +63,9 @@ def setup_distributed():
 
 
 FRAME_NUM = int(os.environ.get("FRAME_NUM", "81"))
+# Output size; unset = pick from the input image aspect within 480*832 area.
+OUT_HEIGHT = int(os.environ.get("HEIGHT", "0"))
+OUT_WIDTH = int(os.environ.get("WIDTH", "0"))
 INSTANCE_TYPE = os.environ.get("INSTANCE_TYPE", "unknown")
 LNC_CONFIG = os.environ.get("LNC_CONFIG", "unknown")
 NUM_NEURON_DEVICES = os.environ.get("NUM_NEURON_DEVICES", "unknown")
@@ -251,13 +254,26 @@ def main():
 
     vae_stride = config.vae_stride  # (4, 16, 16)
     patch_size = config.patch_size   # (1, 2, 2)
-    frame_num = 81
+    frame_num = FRAME_NUM
+    assert (frame_num - 1) % vae_stride[0] == 0, f"FRAME_NUM must be 4k+1, got {frame_num}"
     max_area = 480 * 832
 
     ih, iw = img.height, img.width
     dh = patch_size[1] * vae_stride[1]
     dw = patch_size[2] * vae_stride[2]
-    ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+    if OUT_HEIGHT and OUT_WIDTH:
+        # Generate at the next multiple of 32 (VAE 16x * patch 2), center-crop after decode.
+        oh = -(-OUT_HEIGHT // dh) * dh
+        ow = -(-OUT_WIDTH // dw) * dw
+        crop_h, crop_w = OUT_HEIGHT, OUT_WIDTH
+    else:
+        ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+        crop_h, crop_w = oh, ow
+
+    def crop_video(v):
+        """Center-crop a decoded [C, F, H, W] video to the requested output size."""
+        top, left = (v.shape[-2] - crop_h) // 2, (v.shape[-1] - crop_w) // 2
+        return v[..., top:top + crop_h, left:left + crop_w]
 
     scale = max(ow / iw, oh / ih)
     img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
@@ -311,7 +327,7 @@ def main():
         logger.info("-" * 70)
         logger.info("  INPUT SHAPES & MODEL CONFIG")
         logger.info("-" * 70)
-        logger.info(f"  Image:           {oh}x{ow} (original {ih}x{iw})")
+        logger.info(f"  Image:           {oh}x{ow} (original {ih}x{iw}), output crop {crop_h}x{crop_w}")
         logger.info(f"  Frames:          {frame_num}")
         logger.info(f"  VAE stride:      {vae_stride}")
         logger.info(f"  Patch size:      {patch_size}")
@@ -412,7 +428,7 @@ def main():
             videos = vae.decode(x0)
             # Only rank 0 saves the video (output is all-reduced, same on all VAE ranks)
             if rank == VAE_RANK:
-                video = videos[0]
+                video = crop_video(videos[0])
                 import imageio
                 output_path = "/tmp/wan2_ti2v_output.mp4"
                 video_cpu = video.cpu().float()
@@ -427,7 +443,7 @@ def main():
             logger.info(f"{run_label} VAE decode on Neuron...")
             x0 = [latent.to(torch.bfloat16)]
             videos = vae.decode(x0)
-            video = videos[0]
+            video = crop_video(videos[0])
             import imageio
             output_path = "/tmp/wan2_ti2v_output.mp4"
             video_cpu = video.cpu().float()
@@ -462,7 +478,7 @@ def main():
         logger.info(f"  NeuronDevices:   {NUM_NEURON_DEVICES}")
         logger.info(f"  TP degree:       {TP_DEGREE}  (DiT)  |  SP: {SP_DEGREE}  |  VAE TP: {VAE_TP_DEGREE}")
         logger.info(f"  NKI kernels:     DiT={USE_NKI_KERNELS}, VAE={USE_NKI_VAE}, NST_self_attn={USE_NST_SELF_ATTN}")
-        logger.info(f"  Resolution:      {oh}x{ow}, {frame_num} frames")
+        logger.info(f"  Resolution:      {oh}x{ow} generated, {crop_h}x{crop_w} output, {frame_num} frames")
         logger.info(f"  Latent:          [{z_dim}, {T_latent}, {H_latent}, {W_latent}]")
         logger.info(f"  Seq len:         {seq_len}")
         logger.info(f"  Steps:           {NUM_STEPS}")
