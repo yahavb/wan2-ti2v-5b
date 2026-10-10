@@ -1,20 +1,49 @@
 # Wan2.2-TI2V-5B on AWS Trainium
 
-Text+Image-to-Video generation (81 frames, 480p) using the Wan2.2-TI2V-5B diffusion model, optimized for AWS Trainium (trn2) with tensor parallelism and sequence parallelism.
+Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS Trainium (trn2), with a block-compiled tensor-parallel DiT (`models/fast_dit.py`).
 
 ## Benchmark Results
 
-**Single NeuronDevice** (`s-lnc1-trn2`, 8 NeuronCores, 81 frames, 704x544, 10 steps):
+All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
+warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit`
+branch; original-path rows are the earlier measurements from `main`.
 
-| Config | Denoise (warm) | s/step | VAE decode | Total |
-|---|---|---|---|---|
-| **TP=8 SP=1 (best)** | **44.3s** | **4.4s** | 32.3s | **76.6s** |
-| TP=4 SP=2 | 50.8s | 5.1s | 31.6s | 82.4s |
+### 704x544, 81 frames (7854 DiT tokens)
 
-**Winner: TP=8 (no SP)** — 15% faster denoising. With only 3 heads/rank at TP=8, attention is already cheap. SP's all-gather overhead (K/V of 7854 tokens × 30 layers) exceeds the compute saved by halving Q.
+| Path | Layout | Claim | Denoise | s/step | VAE decode | Total | First run (compile) |
+|---|---|---|---|---|---|---|---|
+| **Fast DiT** (`DIT_FAST=1`) | **TP=8, LNC1** | `s-lnc1` | **19.1s** | **1.91** | 17.7s | **36.8s** | 261.9s |
+| Fast DiT (`DIT_FAST=1`) | TP=4, LNC2 | `s-lnc2` | 25.5s | 2.55 | 10.8s | 36.4s | 286.8s |
+| Original eager path (`DIT_FAST=0`) | TP=8, LNC1 | `s-lnc1-trn2` | 44.3s | 4.4 | 32.3s | 76.6s | — |
+| Original eager path, SP | SP=2 TP=4, LNC1 | `s-lnc1-trn2` | 50.8s | 5.1 | 31.6s | 82.4s | — |
 
-- DiT: NST flash self-attention NKI kernel + NKI cross-attention kernel
-- VAE: PyTorch eager on Neuron (NKI kernels pending SDK migration)
+- **Fast DiT is 2.3x faster on denoise than the original path on the same layout** (4.4 -> 1.91 s/step).
+- **TP=8 LNC1 beats TP=4 LNC2 on the DiT by 25%** (1.91 vs 2.55 s/step) on the same physical device.
+- **VAE favors LNC2** (10.8s vs 17.7s): it runs on one logical core, which is 2 physical cores at LNC2
+  and 1 at LNC1. End to end the two layouts tie at 10 steps; TP=8 LNC1 wins as step count grows.
+- Output video validated visually for the TP=4 LNC2 fast path.
+
+### 368x480, 21 frames (generated at 384x480, center-cropped; 1080 DiT tokens)
+
+| Path | Layout | Denoise | s/step | VAE decode | Total | First run (compile) |
+|---|---|---|---|---|---|---|
+| Fast DiT (`DIT_FAST=1`) | TP=8, LNC1 | 1.5s | 0.15 | 2.4s | **3.9s** | 83.5s |
+
+Set with `HEIGHT=368 WIDTH=480 FRAME_NUM=21` (sizes that are not multiples of 32 are generated
+at the next multiple of 32 and center-cropped after decode).
+
+### What the fast DiT path does (`models/fast_dit.py`)
+
+- Each of the 30 transformer blocks is **one compiled graph** with the TP all-reduces inside it
+  (functional collectives). The original path compiled only the FFN and ran attention, norms,
+  modulation and collectives eagerly.
+- **CFG batched**: cond and uncond run as batch=2 in one forward, one model call per step.
+- **RoPE cos/sin built once** on device (the original rebuilt them on CPU twice per block per forward).
+- **Per-frame time modulation**: TI2V has only two distinct timesteps (image frame = 0, rest = t),
+  so modulation is computed for latent frames instead of every token. Exact, not an approximation.
+- **Text embedding once** per generation.
+- **Attention via SDPA** (TorchNeuron's built-in flash kernel; LNC2-aware). `FAST_ATTN_IMPL=nki`
+  uses this repo's NKI kernels instead (single-program, so one physical core per logical core at LNC2).
 
 ## Architecture
 
@@ -23,12 +52,12 @@ Three models run in a pipeline:
 | Model | Role | Placement |
 |-------|------|-----------|
 | **T5 (UMT5-XXL)** | Text encoder | Single rank (rank 2) |
-| **DiT (WanModel)** | 30-layer diffusion transformer | TP-sharded across all ranks |
+| **DiT (WanModel)** | 30-layer diffusion transformer | TP-sharded across all ranks; fast path compiles each block as one graph |
 | **VAE (Wan2.2_VAE)** | CausalConv3d encoder/decoder | Rank 0, PyTorch eager |
 
-**DiT specs:** dim=3072, 24 heads, 30 layers, ffn_dim=14336, ~5.3B params total, ~1.32B per rank at TP=4.
+**DiT specs:** dim=3072, 24 heads, 30 layers, ffn_dim=14336, ~5.3B params total; ~1.32B per rank at TP=4 (6 heads/rank), ~0.66B at TP=8 (3 heads/rank).
 
-### Parallelism Strategy (SP=2 TP=4)
+### Legacy: SP=2 TP=4 (original path only, `DIT_FAST=0`)
 
 8 ranks on a single NeuronDevice (LNC1 = 2 NCs/ND x 4 NDs):
 
@@ -54,19 +83,24 @@ Supporting infrastructure: `kernels/nkilib_compat.py`, `kernels/nkilib_modular_a
 
 ### Prerequisites
 
-- Kubernetes cluster with trn2 nodes (tested on trn2.48xlarge)
-- DRA resource claims: `s-lnc1-trn2` (single ND) or `m-lnc1-trn2` (2 NDs)
-- S3-backed PVC mounted at `/var/mdl` for model weight caching
-- Secrets: `hf-token` (HuggingFace), `github-token` (repo clone)
+- Kubernetes cluster with trn2 nodes
+- DRA resource claims: `s-lnc1` (1 device, 8 logical cores, TP=8) or `s-lnc2` (1 device, 4 logical cores, TP=4)
+- Secret `github-token` (repo clone). `hf-token` is optional (the model is public).
+- Optional S3-backed PVC at `/var/mdl` for weight caching; without it weights download from Hugging Face each run.
 
-### Run Benchmark (Single NeuronDevice)
+### Run Benchmark
 
 ```bash
-kubectl apply -f wan2-ti2v-5b-job.yaml
-kubectl logs -f job/wan2-ti2v-5b
+kubectl apply -f wan2-ti2v-5b-tp8-job.yaml   # TP=8 LNC1 (fastest DiT)
+kubectl apply -f wan2-ti2v-5b-job.yaml       # TP=4 LNC2
+kubectl logs -f job/wan2-ti2v-5b-tp8
 ```
 
-Configuration: TP=8, 10 denoising steps, 81 frames, NST self-attention kernel.
+Both jobs clone the `fast-dit` branch and run `scripts/prof/bench_profile.sh`:
+clean pass (`CLEAN_RUNS` runs; run 1 compiles, the rest are the latency), then a short profiled pass
+with the Neuron runtime inspector on rank 0, then per-graph analysis. Results go to
+`/tmp/results/<run>.tar.gz` in the pod, which stays up for `KEEP_ALIVE_SECONDS` so you can
+`kubectl cp` the tarball and `output_clean.mp4` (the commands are printed at the end of the log).
 
 ### Run Serving (Multi-NeuronDevice)
 
@@ -89,16 +123,23 @@ FastAPI server on port 8000:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TP_DEGREE` | 8 | DiT tensor parallelism degree (8 is optimal for this model) |
-| `SP_DEGREE` | 1 | Sequence parallelism degree (SP=2 tested, slower for this model) |
-| `T5_RANK` | 2 | Which rank hosts T5 encoder |
-| `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
-| `USE_NKI_KERNELS` | 1 | Enable NKI kernels for DiT attention |
-| `USE_NKI_VAE` | 0 | Enable NKI kernels for VAE (disabled pending SDK migration) |
-| `USE_NST_SELF_ATTN` | 1 | Use Neuron Science Team self-attention kernel |
+| `TP_DEGREE` | 8 | DiT tensor parallelism degree (= torchrun ranks) |
+| `SP_DEGREE` | 1 | Sequence parallelism (original path only; must be 1 with `DIT_FAST=1`) |
+| `DIT_FAST` | 1 | Block-compiled DiT with in-graph all-reduces + batched CFG; 0 = original eager path |
+| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel) or `nki` (this repo's kernels) |
+| `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
+| `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces (0 = off) |
+| `HEIGHT`, `WIDTH` | unset | Output size; unset = derived from the input image aspect within 480x832 area |
+| `FRAME_NUM` | 81 | Output frames (must be 4k+1) |
 | `NUM_STEPS` | 10 | Denoising steps |
-| `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold, run 2=warm) |
-| `FRAME_NUM` | 81 | Output video frames |
+| `NUM_RUNS` | 2 | Iterations per process (run 1 compiles) |
+| `T5_RANK` | 2 | Rank hosting the T5 encoder (clamped to world size) |
+| `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
+| `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
+| `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
+| `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
+| `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |
+| `KEEP_ALIVE_SECONDS` | 86400 (jobs) | Keep the pod up after the run for `kubectl cp` |
 | `MODEL_PATH` | /tmp/Wan2.2-TI2V-5B | Path to model weights |
 
 ## Project Structure
@@ -108,13 +149,16 @@ wan2-ti2v-5b/
 ├── inference_neuron_ti2v.py      # Benchmark script (torchrun entry point)
 ├── serve_ti2v.py                 # FastAPI server with TP-8
 ├── setup.sh                      # Container entrypoint (deps + model + launch)
-├── wan2-ti2v-5b-job.yaml         # K8s job: TP=8, s-lnc1-trn2
+├── wan2-ti2v-5b-job.yaml         # K8s job: TP=4, s-lnc2 (LNC2)
+├── wan2-ti2v-5b-tp8-job.yaml     # K8s job: TP=8, s-lnc1 (LNC1)
 ├── wan2-ti2v-5b-deploy.yaml      # K8s deployment: TP=8, serving
 ├── models/
+│   ├── fast_dit.py               # Fast DiT: block-compiled, batched CFG
 │   ├── tp_utils.py               # TP sharding (Column/RowParallelLinear)
 │   ├── parallel_state.py         # SP/TP process group registry
 │   ├── dit_attention_sp.py       # SP-aware bidirectional self-attention
 │   └── vae_tp.py                 # VAE channel TP (optional)
+├── scripts/prof/                 # 3-run benchmark + profiling harness
 ├── kernels/
 │   ├── self_attention_nst.py     # NST flash self-attention (primary)
 │   ├── cross_attention.py        # NKI cross-attention
@@ -139,13 +183,11 @@ wan2-ti2v-5b/
 ## Neuron-Specific Constraints
 
 - **No float64/complex types** on device -- custom `rope_neuron.py` avoids `torch.polar`/`view_as_complex`
-- **torch.compile(backend='neuron')** for DiT FFN/embeddings/head; time_embedding stays eager (fp32 input, bf16 weights)
+- **torch.compile(backend='neuron')**: fast path compiles each DiT block as one graph with in-graph all-reduces; the original path compiles only FFN/embeddings/head
 - **All collectives on main thread** -- the serving FastAPI thread queues requests to main thread which owns Neuron collective signatures
-- **All-reduce chunking** -- payloads chunked to <=8MB to avoid NRT size-limit rejections at TP=8
+- **All-reduce chunking** (original eager path) -- payloads chunked to <=8MB to avoid NRT size-limit rejections at TP=8; not needed in-graph
 - **NKI SDK (new)** -- uses `import nki` (bare), `@nki.jit` decorators, `@wrap_nki` for PyTorch integration, dst-style `nisa.nc_matmul(dst, stationary, moving)`
 
 ## Model Weights
 
-First run downloads from HuggingFace (`Wan-AI/Wan2.2-TI2V-5B`) and caches as tar on the S3-backed PVC. Subsequent runs extract from cache (~30s).
-
-Requires `HF_TOKEN` secret for gated model access.
+First run downloads from Hugging Face (`Wan-AI/Wan2.2-TI2V-5B`, public) and, if the S3-backed PVC is mounted, caches it as a tar there. Subsequent runs extract from cache (~30s).
