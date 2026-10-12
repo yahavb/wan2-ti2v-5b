@@ -114,6 +114,8 @@ if [ -n "$RANKDIR" ]; then
   timeout 1800 "$PROF" view -d "$RANKDIR" --output-format summary-text --ignore-dma-trace \
     > "$ANA/system_summary.txt" 2>&1 || true
   echo "  system summary-text: $(wc -l < "$ANA/system_summary.txt") lines"
+  echo "=== system summary (rank ${PROFILE_RANKS:-0}) ==="
+  head -150 "$ANA/system_summary.txt"
 fi
 
 N_OK=0; N_TRY=0
