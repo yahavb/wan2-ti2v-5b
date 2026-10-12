@@ -6,7 +6,7 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**Versus GPUs** (5B, 704x544, 81 frames, 10 steps): Trainium2 one device **28.2s** total (1.92 s/step) — **1.7x slower than A100** (16.92s), 3.5x slower than H100 (8.02s), 2.1x faster than the earlier Trainium2 run (58.68s).
+**Versus GPUs** (5B, 704x544, 81 frames, 10 steps): Trainium2 one device **21.0s** total (1.19 s/step) — denoise at parity with A100 (11.9 vs 11.4s), **1.24x slower than A100 end to end** (16.92s), 2.6x slower than H100 (8.02s), 2.8x faster than the earlier Trainium2 run (58.68s).
 
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
 warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
