@@ -63,6 +63,7 @@ python test_vae_kernels.py
 | `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron built-in flash kernel, LNC2-aware) or `nki` (our kernels/, single-program) |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces along seq (0 = off) |
+| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk (3 graphs) |
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold/compile, run 2=warm) |
 | `FRAME_NUM` | 81 | Output video frames |

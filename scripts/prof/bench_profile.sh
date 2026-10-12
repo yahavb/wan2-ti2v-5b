@@ -173,6 +173,22 @@ while read -r NEFF; do
     > "$SW/$h.json" 2>/dev/null && [ -s "$SW/$h.json" ] && OK=$((OK+1))
 done < <(xargs -r ls -S < "$RESULTS/neff_cache_list.txt" 2>/dev/null | head -"$SWEEP_MAX")
 echo "single-io captured+viewed OK: $OK / $N"
+if [ "$OK" -gt 0 ]; then
+  echo "=== [4b] single-io engine table + ranking ==="
+  python3 scripts/prof/profile_all_neffs.py "$SW" 2>&1 | tee "$RESULTS/single_io_breakdown.txt"
+  python3 scripts/prof/rank_neffs.py "$SW" 2>&1 | tee "$RESULTS/single_io_ranking.txt"
+  # If the runtime trace gave no pairs, preserve the single-io captures (content-hash pairs).
+  if ! ls -d "$PAIRS"/rank* >/dev/null 2>&1; then
+    i=0
+    for h in $(python3 scripts/prof/top_neffs.py "$SW" "$MAX_PAIRS"); do
+      i=$((i+1)); NEFF=$(grep "/$h.neff$" "$RESULTS/neff_cache_list.txt" | head -1)
+      [ -n "$NEFF" ] && [ -f "$SW/$h.ntff" ] || continue
+      D="$PAIRS/$(printf 'rank%02d' $i)_${h:0:24}__singleio"
+      mkdir -p "$D"; cp "$NEFF" "$D/"; cp "$SW/$h.ntff" "$D/"; cp "$SW/$h.json" "$D/summary.json"
+      echo "preserved $D"
+    done
+  fi
+fi
 
 # ═══ [5] instruction-level op/DMA report on the preserved pairs ═══
 if ls -d "$PAIRS"/rank* >/dev/null 2>&1; then

@@ -41,7 +41,7 @@ at the next multiple of 32 and center-cropped after decode).
 - **RoPE cos/sin built once** on device (the original rebuilt them on CPU twice per block per forward).
 - **Per-frame time modulation**: TI2V has only two distinct timesteps (image frame = 0, rest = t),
   so modulation is computed for latent frames instead of every token. Exact, not an approximation.
-- **Text embedding once** per generation.
+- **Text embedding and cross-attention K/V once** per generation (the text context is fixed across steps).
 - **Attention via SDPA** (TorchNeuron's built-in flash kernel; LNC2-aware). `FAST_ATTN_IMPL=nki`
   uses this repo's NKI kernels instead (single-program, so one physical core per logical core at LNC2).
 
@@ -137,6 +137,7 @@ FastAPI server on port 8000:
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
+| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk (3 graphs; experimental) |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
 | `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |
 | `KEEP_ALIVE_SECONDS` | 86400 (jobs) | Keep the pod up after the run for `kubectl cp` |

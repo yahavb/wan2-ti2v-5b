@@ -14,7 +14,8 @@ Ports the main Difflet ideas onto our TP-sharded WanModel without changing weigh
      exist (0 for the image frame, t elsewhere), constant within a latent frame. The
      time embedding / 6-way modulation is computed for F frames instead of L tokens
      (21 vs 8190 rows) and broadcast over each frame's tokens.
-  5. Text embedding computed once per generation (context is fixed across steps).
+  5. Text embedding and every block's cross-attention K/V (incl. k-norm) computed once
+     per generation (context is fixed across steps).
 
 Attention backend (FAST_ATTN_IMPL):
   sdpa (default) -- F.scaled_dot_product_attention; TorchNeuron lowers it to its
@@ -78,6 +79,13 @@ def _tp_rms_qk(q, k, norm_q, norm_k):
     q = (qf * q_inv).type_as(q) * norm_q.weight
     k = (kf * k_inv).type_as(k) * norm_k.weight
     return q, k
+
+
+def _tp_rms(x, norm):
+    """TPRMSNorm for one tensor (global RMS via all-reduce of the local sum-of-squares)."""
+    xf = x.float()
+    ss = _all_reduce(xf.pow(2).sum(-1, keepdim=True))
+    return (xf * torch.rsqrt(ss / norm.global_dim + norm.eps)).type_as(x) * norm.weight
 
 
 def _rope(x, cos, sin):
@@ -153,7 +161,7 @@ class _FastBlock(nn.Module):
         self.attn_impl = attn_impl
         self.identity = identity
 
-    def forward(self, x, e, cos, sin, context):
+    def forward(self, x, e, cos, sin, ck, cv):
         blk, nf = self.block, self.num_frames
         sa, ca = blk.self_attn, blk.cross_attn
         B, L, _ = x.shape
@@ -173,14 +181,10 @@ class _FastBlock(nn.Module):
         y = _row_linear(sa.o, y.reshape(B, L, n * d))
         x = x + _gate(y, e[2], nf)
 
-        # cross-attention (context is [B, Lc, C], cond/uncond per batch row)
+        # cross-attention; ck/cv [B, Lc, n, d] precomputed once per prompt (_FastCrossKV)
         h = blk.norm3(x)
-        Lc = context.shape[1]
-        q, k = _tp_rms_qk(F.linear(h, ca.q.weight, ca.q.bias),
-                          F.linear(context, ca.k.weight, ca.k.bias), ca.norm_q, ca.norm_k)
-        v = F.linear(context, ca.v.weight, ca.v.bias).view(B, Lc, n, d)
-        q, k = q.view(B, L, n, d), k.view(B, Lc, n, d)
-        y = _nki_cross(q, k, v, self.identity) if self.attn_impl == "nki" else _sdpa(q, k, v)
+        q = _tp_rms(F.linear(h, ca.q.weight, ca.q.bias), ca.norm_q).view(B, L, n, d)
+        y = _nki_cross(q, ck, cv, self.identity) if self.attn_impl == "nki" else _sdpa(q, ck, cv)
         x = x + _row_linear(ca.o, y.reshape(B, L, n * d))
 
         # FFN
@@ -188,6 +192,22 @@ class _FastBlock(nn.Module):
         h = blk.ffn[1](F.linear(h, blk.ffn[0].weight, blk.ffn[0].bias))
         y = _row_linear(blk.ffn[2], h)
         return x + _gate(y, e[5], nf)
+
+
+class _FastCrossKV(nn.Module):
+    """A block's cross-attention K (normed) and V from the text context; once per prompt."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def forward(self, context):
+        ca = self.block.cross_attn
+        B, Lc, _ = context.shape
+        n, d = ca.num_heads, ca.head_dim
+        k = _tp_rms(F.linear(context, ca.k.weight, ca.k.bias), ca.norm_k).view(B, Lc, n, d)
+        v = F.linear(context, ca.v.weight, ca.v.bias).view(B, Lc, n, d)
+        return k, v
 
 
 class _FastHead(nn.Module):
@@ -277,6 +297,7 @@ class FastWanDiT:
             torch.compile(_FastBlock(b, self.num_frames, FAST_ATTN_IMPL, identity), **kw)
             for b in model.blocks
         ]
+        self.cross_kv = [torch.compile(_FastCrossKV(b), **kw) for b in model.blocks]
         self.head = torch.compile(
             _FastHead(model.head, self.grid, model.patch_size, model.out_dim, guide_scale), **kw)
         self.context = None
@@ -285,7 +306,8 @@ class FastWanDiT:
 
     def set_context(self, ctx_cond, ctx_null):
         ctx = torch.cat([ctx_cond, ctx_null], dim=0).to(torch.bfloat16)  # [2, 512, 4096]
-        self.context = self.text(ctx)
+        context = self.text(ctx)
+        self.context = [kv(context) for kv in self.cross_kv]  # per block (k, v)
 
     def _time_embed(self, t):
         """Per-frame time embedding: frame 0 (image) has t=0, other frames t."""
@@ -303,8 +325,8 @@ class FastWanDiT:
         assert self.context is not None, "call set_context() first"
         e, e0 = self._time_embed(t)
         x = self.patch(latent.to(torch.bfloat16))
-        for blk in self.blocks:
-            x = blk(x, e0, self.cos, self.sin, self.context)
+        for blk, (ck, cv) in zip(self.blocks, self.context):
+            x = blk(x, e0, self.cos, self.sin, ck, cv)
         return self.head(x, e)
 
     @staticmethod

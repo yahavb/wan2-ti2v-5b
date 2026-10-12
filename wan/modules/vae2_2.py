@@ -11,6 +11,9 @@ from einops import rearrange
 
 # ─── NKI Kernel Loading for Neuron ─────────────────────────────────────
 _USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "1") == "1"
+# VAE_COMPILE=1: torch.compile the decoder per latent-frame chunk (a handful of graphs:
+# first chunk, second chunk, steady state -- the causal feat_cache changes shape twice).
+_VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
@@ -962,17 +965,23 @@ class WanVAE_(nn.Module):
         z = z.to(self.conv2.weight.dtype)
         iter_ = z.shape[2]
         x = self.conv2(z)
+        decoder = self.decoder
+        if _VAE_COMPILE:
+            if getattr(self, "_compiled_decoder", None) is None:
+                torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+                self._compiled_decoder = torch.compile(self.decoder, backend="neuron", dynamic=False)
+            decoder = self._compiled_decoder
         for i in range(iter_):
             self._conv_idx = [0]
             if i == 0:
-                out = self.decoder(
+                out = decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                     first_chunk=True,
                 )
             else:
-                out_ = self.decoder(
+                out_ = decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
