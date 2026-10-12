@@ -51,6 +51,8 @@ CONST_MAX_SOFTMAX_MAX = float(os.environ.get("CONST_MAX_SOFTMAX_MAX", "15.0"))
 #             scores at 70, so layers that can exceed it would have their peaks flattened.
 #   "all"  -- every layer;  or a comma list of layer indices.
 CONST_MAX_LAYERS = os.environ.get("CONST_MAX_LAYERS", "auto")
+# SBUF bytes the const-max kernel may use per call for Q + fp32 output accumulators.
+CONST_MAX_SBUF_BUDGET = int(os.environ.get("CONST_MAX_SBUF_BUDGET", str(8 * 1024 * 1024)))
 CONST_MAX_HARD_LIMIT = float(os.environ.get("CONST_MAX_HARD_LIMIT", "70"))
 
 
@@ -165,7 +167,14 @@ def _const_max_self(q, k, v):
     qn = q.permute(0, 2, 3, 1).reshape(B * n, d, L)
     kn = k.permute(0, 2, 3, 1).reshape(B * n, d, L)
     vn = v.permute(0, 2, 1, 3).reshape(B * n, L, d)
-    out = attention_const_max(qn, kn, vn, CONST_MAX_SOFTMAX_MAX, d ** -0.5)
+    # The kernel keeps every head's Q blocks and fp32 output accumulator resident in SBUF;
+    # at long sequences that overflows SBUF (neuronx-cc sb_spill assertion), so call it on
+    # as many heads at a time as fit in CONST_MAX_SBUF_BUDGET bytes.
+    per_head = d * L * 2 + 128 * (-(-L // 128)) * (d + 1) * 4
+    g = max(1, min(B * n, CONST_MAX_SBUF_BUDGET // per_head))
+    outs = [attention_const_max(qn[i:i + g], kn[i:i + g], vn[i:i + g], CONST_MAX_SOFTMAX_MAX, d ** -0.5)
+            for i in range(0, B * n, g)]
+    out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)
     return out.view(B, n, L, d).transpose(1, 2)
 
 
