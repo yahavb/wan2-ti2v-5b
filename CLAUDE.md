@@ -65,6 +65,7 @@ python test_vae_kernels.py
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces along seq (0 = off) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py`: fixed-shape causal cache, 2 graphs (chunk 0 / rest) |
 | `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile (graph breaks fail loudly) |
+| `VAE_TILED`, `VAE_TILE_OVERLAP` | 0, 8 | Eager VAE on all ranks, each decodes overlapping spatial tiles; rank 0 blends |
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold/compile, run 2=warm) |
 | `FRAME_NUM` | 81 | Output video frames |

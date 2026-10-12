@@ -175,9 +175,11 @@ spec:
             - name: USE_NST_SELF_ATTN
               value: "1"
             - name: VAE_COMPILE
+              value: "0"
+            - name: VAE_TILED
               value: "1"
-            - name: VAE_FULLGRAPH
-              value: "1"
+            - name: VAE_TILE_OVERLAP
+              value: "8"
             - name: DIT_FAST
               value: "1"
             - name: FAST_ATTN_IMPL

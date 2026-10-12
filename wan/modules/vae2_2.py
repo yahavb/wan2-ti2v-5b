@@ -162,8 +162,11 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return (F.normalize(x, dim=(1 if self.channel_first else -1)) *
-                self.scale * self.gamma + self.bias)
+        # x * rsqrt(mean(x^2)) == F.normalize(x) * sqrt(D), without F.normalize's
+        # NaN-guard and generic L2 reduce (vllm-omni measured ~67us/call on Neuron).
+        dim = 1 if self.channel_first else -1
+        rms = x.to(torch.float32).pow(2).mean(dim, keepdim=True).clamp(min=1e-8).rsqrt()
+        return (x * rms).to(self.gamma.dtype) * self.gamma + self.bias
 
 
 class Upsample(nn.Upsample):

@@ -47,6 +47,10 @@ T5_RANK = int(os.environ.get("T5_RANK", "8"))
 VAE_RANK = 0
 VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "1"))  # 1=single rank (existing), 2=channel-parallel TP
 VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
+# VAE_TILED=1: every rank loads the VAE and decodes a share of overlapping spatial tiles
+# (models/vae_tiled.py); rank 0 blends. VAE_TILE_OVERLAP is in latent units.
+VAE_TILED = os.environ.get("VAE_TILED", "0") == "1"
+VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "8"))
 USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 # DIT_FAST=1: block-compiled DiT with in-graph collectives + batched CFG (models/fast_dit.py).
 # DIT_FAST=0: original eager path (per-FFN NEFFs, eager all-reduces, 2 forwards/step).
@@ -82,6 +86,8 @@ def main():
         T5_RANK = world_size - 1
     if DIT_FAST:
         assert SP_DEGREE == 1, "DIT_FAST requires SP_DEGREE=1"
+    # CPU group for gathering decoded VAE tiles (small, once per video).
+    cpu_group = dist.new_group(backend="gloo") if VAE_TILED else None
 
     # Initialize SP/TP parallel groups if SP > 1
     if SP_DEGREE > 1:
@@ -153,7 +159,7 @@ def main():
         vae_tp_rank = VAE_TP_RANKS.index(rank)
         shard_vae_model_tp(vae.model, vae_tp_rank, VAE_TP_DEGREE)
         logger.info(f"VAE TP={VAE_TP_DEGREE} sharded on rank {rank} (vae_tp_rank={vae_tp_rank})")
-    elif VAE_TP_DEGREE <= 1 and rank == VAE_RANK:
+    elif VAE_TP_DEGREE <= 1 and (rank == VAE_RANK or VAE_TILED):
         # Original single-rank path with NKI kernels
         logger.info(f"Loading VAE on rank {VAE_RANK} (on Neuron with NKI kernels)...")
         vae = Wan2_2_VAE(
@@ -435,6 +441,23 @@ def main():
                 video_np = ((video_cpu.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
                 if video_np.dim() == 4 and video_np.shape[0] == 3:
                     video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
+                frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
+                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+                logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+        elif VAE_TILED:
+            # Tiled decode across all ranks; rank 0 receives the blended video
+            from models.vae_tiled import decode_tiled, tile_grid
+            if rank == 0 and run_idx == 0:
+                th, tw, ys, xs = tile_grid(latent.shape[2], latent.shape[3], world_size, VAE_TILE_OVERLAP)
+                logger.info(f"VAE tiled decode: {len(ys)}x{len(xs)} tiles of {th}x{tw} latent "
+                            f"(overlap {VAE_TILE_OVERLAP}) over {world_size} ranks")
+            video = decode_tiled(vae, latent.to(torch.bfloat16), cpu_group, VAE_TILE_OVERLAP)
+            if rank == 0:
+                video = crop_video(video)
+                import imageio
+                output_path = "/tmp/wan2_ti2v_output.mp4"
+                video_np = ((video.float().clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+                video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
                 imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
