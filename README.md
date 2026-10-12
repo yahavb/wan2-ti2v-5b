@@ -5,8 +5,8 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 ## Benchmark Results
 
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
-warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit`
-branch; original-path rows are the earlier measurements from `main`.
+warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
+original-path rows are the earlier measurements.
 
 ### 704x544, 81 frames (7854 DiT tokens)
 
@@ -98,7 +98,7 @@ kubectl apply -f wan2-ti2v-5b-job.yaml       # TP=4 LNC2
 kubectl logs -f job/wan2-ti2v-5b-tp8
 ```
 
-Both jobs clone the `fast-dit` branch and run `scripts/prof/bench_profile.sh`:
+Both jobs clone `main` and run `scripts/prof/bench_profile.sh`:
 clean pass (`CLEAN_RUNS` runs; run 1 compiles, the rest are the latency), then a short profiled pass
 with the Neuron runtime inspector on rank 0, then per-graph analysis. Results go to
 `/tmp/results/<run>.tar.gz` in the pod, which stays up for `KEEP_ALIVE_SECONDS` so you can
