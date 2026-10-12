@@ -15,6 +15,18 @@ Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 Reference (5B, same shape class, from the 2026-10-07 comparison): H100 compiled 0.498 s/step, 8.02s total;
 A100 compiled 1.143 s/step, 16.92s total; earlier Trainium2 TP8 3.971 s/step, 58.68s total.
 
+## Comparison with GPUs (Wan2.2-TI2V-5B, 704x544, 81 frames, 10 steps)
+
+| Platform | s/step | Total | Trainium2 (current main) vs this |
+|---|---|---|---|
+| H100 compiled, BF16 VAE + autotuning | 0.498 | 8.02s | 3.5x slower |
+| A100 compiled, BF16 VAE + autotuning | 1.143 | 16.92s | **1.7x slower** |
+| Trainium2 earlier (TP8/SP1) | 3.971 | 58.68s | 2.1x faster |
+| **Trainium2 current main (TP8 LNC1, one device)** | **1.92** | **28.2s** | — |
+
+GPU numbers are from the 2026-10-07 comparison table (sequential CFG); Trainium2 uses batched CFG.
+Job: `wan2-ti2v-5b-tp8-81f-job.yaml`.
+
 ## 368x480, 21 frames (generated 384x480, cropped; 1080 DiT tokens), TP=8 LNC1
 
 | Commit | Change | s/step | Denoise | VAE | Total | Video |

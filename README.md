@@ -6,6 +6,8 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
+**Versus GPUs** (5B, 704x544, 81 frames, 10 steps): Trainium2 one device **28.2s** total (1.92 s/step) — **1.7x slower than A100** (16.92s), 3.5x slower than H100 (8.02s), 2.1x faster than the earlier Trainium2 run (58.68s).
+
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
 warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
 original-path rows are the earlier measurements.
@@ -162,7 +164,8 @@ wan2-ti2v-5b/
 ├── serve_ti2v.py                 # FastAPI server with TP-8
 ├── setup.sh                      # Container entrypoint (deps + model + launch)
 ├── wan2-ti2v-5b-job.yaml         # K8s job: TP=4, s-lnc2 (LNC2)
-├── wan2-ti2v-5b-tp8-job.yaml     # K8s job: TP=8, s-lnc1 (LNC1)
+├── wan2-ti2v-5b-tp8-job.yaml     # K8s job: TP=8, s-lnc1 (LNC1), 368x480x21
+├── wan2-ti2v-5b-tp8-81f-job.yaml # K8s job: TP=8, s-lnc1, 704x544x81 (GPU comparison shape)
 ├── wan2-ti2v-5b-deploy.yaml      # K8s deployment: TP=8, serving
 ├── models/
 │   ├── fast_dit.py               # Fast DiT: block-compiled, batched CFG
