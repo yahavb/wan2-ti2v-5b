@@ -18,7 +18,7 @@ Architecture constraints:
 Production shapes:
   Decoder middle block: d=1024, seq=30*52=1560 → pad to 2048
 
-NKI API: bundled neuronxcc.nki.isa return-style.
+NKI API: destination-first nisa calls, as in self_attention_nst.py.
 """
 import nki
 import nki.language as nl
@@ -92,38 +92,41 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                     # Moving operand is K_chunk[128,512] — within 512 limit ✓
                     qk_psum = nl.ndarray((P, CHUNK), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_matmul(qk_psum, q_buf, k_chunk)
-                    qk_sbuf = nl.copy(qk_psum)
 
-                    # Accumulate into the right seq_k columns
-                    qk_slice = nl.copy(qk_acc[:, nl.ds(sk_off, CHUNK)])
-                    qk_updated = nisa.tensor_tensor(qk_slice, qk_sbuf, nl.add)
-                    # Write back (in-place update via copy)
-                    nisa.dma_copy(dst=qk_acc[:, nl.ds(sk_off, CHUNK)], src=qk_updated)
+                    # Accumulate into the right seq_k columns (in place)
+                    qk_cols = qk_acc[:, nl.ds(sk_off, CHUNK)]
+                    nisa.tensor_tensor(qk_cols, qk_cols, qk_psum, op=nl.add)
 
             # Scale
-            qk_scaled = nisa.tensor_scalar(qk_acc, nl.multiply, softmax_scale)
+            qk_scaled = nl.ndarray((P, seqlen_k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(qk_scaled, qk_acc, nl.multiply, softmax_scale)
 
             # ── Phase 2: Softmax ──
             # Row max in 512 chunks
             pmaxes = nl.ndarray((P, num_sk_chunks), dtype=nl.float32, buffer=nl.sbuf)
             for sc in range(num_sk_chunks):
                 sc_start = sc * CHUNK
-                pmaxes[:, nl.ds(sc, 1)] = nisa.tensor_reduce(
-                    nl.maximum, qk_scaled[:, nl.ds(sc_start, CHUNK)], axis=1)
-            row_max = nisa.tensor_reduce(nl.maximum, pmaxes, axis=1)
+                nisa.tensor_reduce(pmaxes[:, sc], nl.maximum,
+                                   qk_scaled[:, nl.ds(sc_start, CHUNK)], axis=1)
+            row_max = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(row_max[:, 0], nl.maximum, pmaxes, axis=1)
 
-            # Subtract max and exp
-            qk_shifted = nisa.tensor_tensor(qk_scaled, row_max, nl.subtract)
-            exp_qk = nisa.activation(nl.exp, qk_shifted)
+            # Subtract max (per-partition scalar) and exp
+            qk_shifted = nl.ndarray((P, seqlen_k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(qk_shifted, qk_scaled, nl.subtract, row_max)
+            exp_qk = nl.ndarray((P, seqlen_k), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(exp_qk, nl.exp, qk_shifted)
 
             # Row sum in 512 chunks
             psums = nl.ndarray((P, num_sk_chunks), dtype=nl.float32, buffer=nl.sbuf)
             for sc in range(num_sk_chunks):
                 sc_start = sc * CHUNK
-                psums[:, nl.ds(sc, 1)] = nisa.tensor_reduce(
-                    nl.add, exp_qk[:, nl.ds(sc_start, CHUNK)], axis=1)
-            row_sum = nisa.tensor_reduce(nl.add, psums, axis=1)
-            row_sum_recip = nisa.reciprocal(row_sum)
+                nisa.tensor_reduce(psums[:, sc], nl.add,
+                                   exp_qk[:, nl.ds(sc_start, CHUNK)], axis=1)
+            row_sum = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(row_sum[:, 0], nl.add, psums, axis=1)
+            row_sum_recip = nl.ndarray((P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.reciprocal(row_sum_recip, row_sum)
 
             # Cast exp to bf16 for PV matmul
             exp_bf16 = nl.copy(exp_qk, dtype=nl.bfloat16)
@@ -168,23 +171,20 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                     v_d_chunk = nl.copy(v_tile[:, nl.ds(dmc_start, CHUNK)])
                     pv_psum = nl.ndarray((P, CHUNK), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_matmul(pv_psum, attn_T, v_d_chunk)
-                    pv_s = nl.copy(pv_psum)
-                    existing = nl.copy(pv_accum[:, nl.ds(dmc_start, CHUNK)])
-                    updated = nisa.tensor_tensor(existing, pv_s, nl.add)
-                    nisa.dma_copy(dst=pv_accum[:, nl.ds(dmc_start, CHUNK)], src=updated)
+                    pv_cols = pv_accum[:, nl.ds(dmc_start, CHUNK)]
+                    nisa.tensor_tensor(pv_cols, pv_cols, pv_psum, op=nl.add)
 
                 if d_mat_rem > 0:
                     dmc_start_rem = d_mat_chunks * CHUNK
                     v_d_rem = nl.copy(v_tile[:, nl.ds(dmc_start_rem, d_mat_rem)])
                     pv_rem_psum = nl.ndarray((P, d_mat_rem), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_matmul(pv_rem_psum, attn_T, v_d_rem)
-                    pv_rem_s = nl.copy(pv_rem_psum)
-                    existing_rem = nl.copy(pv_accum[:, nl.ds(dmc_start_rem, d_mat_rem)])
-                    updated_rem = nisa.tensor_tensor(existing_rem, pv_rem_s, nl.add)
-                    nisa.dma_copy(dst=pv_accum[:, nl.ds(dmc_start_rem, d_mat_rem)], src=updated_rem)
+                    pv_rem_cols = pv_accum[:, nl.ds(dmc_start_rem, d_mat_rem)]
+                    nisa.tensor_tensor(pv_rem_cols, pv_rem_cols, pv_rem_psum, op=nl.add)
 
             # ── Phase 4: Normalize and store ──
-            pv_normed = nisa.tensor_tensor(pv_accum, row_sum_recip, nl.multiply)
+            pv_normed = nl.ndarray((P, d), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(pv_normed, pv_accum, nl.multiply, row_sum_recip)
             pv_out = nl.copy(pv_normed, dtype=q.dtype)
 
             nisa.dma_copy(
