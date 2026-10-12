@@ -4,6 +4,8 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 ## Benchmark Results
 
+Full run-by-run log: [RESULTS.md](RESULTS.md).
+
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
 warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
 original-path rows are the earlier measurements.
