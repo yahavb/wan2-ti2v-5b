@@ -32,6 +32,8 @@ original-path rows are the earlier measurements.
 With the cross-attention K/V cache (`1b18e22`) denoise drops to 1.4s (0.14 s/step).
 With the 8-rank tiled VAE decode and the RMS_norm rewrite (`12fd9ce`, `VAE_TILED=1`), VAE decode drops to 1.7s and the total to **3.2s** (seam quality: check the video).
 
+Const-max self-attention (`FAST_ATTN_IMPL=constmax`, hybrid `CONST_MAX_LAYERS=auto`: 22 of 30 layers) gives good quality at the same 1.4s denoise as sdpa at this size (`dae9160`); const-max on all 30 layers was 1.3s but degraded frames. Default stays sdpa.
+
 Set with `HEIGHT=368 WIDTH=480 FRAME_NUM=21` (sizes that are not multiples of 32 are generated
 at the next multiple of 32 and center-cropped after decode).
 
