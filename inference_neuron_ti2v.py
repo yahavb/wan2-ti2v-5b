@@ -453,6 +453,7 @@ def main():
                             f"(overlap {VAE_TILE_OVERLAP}) over {world_size} ranks")
             video = decode_tiled(vae, latent.to(torch.bfloat16), cpu_group, VAE_TILE_OVERLAP)
             if rank == 0:
+                t_w = time.time()
                 video = crop_video(video)
                 import imageio
                 output_path = "/tmp/wan2_ti2v_output.mp4"
@@ -460,7 +461,8 @@ def main():
                 video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
                 imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
-                logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+                logger.info(f"Video saved to {output_path} ({len(frames)} frames); "
+                            f"convert+mp4 write {time.time() - t_w:.2f}s")
         elif rank == VAE_RANK:
             # Original single-rank decode with NKI kernels
             logger.info(f"{run_label} VAE decode on Neuron...")

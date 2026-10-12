@@ -29,7 +29,7 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              git clone -b vae-par https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
               cd wan2-ti2v-5b
 
               # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
@@ -189,7 +189,7 @@ spec:
             - name: CONST_MAX_LAYERS
               value: "auto"
             - name: SKIP_PROFILE
-              value: "0"
+              value: "1"
             - name: CLEAN_RUNS
               value: "3"
             - name: PROFILE_STEPS

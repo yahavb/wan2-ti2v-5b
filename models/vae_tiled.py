@@ -11,6 +11,7 @@ rank runs the same op shapes.
 """
 
 import math
+import time
 
 import torch
 import torch.distributed as dist
@@ -57,6 +58,7 @@ def decode_tiled(vae, z, cpu_group, overlap=8):
     th, tw, ys, xs = tile_grid(h, w, world, overlap)
     tiles = [(i, j) for i in range(len(ys)) for j in range(len(xs))]
 
+    t0 = time.time()
     mine = []
     for k, (i, j) in enumerate(tiles):
         if k % world != rank:
@@ -65,10 +67,15 @@ def decode_tiled(vae, z, cpu_group, overlap=8):
         out = vae.decode([zt])[0]  # [3, F, th*s, tw*s], float32 clamped
         mine.append((k, out.to(torch.bfloat16).cpu()))
 
+    t_dec = time.time() - t0
     gathered = [None] * world if rank == 0 else None
-    dist.gather_object(mine, gathered, dst=0, group=cpu_group)
+    dist.gather_object((t_dec, mine), gathered, dst=0, group=cpu_group)
     if rank != 0:
         return None
+    t_gather = time.time() - t0 - t_dec
+    dec_times = [g[0] for g in gathered]
+    gathered = [g[1] for g in gathered]
+    t1 = time.time()
 
     parts = dict(item for lst in gathered for item in lst)
     sample = parts[0]
@@ -85,7 +92,11 @@ def decode_tiled(vae, z, cpu_group, overlap=8):
         wt = (wy[:, None] * wx[None, :])[None, None]
         acc[:, :, y0:y0 + th * s, x0:x0 + tw * s] += parts[k].float() * wt
         wsum[:, :, y0:y0 + th * s, x0:x0 + tw * s] += wt
-    return (acc / wsum).clamp_(-1, 1)
+    out = (acc / wsum).clamp_(-1, 1)
+    print(f"[vae_tiled] tiles={len(tiles)} ({th}x{tw} latent) decode max/min over ranks="
+          f"{max(dec_times):.2f}/{min(dec_times):.2f}s gather(after rank0 decode)={t_gather:.2f}s "
+          f"blend={time.time() - t1:.2f}s", flush=True)
+    return out
 
 
 __all__ = ["decode_tiled", "tile_grid"]
