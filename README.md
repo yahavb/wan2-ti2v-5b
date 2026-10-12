@@ -165,7 +165,6 @@ wan2-ti2v-5b/
 ├── setup.sh                      # Container entrypoint (deps + model + launch)
 ├── wan2-ti2v-5b-job.yaml         # K8s job: TP=4, s-lnc2 (LNC2)
 ├── wan2-ti2v-5b-tp8-job.yaml     # K8s job: TP=8, s-lnc1 (LNC1), 368x480x21
-├── wan2-ti2v-5b-tp8-81f-job.yaml # K8s job: TP=8, s-lnc1, 704x544x81 (GPU comparison shape)
 ├── wan2-ti2v-5b-deploy.yaml      # K8s deployment: TP=8, serving
 ├── models/
 │   ├── fast_dit.py               # Fast DiT: block-compiled, batched CFG

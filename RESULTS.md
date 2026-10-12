@@ -25,7 +25,7 @@ A100 compiled 1.143 s/step, 16.92s total; earlier Trainium2 TP8 3.971 s/step, 58
 | **Trainium2 current main (TP8 LNC1, one device)** | **1.92** | **28.2s** | — |
 
 GPU numbers are from the 2026-10-07 comparison table (sequential CFG); Trainium2 uses batched CFG.
-Job: `wan2-ti2v-5b-tp8-81f-job.yaml`.
+Job: `wan2-ti2v-5b-tp8-job.yaml` with FRAME_NUM=81 and HEIGHT/WIDTH unset.
 
 ## 368x480, 21 frames (generated 384x480, cropped; 1080 DiT tokens), TP=8 LNC1
 
