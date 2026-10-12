@@ -30,6 +30,7 @@ original-path rows are the earlier measurements.
 | Fast DiT (`DIT_FAST=1`) | TP=8, LNC1 | 1.5s | 0.15 | 2.4s | **3.9s** | 83.5s |
 
 With the cross-attention K/V cache (`1b18e22`) denoise drops to 1.4s (0.14 s/step).
+With the 8-rank tiled VAE decode and the RMS_norm rewrite (`12fd9ce`, `VAE_TILED=1`), VAE decode drops to 1.7s and the total to **3.2s** (seam quality: check the video).
 
 Set with `HEIGHT=368 WIDTH=480 FRAME_NUM=21` (sizes that are not multiples of 32 are generated
 at the next multiple of 32 and center-cropped after decode).
