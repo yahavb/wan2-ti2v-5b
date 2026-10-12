@@ -23,6 +23,9 @@ Attention backend (FAST_ATTN_IMPL):
                     physical cores).
   nki            -- our kernels/ NST self-attn + cross-attn (single-program launch,
                     so under LNC2 they occupy one physical core).
+  constmax       -- self-attn via kernels/attention_const_max.py (odyssey-trainium
+                    const-max kernel, constant softmax max CONST_MAX_SOFTMAX_MAX);
+                    cross-attn stays on sdpa.
 """
 
 import logging
@@ -39,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 FAST_ATTN_IMPL = os.environ.get("FAST_ATTN_IMPL", "sdpa")
 FAST_FULLGRAPH = os.environ.get("FAST_FULLGRAPH", "0") == "1"
+# Constant max subtracted before exp in the const-max kernel (scaled-score units). The output
+# is invariant to it; it only has to stay within ~80 of every row's true max.
+CONST_MAX_SOFTMAX_MAX = float(os.environ.get("CONST_MAX_SOFTMAX_MAX", "15.0"))
 # In-graph all-reduce chunking (0 = off). The 8MB eager limit in tp_utils was an NRT
 # eager-collective constraint; set this if the compiled collective hits a size error.
 FAST_ALLREDUCE_CHUNK_BYTES = int(os.environ.get("FAST_ALLREDUCE_CHUNK_BYTES", "0"))
@@ -135,6 +141,17 @@ def _nki_self(q, k, v):
     return out[:L].view(L, B, n, d).permute(1, 0, 2, 3)
 
 
+def _const_max_self(q, k, v):
+    """q/k/v [B, L, n, d] -> [B, L, n, d] via the const-max NKI kernel (batch folded into heads)."""
+    from kernels.attention_const_max import attention_const_max
+    B, L, n, d = q.shape
+    qn = q.permute(0, 2, 3, 1).reshape(B * n, d, L)
+    kn = k.permute(0, 2, 3, 1).reshape(B * n, d, L)
+    vn = v.permute(0, 2, 1, 3).reshape(B * n, L, d)
+    out = attention_const_max(qn, kn, vn, CONST_MAX_SOFTMAX_MAX, d ** -0.5)
+    return out.view(B, n, L, d).transpose(1, 2)
+
+
 def _nki_cross(q, k, v, identity):
     from wan.modules import attention as A
     B, L, n, d = q.shape
@@ -177,7 +194,12 @@ class _FastBlock(nn.Module):
         v = F.linear(h, sa.v.weight, sa.v.bias).view(B, L, n, d)
         q = _rope(q.view(B, L, n, d), cos, sin)
         k = _rope(k.view(B, L, n, d), cos, sin)
-        y = _nki_self(q, k, v) if self.attn_impl == "nki" else _sdpa(q, k, v)
+        if self.attn_impl == "nki":
+            y = _nki_self(q, k, v)
+        elif self.attn_impl == "constmax":
+            y = _const_max_self(q, k, v)
+        else:
+            y = _sdpa(q, k, v)
         y = _row_linear(sa.o, y.reshape(B, L, n * d))
         x = x + _gate(y, e[2], nf)
 

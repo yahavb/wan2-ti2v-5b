@@ -60,7 +60,8 @@ python test_vae_kernels.py
 | `USE_NKI_VAE` | 1 | Enable NKI kernels for VAE conv/attention |
 | `USE_NST_SELF_ATTN` | 0 | Use Neuron Science Team self-attention kernel (no mask/identity needed) |
 | `DIT_FAST` | 1 | Block-compiled DiT, in-graph all-reduces, batched CFG (`models/fast_dit.py`); requires SP=1. 0 = original eager path |
-| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron built-in flash kernel, LNC2-aware) or `nki` (our kernels/, single-program) |
+| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron built-in flash kernel, LNC2-aware), `nki` (our kernels/, single-program), or `constmax` (const-max self-attn from odyssey-trainium) |
+| `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant max for the const-max kernel |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces along seq (0 = off) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py`: fixed-shape causal cache, 2 graphs (chunk 0 / rest) |

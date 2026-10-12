@@ -129,7 +129,8 @@ FastAPI server on port 8000:
 | `TP_DEGREE` | 8 | DiT tensor parallelism degree (= torchrun ranks) |
 | `SP_DEGREE` | 1 | Sequence parallelism (original path only; must be 1 with `DIT_FAST=1`) |
 | `DIT_FAST` | 1 | Block-compiled DiT with in-graph all-reduces + batched CFG; 0 = original eager path |
-| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel) or `nki` (this repo's kernels) |
+| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel), `nki` (this repo's kernels), or `constmax` (odyssey-trainium const-max self-attention, `kernels/attention_const_max.py`) |
+| `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces (0 = off) |
 | `HEIGHT`, `WIDTH` | unset | Output size; unset = derived from the input image aspect within 480x832 area |
