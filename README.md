@@ -139,7 +139,8 @@ FastAPI server on port 8000:
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
-| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk. **Measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
+| `VAE_FULLGRAPH`, `VAE_CC_FLAGS` | 0, "" | fullgraph=True for the VAE compile; NEURON_CC_FLAGS used while VAE graphs compile |
+| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk. **Measured slower** (fullgraph=False, transformer flags): 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
 | `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |
 | `KEEP_ALIVE_SECONDS` | 86400 (jobs) | Keep the pod up after the run for `kubectl cp` |

@@ -64,6 +64,8 @@ python test_vae_kernels.py
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces along seq (0 = off) |
 | `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk (3 graphs) |
+| `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile (graph breaks fail loudly) |
+| `VAE_CC_FLAGS` | "" | NEURON_CC_FLAGS while VAE graphs compile, e.g. `--model-type=unet-inference` |
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold/compile, run 2=warm) |
 | `FRAME_NUM` | 81 | Output video frames |

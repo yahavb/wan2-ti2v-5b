@@ -14,6 +14,29 @@ _USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "1") == "1"
 # VAE_COMPILE=1: torch.compile the decoder per latent-frame chunk (a handful of graphs:
 # first chunk, second chunk, steady state -- the causal feat_cache changes shape twice).
 _VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
+# VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
+# splitting the decoder into fragments.
+_VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
+# VAE_CC_FLAGS: NEURON_CC_FLAGS used while the VAE graphs compile (e.g.
+# "--model-type=unet-inference"); empty = inherit the process-wide flags.
+_VAE_CC_FLAGS = os.environ.get("VAE_CC_FLAGS", "")
+
+
+@contextlib.contextmanager
+def _vae_cc_flags():
+    """Swap NEURON_CC_FLAGS for the VAE graphs (compile happens on first call)."""
+    if not _VAE_CC_FLAGS:
+        yield
+        return
+    prev = os.environ.get("NEURON_CC_FLAGS")
+    os.environ["NEURON_CC_FLAGS"] = _VAE_CC_FLAGS
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop("NEURON_CC_FLAGS", None)
+        else:
+            os.environ["NEURON_CC_FLAGS"] = prev
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
@@ -966,27 +989,46 @@ class WanVAE_(nn.Module):
         iter_ = z.shape[2]
         x = self.conv2(z)
         decoder = self.decoder
+        first_compiled = False
         if _VAE_COMPILE:
             if getattr(self, "_compiled_decoder", None) is None:
                 torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
-                self._compiled_decoder = torch.compile(self.decoder, backend="neuron", dynamic=False)
+                self._compiled_decoder = torch.compile(
+                    self.decoder, backend="neuron", dynamic=False, fullgraph=_VAE_FULLGRAPH)
+                first_compiled = True
+                from torch._dynamo.utils import counters
+                graphs0 = counters["stats"].get("unique_graphs", 0)
+                breaks0 = sum(counters["graph_break"].values())
+                print(f"[vae2_2] compiling decoder: fullgraph={_VAE_FULLGRAPH} "
+                      f"cc_flags={_VAE_CC_FLAGS or os.environ.get('NEURON_CC_FLAGS', '')!r}", flush=True)
             decoder = self._compiled_decoder
+        import time as _time
         for i in range(iter_):
             self._conv_idx = [0]
+            t0 = _time.time()
             if i == 0:
-                out = decoder(
+                with _vae_cc_flags():
+                    out = decoder(
                     x[:, :, i:i + 1, :, :],
                     feat_cache=self._feat_map,
                     feat_idx=self._conv_idx,
                     first_chunk=True,
                 )
             else:
-                out_ = decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                )
+                with _vae_cc_flags():
+                    out_ = decoder(
+                        x[:, :, i:i + 1, :, :],
+                        feat_cache=self._feat_map,
+                        feat_idx=self._conv_idx,
+                    )
                 out = torch.cat([out, out_], 2)
+            if first_compiled:
+                print(f"[vae2_2] first decode chunk {i}: {_time.time() - t0:.1f}s", flush=True)
+        if first_compiled:
+            from torch._dynamo.utils import counters
+            print(f"[vae2_2] decoder graphs compiled: {counters['stats'].get('unique_graphs', 0) - graphs0}, "
+                  f"graph breaks: {sum(counters['graph_break'].values()) - breaks0} "
+                  f"{dict(counters['graph_break']) or ''}", flush=True)
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out

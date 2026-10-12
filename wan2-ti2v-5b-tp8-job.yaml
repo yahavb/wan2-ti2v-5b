@@ -175,7 +175,11 @@ spec:
             - name: USE_NST_SELF_ATTN
               value: "1"
             - name: VAE_COMPILE
-              value: "0"
+              value: "1"
+            - name: VAE_FULLGRAPH
+              value: "1"
+            - name: VAE_CC_FLAGS
+              value: "--model-type=unet-inference"
             - name: DIT_FAST
               value: "1"
             - name: FAST_ATTN_IMPL
