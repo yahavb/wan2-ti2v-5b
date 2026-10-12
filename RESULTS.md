@@ -11,7 +11,10 @@ Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 | `ce390d3` | fast DiT: block-compiled, batched CFG | TP=4 LNC2 | 2.55 | 25.5s | 10.8s | 36.4s | ok |
 | `ce390d3` | fast DiT | TP=8 LNC1 | 1.91 | 19.1s | 17.7s | 36.8s | not checked |
 | `2e4a6a6` | + cross-attn K/V cache + tiled VAE | TP=8 LNC1 | 1.92 | 19.2s | 9.0s | 28.2s | not checked |
-| `b8d5cbd` | + const-max self-attention on 22/30 layers (1 head per kernel call), rest sdpa | TP=8 LNC1 | **1.19** | **11.9s** | 9.0s | **21.0s** | perfect |
+| `b8d5cbd` | + const-max self-attention on 22/30 layers (1 head per kernel call), rest sdpa | TP=8 LNC1 | 1.19 | 11.9s | 9.0s | 21.0s | perfect |
+| `de16d5d` | + VAE tiles weighted on device, collected via /dev/shm; tile overlap 4 | TP=8 LNC1 | **1.19** | **11.9s** | **6.0s** | **17.9s** | amazing |
+
+VAE breakdown at `de16d5d`: per-core decode 4.5s, collect+sum 0.4s, convert+mp4 write 1.1s (was 6.1s / 2.3s gather+blend / 0.9s at `21759b3`, overlap 8).
 
 Reference (5B, same shape class, from the 2026-10-07 comparison): H100 compiled 0.498 s/step, 8.02s total;
 A100 compiled 1.143 s/step, 16.92s total; earlier Trainium2 TP8 3.971 s/step, 58.68s total.
@@ -20,10 +23,10 @@ A100 compiled 1.143 s/step, 16.92s total; earlier Trainium2 TP8 3.971 s/step, 58
 
 | Platform | s/step | Denoise | VAE + output | Total | Trainium2 (current main) vs this |
 |---|---|---|---|---|---|
-| H100 compiled, BF16 VAE + autotuning | 0.498 | 4.98s | 3.01s | 8.02s | 2.6x slower total |
-| A100 compiled, BF16 VAE + autotuning | 1.143 | 11.43s | 5.48s | 16.92s | **1.24x slower total; denoise at parity (11.9 vs 11.4s)** |
-| Trainium2 earlier (TP8/SP1) | 3.971 | 39.71s | 18.86s | 58.68s | 2.8x faster |
-| **Trainium2 current main (TP8 LNC1, one device)** | **1.19** | **11.9s** | **9.0s** | **21.0s** | — |
+| H100 compiled, BF16 VAE + autotuning | 0.498 | 4.98s | 3.01s | 8.02s | 2.2x slower total |
+| A100 compiled, BF16 VAE + autotuning | 1.143 | 11.43s | 5.48s | 16.92s | **1.06x slower total; denoise and VAE near parity** |
+| Trainium2 earlier (TP8/SP1) | 3.971 | 39.71s | 18.86s | 58.68s | 3.3x faster |
+| **Trainium2 current main (TP8 LNC1, one device)** | **1.19** | **11.9s** | **6.0s** | **17.9s** | — |
 
 GPU numbers are from the 2026-10-07 comparison table (sequential CFG); Trainium2 uses batched CFG.
 Job: `wan2-ti2v-5b-tp8-job.yaml` (FRAME_NUM=81, HEIGHT/WIDTH unset).
@@ -41,7 +44,7 @@ Job: `wan2-ti2v-5b-tp8-job.yaml` (FRAME_NUM=81, HEIGHT/WIDTH unset).
 | `dae9160` | const-max hybrid, 22/30 layers (rest sdpa) | 0.14 | 1.4s | 1.7s | 3.1s | perfect |
 
 **Current default on `main`:** fast DiT + const-max hybrid self-attention + cross-attn K/V cache + tiled VAE, TP=8 LNC1:
-**1.19 s/step, 21.0s total** at 704x544x81; 0.14 s/step, 3.1s total at 368x480x21.
+**1.19 s/step, 17.9s total** at 704x544x81; 0.14 s/step, 3.1s total at 368x480x21.
 
 ## Notes
 
