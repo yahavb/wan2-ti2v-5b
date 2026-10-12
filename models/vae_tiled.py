@@ -37,13 +37,13 @@ def tile_grid(h, w, world, overlap):
 
 def _ramp(n, ramp, lo_edge, hi_edge):
     """1-D blend weights of length n: linear ramps on sides that border another tile."""
+    # min() of the two ramps stays continuous even when they overlap (tile < 2*ramp).
+    pos = torch.arange(n, dtype=torch.float32).add_(0.5)
     wgt = torch.ones(n)
-    if ramp > 0:
-        r = torch.arange(ramp, dtype=torch.float32).add_(0.5).div_(ramp)
-        if lo_edge:
-            wgt[:ramp] = r
-        if hi_edge:
-            wgt[n - ramp:] = r.flip(0)
+    if ramp > 0 and lo_edge:
+        wgt = torch.minimum(wgt, pos / ramp)
+    if ramp > 0 and hi_edge:
+        wgt = torch.minimum(wgt, pos.flip(0) / ramp)
     return wgt
 
 
