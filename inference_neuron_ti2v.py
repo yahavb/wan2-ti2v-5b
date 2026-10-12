@@ -51,6 +51,11 @@ VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 # (models/vae_tiled.py); rank 0 blends. VAE_TILE_OVERLAP is in latent units.
 VAE_TILED = os.environ.get("VAE_TILED", "0") == "1"
 VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "8"))
+# x264 settings for the output mp4. imageio's default is preset medium, crf 25 (~1.1s for
+# 81 frames at 704x544); veryfast + crf 20 is ~8x faster at about the same PSNR.
+MP4_PRESET = os.environ.get("MP4_PRESET", "veryfast")
+MP4_CRF = os.environ.get("MP4_CRF", "20")
+MP4_KW = dict(quality=None, ffmpeg_params=["-preset", MP4_PRESET, "-crf", MP4_CRF])
 USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 # DIT_FAST=1: block-compiled DiT with in-graph collectives + batched CFG (models/fast_dit.py).
 # DIT_FAST=0: original eager path (per-FFN NEFFs, eager all-reduces, 2 forwards/step).
@@ -442,7 +447,7 @@ def main():
                 if video_np.dim() == 4 and video_np.shape[0] == 3:
                     video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+                imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
         elif VAE_TILED:
             # Tiled decode across all ranks; rank 0 receives the blended video
@@ -460,7 +465,7 @@ def main():
                 video_np = ((video.float().clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
                 video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+                imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames); "
                             f"convert+mp4 write {time.time() - t_w:.2f}s")
         elif rank == VAE_RANK:
@@ -476,7 +481,7 @@ def main():
             if video_np.dim() == 4 and video_np.shape[0] == 3:
                 video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
             frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-            imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+            imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
             logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
         dist.barrier()

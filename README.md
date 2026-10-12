@@ -142,6 +142,7 @@ FastAPI server on port 8000:
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces (0 = off) |
 | `HEIGHT`, `WIDTH` | unset | Output size; unset = derived from the input image aspect within 480x832 area |
 | `FRAME_NUM` | 81 | Output frames (must be 4k+1) |
+| `MP4_PRESET`, `MP4_CRF` | veryfast, 20 | x264 settings for the output mp4 (imageio default medium/25 is ~8x slower) |
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Iterations per process (run 1 compiles) |
 | `T5_RANK` | 2 | Rank hosting the T5 encoder (clamped to world size) |

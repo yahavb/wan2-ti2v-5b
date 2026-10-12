@@ -71,6 +71,7 @@ python test_vae_kernels.py
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold/compile, run 2=warm) |
 | `FRAME_NUM` | 81 | Output video frames |
+| `MP4_PRESET`, `MP4_CRF` | veryfast, 20 | x264 settings for the output mp4 |
 | `NEURON_LOGICAL_NC_CONFIG` | 2 | Logical NeuronCores per device (set in k8s yaml) |
 
 ## NKI Kernels (`kernels/`)
