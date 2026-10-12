@@ -179,7 +179,7 @@ spec:
             - name: VAE_TILED
               value: "1"
             - name: VAE_TILE_OVERLAP
-              value: "8"
+              value: "4"
             - name: DIT_FAST
               value: "1"
             - name: FAST_ATTN_IMPL

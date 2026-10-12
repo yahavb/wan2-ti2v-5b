@@ -11,7 +11,10 @@ rank runs the same op shapes.
 """
 
 import math
+import os
 import time
+
+import numpy as np
 
 import torch
 import torch.distributed as dist
@@ -48,54 +51,69 @@ def _ramp(n, ramp, lo_edge, hi_edge):
     return wgt
 
 
+_CALL = [0]
+SHM_DIR = os.environ.get("VAE_TILE_SHM_DIR", "/dev/shm")
+
+
+def _weights(tiles, ys, xs, th, tw, s, ramp, H, W):
+    """Per-tile blend weights pre-normalized by their sum, so tiles only need adding."""
+    wts, wsum = [], torch.zeros(H, W)
+    for i, j in tiles:
+        wy = _ramp(th * s, ramp, i > 0, i < len(ys) - 1)
+        wx = _ramp(tw * s, ramp, j > 0, j < len(xs) - 1)
+        wt = wy[:, None] * wx[None, :]
+        wsum[ys[i] * s:ys[i] * s + th * s, xs[j] * s:xs[j] * s + tw * s] += wt
+        wts.append(wt)
+    return [wt / wsum[ys[i] * s:ys[i] * s + th * s, xs[j] * s:xs[j] * s + tw * s]
+            for wt, (i, j) in zip(wts, tiles)]
+
+
 def decode_tiled(vae, z, cpu_group, overlap=8):
     """vae: Wan2_2_VAE on this rank's device; z: [C, T, H, W] latent (same on all ranks).
 
+    Each rank decodes its tiles, multiplies by the normalized blend weight on device, and
+    writes the result to shared memory; rank 0 sums the tiles into place.
     Returns the decoded video [3, F, H*s, W*s] (float32, clamped) on rank 0, None elsewhere.
     """
     rank, world = dist.get_rank(), dist.get_world_size()
     _, _, h, w = z.shape
     th, tw, ys, xs = tile_grid(h, w, world, overlap)
     tiles = [(i, j) for i in range(len(ys)) for j in range(len(xs))]
+    _CALL[0] += 1
+    tag = f"{SHM_DIR}/wan_vae_tile_{os.getppid()}_{_CALL[0]}"
 
     t0 = time.time()
-    mine = []
+    meta = None
     for k, (i, j) in enumerate(tiles):
         if k % world != rank:
             continue
         zt = z[:, :, ys[i]:ys[i] + th, xs[j]:xs[j] + tw].contiguous()
-        out = vae.decode([zt])[0]  # [3, F, th*s, tw*s], float32 clamped
-        mine.append((k, out.to(torch.bfloat16).cpu()))
-
+        out = vae.decode([zt])[0]  # [3, F, th*s, tw*s], float32 clamped, on device
+        C, F = out.shape[0], out.shape[1]
+        s = out.shape[-1] // tw
+        wt = _weights(tiles, ys, xs, th, tw, s, overlap * s, h * s, w * s)[k]
+        out = (out * wt.to(out.device, out.dtype)).to(torch.bfloat16).cpu()
+        out.view(torch.int16).numpy().tofile(f"{tag}_{k}.bin")
+        meta = (C, F, s)
     t_dec = time.time() - t0
+
     gathered = [None] * world if rank == 0 else None
-    dist.gather_object((t_dec, mine), gathered, dst=0, group=cpu_group)
+    dist.gather_object((t_dec, meta), gathered, dst=0, group=cpu_group)  # tiny; also a barrier
     if rank != 0:
         return None
-    t_gather = time.time() - t0 - t_dec
-    dec_times = [g[0] for g in gathered]
-    gathered = [g[1] for g in gathered]
     t1 = time.time()
-
-    parts = dict(item for lst in gathered for item in lst)
-    sample = parts[0]
-    s = sample.shape[-1] // tw  # spatial scale latent -> pixels
-    C, F = sample.shape[0], sample.shape[1]
-    H, W = h * s, w * s
-    ramp = overlap * s
-    acc = torch.zeros(C, F, H, W)
-    wsum = torch.zeros(1, 1, H, W)
+    dec_times = [g[0] for g in gathered]
+    C, F, s = gathered[0][1]
+    acc = torch.zeros(C, F, h * s, w * s)
     for k, (i, j) in enumerate(tiles):
-        y0, x0 = ys[i] * s, xs[j] * s
-        wy = _ramp(th * s, ramp, i > 0, i < len(ys) - 1)
-        wx = _ramp(tw * s, ramp, j > 0, j < len(xs) - 1)
-        wt = (wy[:, None] * wx[None, :])[None, None]
-        acc[:, :, y0:y0 + th * s, x0:x0 + tw * s] += parts[k].float() * wt
-        wsum[:, :, y0:y0 + th * s, x0:x0 + tw * s] += wt
-    out = (acc / wsum).clamp_(-1, 1)
-    print(f"[vae_tiled] tiles={len(tiles)} ({th}x{tw} latent) decode max/min over ranks="
-          f"{max(dec_times):.2f}/{min(dec_times):.2f}s gather(after rank0 decode)={t_gather:.2f}s "
-          f"blend={time.time() - t1:.2f}s", flush=True)
+        f = f"{tag}_{k}.bin"
+        part = torch.from_numpy(np.fromfile(f, dtype=np.int16)).view(torch.bfloat16)
+        part = part.view(C, F, th * s, tw * s)
+        acc[:, :, ys[i] * s:ys[i] * s + th * s, xs[j] * s:xs[j] * s + tw * s] += part.float()
+        os.remove(f)
+    out = acc.clamp_(-1, 1)
+    print(f"[vae_tiled] tiles={len(tiles)} ({th}x{tw} latent, overlap {overlap}) decode max/min over ranks="
+          f"{max(dec_times):.2f}/{min(dec_times):.2f}s collect+sum={time.time() - t1:.2f}s", flush=True)
     return out
 
 
