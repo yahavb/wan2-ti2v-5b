@@ -178,8 +178,6 @@ spec:
               value: "1"
             - name: VAE_FULLGRAPH
               value: "1"
-            - name: VAE_CC_FLAGS
-              value: "--model-type=unet-inference -O1 --auto-cast=none"
             - name: DIT_FAST
               value: "1"
             - name: FAST_ATTN_IMPL

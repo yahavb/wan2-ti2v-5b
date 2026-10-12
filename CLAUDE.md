@@ -63,9 +63,8 @@ python test_vae_kernels.py
 | `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron built-in flash kernel, LNC2-aware) or `nki` (our kernels/, single-program) |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
 | `FAST_ALLREDUCE_CHUNK_BYTES` | 0 | Chunk in-graph all-reduces along seq (0 = off) |
-| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk (3 graphs) |
+| `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py`: fixed-shape causal cache, 2 graphs (chunk 0 / rest) |
 | `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile (graph breaks fail loudly) |
-| `VAE_CC_FLAGS` | "" | NEURON_CC_FLAGS while VAE graphs compile, e.g. `--model-type=unet-inference` |
 | `NUM_STEPS` | 10 | Denoising steps |
 | `NUM_RUNS` | 2 | Benchmark iterations (run 1=cold/compile, run 2=warm) |
 | `FRAME_NUM` | 81 | Output video frames |
@@ -90,6 +89,7 @@ The VAE uses NKI when `USE_NKI_VAE=1` (loaded in `wan/modules/vae2_2.py` via `to
 - `torch.compile(backend='neuron')` used for DiT submodules but NOT time_embedding/time_projection (fp32 input with bf16 weights)
 - All `dist.broadcast`/`dist.all_reduce` must happen from the main thread (same thread as warmup) — the server uses a queue to route requests from FastAPI thread to main thread
 - All-reduce payloads chunked to ≤8MB (`MAX_ALLREDUCE_BYTES`) to avoid NRT size-limit rejections at TP=8
+- TorchNeuron reads `NEURON_CC_FLAGS` once per process (session settings); changing it mid-process has no effect, and there is no per-graph compiler-args option
 - `@torch.compiler.disable` on `all_reduce_sum` forces graph breaks between compiled FFN NEFFs and collective ops
 
 ## Deployment
