@@ -337,13 +337,16 @@ class FastWanDiT:
             if CONST_MAX_LAYERS == "all":
                 chosen = set(range(len(model.blocks)))
             elif CONST_MAX_LAYERS == "auto":
-                chosen = set()
-                for i, b in enumerate(model.blocks):
-                    ok, hard = const_max_layer_ok(b)
-                    logger.info(f"[fast_dit] block {i}: const-max hard bound {hard:.1f} -> "
-                                f"{'constmax' if ok else 'sdpa'}")
-                    if ok:
-                        chosen.add(i)
+                # Each rank only sees its heads' gammas; take the max over ranks so every
+                # rank compiles the SAME graph per block (collectives need identical NEFFs).
+                hard = torch.tensor([const_max_layer_ok(b)[1] for b in model.blocks])
+                if torch.distributed.is_initialized():
+                    import torch.distributed as dist
+                    gloo = dist.new_group(backend="gloo")
+                    dist.all_reduce(hard, op=dist.ReduceOp.MAX, group=gloo)
+                chosen = {i for i, h in enumerate(hard.tolist()) if h <= CONST_MAX_HARD_LIMIT}
+                logger.info(f"[fast_dit] const-max hard bounds (max over ranks): "
+                            f"{[round(h, 1) for h in hard.tolist()]}")
             else:
                 chosen = {int(x) for x in CONST_MAX_LAYERS.split(",") if x.strip()}
             impls = ["constmax" if i in chosen else "sdpa" for i in range(len(model.blocks))]
