@@ -186,6 +186,8 @@ spec:
               value: "constmax"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
+            - name: CONST_MAX_LAYERS
+              value: "auto"
             - name: CLEAN_RUNS
               value: "3"
             - name: PROFILE_STEPS

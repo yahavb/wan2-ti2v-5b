@@ -45,6 +45,23 @@ FAST_FULLGRAPH = os.environ.get("FAST_FULLGRAPH", "0") == "1"
 # Constant max subtracted before exp in the const-max kernel (scaled-score units). The output
 # is invariant to it; it only has to stay within ~80 of every row's true max.
 CONST_MAX_SOFTMAX_MAX = float(os.environ.get("CONST_MAX_SOFTMAX_MAX", "15.0"))
+# Which layers use const-max (others fall back to sdpa, as in odyssey PR #96's hybrid):
+#   "auto" -- layers whose worst-case scaled score sqrt(d)*max|g_q|*max|g_k| (per head, from
+#             the QK-norm weights) stays <= CONST_MAX_HARD_LIMIT; the kernel clips scaled
+#             scores at 70, so layers that can exceed it would have their peaks flattened.
+#   "all"  -- every layer;  or a comma list of layer indices.
+CONST_MAX_LAYERS = os.environ.get("CONST_MAX_LAYERS", "auto")
+CONST_MAX_HARD_LIMIT = float(os.environ.get("CONST_MAX_HARD_LIMIT", "70"))
+
+
+def const_max_layer_ok(block):
+    """Worst-case scaled score of this block's self-attn heads (local shard) under the clip?"""
+    sa = block.self_attn
+    d = sa.head_dim
+    gq = sa.norm_q.weight.detach().float().cpu().reshape(-1, d).abs().amax(1)
+    gk = sa.norm_k.weight.detach().float().cpu().reshape(-1, d).abs().amax(1)
+    hard = float((d ** 0.5) * (gq * gk).max())
+    return hard <= CONST_MAX_HARD_LIMIT, hard
 # In-graph all-reduce chunking (0 = off). The 8MB eager limit in tp_utils was an NRT
 # eager-collective constraint; set this if the compiled collective hits a size error.
 FAST_ALLREDUCE_CHUNK_BYTES = int(os.environ.get("FAST_ALLREDUCE_CHUNK_BYTES", "0"))
@@ -315,9 +332,25 @@ class FastWanDiT:
         kw = dict(backend="neuron", dynamic=False, fullgraph=FAST_FULLGRAPH)
         self.patch = torch.compile(_FastPatch(model.patch_embedding, batch=2), **kw)
         self.text = torch.compile(_FastText(model.text_embedding), **kw)
+        impls = [FAST_ATTN_IMPL] * len(model.blocks)
+        if FAST_ATTN_IMPL == "constmax":
+            if CONST_MAX_LAYERS == "all":
+                chosen = set(range(len(model.blocks)))
+            elif CONST_MAX_LAYERS == "auto":
+                chosen = set()
+                for i, b in enumerate(model.blocks):
+                    ok, hard = const_max_layer_ok(b)
+                    logger.info(f"[fast_dit] block {i}: const-max hard bound {hard:.1f} -> "
+                                f"{'constmax' if ok else 'sdpa'}")
+                    if ok:
+                        chosen.add(i)
+            else:
+                chosen = {int(x) for x in CONST_MAX_LAYERS.split(",") if x.strip()}
+            impls = ["constmax" if i in chosen else "sdpa" for i in range(len(model.blocks))]
+            logger.info(f"[fast_dit] const-max on {len(chosen)}/{len(impls)} layers: {sorted(chosen)}")
         self.blocks = [
-            torch.compile(_FastBlock(b, self.num_frames, FAST_ATTN_IMPL, identity), **kw)
-            for b in model.blocks
+            torch.compile(_FastBlock(b, self.num_frames, impl, identity), **kw)
+            for b, impl in zip(model.blocks, impls)
         ]
         self.cross_kv = [torch.compile(_FastCrossKV(b), **kw) for b in model.blocks]
         self.head = torch.compile(

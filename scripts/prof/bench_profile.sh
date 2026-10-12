@@ -56,6 +56,13 @@ archive() {
 }
 trap archive EXIT
 
+# ═══ [0] const-max kernel parity (one core) when that kernel is selected ═══
+if [ "${FAST_ATTN_IMPL:-}" = "constmax" ]; then
+  echo "=== [0] const-max parity vs exact attention (one core) ==="
+  NEURON_RT_VISIBLE_CORES=0 timeout 1800 python3 scripts/prof/const_max_parity.py 2>&1 \
+    | grep -vE "Warning|warn\(" | tee "$RESULTS/const_max_parity.txt" | tail -25
+fi
+
 # ═══ [1+2] CLEAN (compile/load + warm runs, no profiler) ═══
 echo "=== [1+2] CLEAN: NUM_RUNS=$CLEAN_RUNS, no profiler ==="
 NUM_RUNS="$CLEAN_RUNS" "${LAUNCH[@]}" inference_neuron_ti2v.py > "$RESULTS/clean.log" 2>&1
