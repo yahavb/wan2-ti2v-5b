@@ -10,6 +10,10 @@ Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 | (main, before) | original eager DiT | TP=8 LNC1 | 4.4 | 44.3s | 32.3s | 76.6s | ok |
 | `ce390d3` | fast DiT: block-compiled, batched CFG | TP=4 LNC2 | 2.55 | 25.5s | 10.8s | 36.4s | ok |
 | `ce390d3` | fast DiT | TP=8 LNC1 | 1.91 | 19.1s | 17.7s | 36.8s | not checked |
+| `2e4a6a6` | + cross-attn K/V cache + tiled VAE (current main) | TP=8 LNC1 | 1.92 | 19.2s | 9.0s | **28.2s** | not checked |
+
+Reference (5B, same shape class, from the 2026-10-07 comparison): H100 compiled 0.498 s/step, 8.02s total;
+A100 compiled 1.143 s/step, 16.92s total; earlier Trainium2 TP8 3.971 s/step, 58.68s total.
 
 ## 368x480, 21 frames (generated 384x480, cropped; 1080 DiT tokens), TP=8 LNC1
 

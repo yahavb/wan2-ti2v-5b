@@ -79,6 +79,14 @@ find /tmp /var/tmp /root -name '*.neff' -size +100k 2>/dev/null | grep -v -e /tm
   > "$RESULTS/neff_cache_list.txt" || true
 echo "cached NEFFs (>100KB): $(wc -l < "$RESULTS/neff_cache_list.txt")"
 
+if [ "${SKIP_PROFILE:-0}" = "1" ]; then
+  echo "════════ SUMMARY (SKIP_PROFILE=1) ════════"
+  echo "  provenance : $GIT_BRANCH@${GIT_SHA:0:8}  TP=$TP LNC=${LNC_CONFIG:-?}"
+  echo "  CLEAN      : ${T_CLEAN:-N/A} s/step"
+  echo "  video      : $RESULTS/output_clean.mp4"
+  exit 0
+fi
+
 # ═══ [3a] PROFILED (runtime inspector on PROFILE_RANKS) ═══
 SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
 echo "=== [3a] PROFILED: NUM_RUNS=1 NUM_STEPS=$PROFILE_STEPS, inspector on ranks ${PROFILE_RANKS:-0} ==="
