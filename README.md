@@ -29,6 +29,8 @@ branch; original-path rows are the earlier measurements from `main`.
 |---|---|---|---|---|---|---|
 | Fast DiT (`DIT_FAST=1`) | TP=8, LNC1 | 1.5s | 0.15 | 2.4s | **3.9s** | 83.5s |
 
+With the cross-attention K/V cache (`1b18e22`) denoise drops to 1.4s (0.14 s/step).
+
 Set with `HEIGHT=368 WIDTH=480 FRAME_NUM=21` (sizes that are not multiples of 32 are generated
 at the next multiple of 32 and center-cropped after decode).
 
@@ -137,7 +139,7 @@ FastAPI server on port 8000:
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
-| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk (3 graphs; experimental) |
+| `VAE_COMPILE` | 0 | torch.compile the VAE decoder per latent-frame chunk. **Measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
 | `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |
 | `KEEP_ALIVE_SECONDS` | 86400 (jobs) | Keep the pod up after the run for `kubectl cp` |
