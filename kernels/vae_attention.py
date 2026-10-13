@@ -159,7 +159,7 @@ def vae_self_attention(q, k, v, identity, softmax_scale=None):
                 # Transpose via identity matmul trick
                 attn_T_psum = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(attn_T_psum, attn_chunk, id_sbuf)
-                attn_T = nl.copy(attn_T_psum)
+                attn_T = nl.copy(attn_T_psum, dtype=v.dtype)  # nc_matmul needs matching dtypes
 
                 # nc_matmul: attn_T[P,P].T @ V[P,d]
                 # V has free dim = d, which could be 256/512/1024
