@@ -266,6 +266,9 @@ def main():
     if rank == T5_RANK:
         del text_encoder
         gc.collect()
+        # Return T5's ~11 GB of cached blocks to the runtime: rank 2 shares an HBM stack with
+        # rank 3, which otherwise runs out during the VAE (reserved stayed at 13.9 GB).
+        torch.neuron.empty_cache()
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast to all ranks")
