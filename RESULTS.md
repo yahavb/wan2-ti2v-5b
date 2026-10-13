@@ -13,6 +13,11 @@ Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 | `2e4a6a6` | + cross-attn K/V cache + tiled VAE | TP=8 LNC1 | 1.92 | 19.2s | 9.0s | 28.2s | not checked |
 | `b8d5cbd` | + const-max self-attention on 22/30 layers (1 head per kernel call), rest sdpa | TP=8 LNC1 | 1.19 | 11.9s | 9.0s | 21.0s | perfect |
 | `de16d5d` | + VAE tiles weighted on device, collected via /dev/shm; tile overlap 4 | TP=8 LNC1 | **1.19** | **11.9s** | **6.0s** | **17.9s** | amazing |
+| `679701a` | + nkilib conv3d for VAE causal 3x3x3 convs (C>=96, D_out>=2), T5 cache freed | TP=8 LNC1 | **1.19** | **11.9s** | **5.4s** | **17.3s** | conv rel_err <= 1e-4 |
+| `99f92da` | + upsample convs via nkilib (D=1), 2x upsample as repeat_interleave | TP=8 LNC1 | 1.19 | 11.9s | 5.2s | 17.2s | 2D rel_err 0.0000 |
+| `08921e3` | + rank-0 CPU threads 16 (torchrun default 1), in-place uint8 convert | TP=8 LNC1 | **1.19** | **11.9s** | **4.2s** | **16.1s** | — **beats A100 16.92s** |
+
+VAE breakdown at `08921e3`: per-core decode 3.8s, collect+sum 0.14s, convert 0.02s, mp4 write 0.21s.
 
 VAE breakdown at `de16d5d`: per-core decode 4.5s, collect+sum 0.4s, convert+mp4 write 1.1s (was 6.1s / 2.3s gather+blend / 0.9s at `21759b3`, overlap 8).
 

@@ -51,6 +51,11 @@ VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 # (models/vae_tiled.py); rank 0 blends. VAE_TILE_OVERLAP is in latent units.
 VAE_TILED = os.environ.get("VAE_TILED", "0") == "1"
 VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "8"))
+# x264 settings for the output mp4. imageio's default is preset medium, crf 25 (~1.1s for
+# 81 frames at 704x544); veryfast + crf 20 is ~8x faster at about the same PSNR.
+MP4_PRESET = os.environ.get("MP4_PRESET", "veryfast")
+MP4_CRF = os.environ.get("MP4_CRF", "20")
+MP4_KW = dict(quality=None, ffmpeg_params=["-preset", MP4_PRESET, "-crf", MP4_CRF])
 USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 # DIT_FAST=1: block-compiled DiT with in-graph collectives + batched CFG (models/fast_dit.py).
 # DIT_FAST=0: original eager path (per-FFN NEFFs, eager all-reduces, 2 forwards/step).
@@ -63,7 +68,21 @@ def setup_distributed():
     dist.init_process_group(backend="neuron")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.neuron.set_device(local_rank)
+    print(f"[mem] rank {dist.get_rank()} local_rank {local_rank} "
+          f"NEURON_RT_VISIBLE_CORES={os.environ.get('NEURON_RT_VISIBLE_CORES')}", flush=True)
     return dist.get_rank(), dist.get_world_size()
+
+
+def device_mem_str():
+    """Allocated / reserved device memory of this rank, in GB (best effort)."""
+    for mod in (getattr(torch, "neuron", None), getattr(torch, "accelerator", None)):
+        try:
+            return (f"alloc={mod.memory_allocated() / 2**30:.2f}GB "
+                    f"reserved={mod.memory_reserved() / 2**30:.2f}GB "
+                    f"max_alloc={mod.max_memory_allocated() / 2**30:.2f}GB")
+        except Exception:
+            continue
+    return "n/a"
 
 
 FRAME_NUM = int(os.environ.get("FRAME_NUM", "81"))
@@ -80,6 +99,9 @@ USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "0")
 def main():
     rank, world_size = setup_distributed()
     torch.set_grad_enabled(False)
+    if rank == 0:
+        # torchrun sets OMP_NUM_THREADS=1; rank 0 sums the VAE tiles and converts the video on CPU.
+        torch.set_num_threads(int(os.environ.get("RANK0_CPU_THREADS", "16")))
 
     global T5_RANK
     if T5_RANK >= world_size:
@@ -247,6 +269,9 @@ def main():
     if rank == T5_RANK:
         del text_encoder
         gc.collect()
+        # Return T5's ~11 GB of cached blocks to the runtime: rank 2 shares an HBM stack with
+        # rank 3, which otherwise runs out during the VAE (reserved stayed at 13.9 GB).
+        torch.neuron.empty_cache()
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast to all ranks")
@@ -442,7 +467,7 @@ def main():
                 if video_np.dim() == 4 and video_np.shape[0] == 3:
                     video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+                imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
         elif VAE_TILED:
             # Tiled decode across all ranks; rank 0 receives the blended video
@@ -451,18 +476,21 @@ def main():
                 th, tw, ys, xs = tile_grid(latent.shape[2], latent.shape[3], world_size, VAE_TILE_OVERLAP)
                 logger.info(f"VAE tiled decode: {len(ys)}x{len(xs)} tiles of {th}x{tw} latent "
                             f"(overlap {VAE_TILE_OVERLAP}) over {world_size} ranks")
+            print(f"[mem] rank {rank} before VAE: {device_mem_str()}", flush=True)
             video = decode_tiled(vae, latent.to(torch.bfloat16), cpu_group, VAE_TILE_OVERLAP)
+            print(f"[mem] rank {rank} after VAE: {device_mem_str()}", flush=True)
             if rank == 0:
                 t_w = time.time()
-                video = crop_video(video)
                 import imageio
                 output_path = "/tmp/wan2_ti2v_output.mp4"
-                video_np = ((video.float().clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
-                video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
-                frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
-                logger.info(f"Video saved to {output_path} ({len(frames)} frames); "
-                            f"convert+mp4 write {time.time() - t_w:.2f}s")
+                # video is float32 in [-1, 1] (clamped in decode_tiled); same truncation as
+                # ((v * 0.5 + 0.5) * 255).byte(), without the extra full-size temporaries.
+                video_np = crop_video(video).add_(1).mul_(127.5).to(torch.uint8)
+                video_np = video_np.permute(1, 2, 3, 0).contiguous().numpy()  # [F, H, W, C]
+                t_c = time.time()
+                imageio.mimwrite(output_path, list(video_np), fps=24, codec='libx264', **MP4_KW)
+                logger.info(f"Video saved to {output_path} ({len(video_np)} frames); "
+                            f"convert {t_c - t_w:.2f}s + mp4 write {time.time() - t_c:.2f}s")
         elif rank == VAE_RANK:
             # Original single-rank decode with NKI kernels
             logger.info(f"{run_label} VAE decode on Neuron...")
@@ -476,7 +504,7 @@ def main():
             if video_np.dim() == 4 and video_np.shape[0] == 3:
                 video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
             frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-            imageio.mimwrite(output_path, frames, fps=24, codec='libx264')
+            imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
             logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
 
         dist.barrier()

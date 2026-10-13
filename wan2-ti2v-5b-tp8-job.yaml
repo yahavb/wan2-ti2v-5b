@@ -29,7 +29,7 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              git clone -b fast-mp4 https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
               cd wan2-ti2v-5b
 
               # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
@@ -171,6 +171,10 @@ spec:
             - name: USE_NKI_KERNELS
               value: "1"
             - name: USE_NKI_VAE
+              value: "1"
+            - name: USE_NKI_CONV3D
+              value: "1"
+            - name: NKI_CONV3D_CHECK
               value: "0"
             - name: USE_NST_SELF_ATTN
               value: "1"

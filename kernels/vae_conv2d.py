@@ -10,7 +10,7 @@ nc_matmul semantics: nc_matmul(stationary, moving) = stationary.T @ moving
 Input layout: (C, H*W) flattened spatial — caller handles the 5D→2D reshape.
 Weight layout: TRANSPOSED — weight_T is (C_in, C_out) so nc_matmul gives W @ input.
 
-NKI API: bundled neuronxcc.nki.isa return-style (same as cross_attention.py).
+NKI API: destination-first nisa calls (tensor_tensor(dst, a, b, op=...)), as in self_attention_nst.py.
 """
 import nki
 import nki.language as nl
@@ -75,11 +75,10 @@ def vae_conv2d_k1(input_2d, weight_T, bias, HW):
                 # nc_matmul: w_chunk.T @ inp_chunk = W[co:co+P, ci:ci+P] @ input[ci:ci+P, sp:sp+512]
                 mm = nl.ndarray((P, SPATIAL_TILE), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(mm, w_chunk, inp_chunk)
-                mm_sbuf = nl.copy(mm, dtype=nl.float32)
-                acc[...] = nisa.tensor_tensor(acc, mm_sbuf, nl.add)
+                nisa.tensor_tensor(acc, acc, mm, op=nl.add)
 
-            # Add bias (broadcast along spatial dim)
-            acc[...] = nisa.tensor_tensor(acc, bias_sbuf, nl.add)
+            # Add bias (per-partition scalar, broadcast along spatial dim)
+            nisa.tensor_scalar(acc, acc, nl.add, bias_sbuf)
 
             # Store
             out_tile = nl.copy(acc, dtype=input_2d.dtype)
@@ -154,11 +153,10 @@ def vae_conv2d_k3_shifted(shifted_inputs, weight_slices_T, bias, num_positions):
                     # nc_matmul: w_chunk.T @ inp_chunk = W_slice[co:co+P, ci:ci+P] @ shifted_input
                     mm = nl.ndarray((P, SPATIAL_TILE), dtype=nl.float32, buffer=nl.psum)
                     nisa.nc_matmul(mm, w_chunk, inp_chunk)
-                    mm_sbuf = nl.copy(mm, dtype=nl.float32)
-                    acc[...] = nisa.tensor_tensor(acc, mm_sbuf, nl.add)
+                    nisa.tensor_tensor(acc, acc, mm, op=nl.add)
 
-            # Add bias
-            acc[...] = nisa.tensor_tensor(acc, bias_sbuf, nl.add)
+            # Add bias (per-partition scalar)
+            nisa.tensor_scalar(acc, acc, nl.add, bias_sbuf)
 
             out_tile = nl.copy(acc, dtype=shifted_inputs.dtype)
             nisa.dma_copy(dst=output[nl.ds(co, P), nl.ds(sp, SPATIAL_TILE)], src=out_tile)

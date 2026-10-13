@@ -35,6 +35,20 @@ if _USE_NKI_VAE:
     except Exception as e:
         logging.warning(f"[vae2_2] NKI VAE kernels: FAILED ({e}), using PyTorch fallback")
 
+# USE_NKI_CONV3D=1: causal 3x3x3 convs with C_in, C_out >= 96 and D_out >= 2 run the nkilib
+# conv3d kernel (kernels/vae_conv3d.py). NKI_CONV3D_CHECK=1 logs, once per shape, the error
+# against the eager conv.
+_USE_NKI_CONV3D = os.environ.get("USE_NKI_CONV3D", "0") == "1"
+_NKI_CONV3D_CHECK = os.environ.get("NKI_CONV3D_CHECK", "0") == "1"
+_nki_conv3d = None
+_nki_conv3d_checked = set()
+if _USE_NKI_CONV3D:
+    try:
+        from kernels import vae_conv3d as _nki_conv3d
+        logging.info("[vae2_2] nkilib conv3d: LOADED")
+    except Exception as e:
+        logging.warning(f"[vae2_2] nkilib conv3d: FAILED ({e}), using PyTorch conv3d")
+
 
 def _is_neuron_tensor(x):
     """Check if tensor is on a Neuron device."""
@@ -137,6 +151,7 @@ class CausalConv3d(nn.Conv3d):
             0,
         )
         self.padding = (0, 0, 0)
+        self._nki_filters = None  # packed lazily, after the model is on device
 
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
@@ -144,9 +159,33 @@ class CausalConv3d(nn.Conv3d):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
+        # Once packed (first call with D_out >= 2), every call takes the kernel: the original
+        # weight is freed, and the D_out=1 calls left are chunk 0's.
+        if self._nki_filters is not None or (
+                _nki_conv3d is not None and x.shape[2] + padding[4] - 2 >= _nki_conv3d.MIN_D_OUT
+                and _nki_conv3d.eligible(self)):
+            return self._nki_forward(x, padding)
         x = F.pad(x, padding)
 
         return super().forward(x)
+
+    def _nki_forward(self, x, padding):
+        if padding[4] > 0:  # fewer than 2 cached frames: zero-pad time, kernel pads H/W
+            x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
+        if self._nki_filters is None:
+            self._nki_filters = _nki_conv3d.pack_filters(self.weight)
+            if not _NKI_CONV3D_CHECK:  # drop the unpacked copy (~0.5 GB per rank in total)
+                self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
+        out = _nki_conv3d.conv3d_3x3x3(x.to(self._nki_filters.dtype), self._nki_filters, self.bias)
+        if _NKI_CONV3D_CHECK:
+            key = (tuple(x.shape), self.out_channels)
+            if key not in _nki_conv3d_checked:
+                _nki_conv3d_checked.add(key)
+                ref = super().forward(F.pad(x, (1, 1, 1, 1, 0, 0)))
+                err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
+                logging.warning(f"[nki_conv3d] x={list(x.shape)} C_out={self.out_channels} "
+                                f"rel_err={err.item():.4f} shape_ok={out.shape == ref.shape}")
+        return out
 
 
 class RMS_norm(nn.Module):
@@ -175,7 +214,32 @@ class Upsample(nn.Upsample):
         """
         Fix bfloat16 support for nearest neighbor interpolation.
         """
+        # Integer 2x nearest == repeat each pixel; avoids nn.Upsample's fp32 cast and the
+        # indirect-DMA gathers it lowers to on Neuron (vllm-omni-neuron-staging).
+        if tuple(self.scale_factor) == (2.0, 2.0) and self.mode in ("nearest", "nearest-exact"):
+            return x.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
         return super().forward(x.float()).type_as(x)
+
+
+class NkiConv2d(nn.Conv2d):
+    """3x3 / pad 1 Conv2d run as nkilib conv3d with D=1 when USE_NKI_CONV3D=1 (the
+    upsample convs; staging measured them paying off together with the 3D group)."""
+
+    def forward(self, x):
+        if _nki_conv3d is None or min(self.in_channels, self.out_channels) < _nki_conv3d.MIN_CHANNELS:
+            return super().forward(x)
+        if getattr(self, "_nki_filters", None) is None:
+            self._nki_filters = _nki_conv3d.pack_filters(self.weight.unsqueeze(2))
+            if not _NKI_CONV3D_CHECK:
+                self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
+        out = _nki_conv3d.conv3d_3x3x3(x.unsqueeze(2).to(self._nki_filters.dtype),
+                                       self._nki_filters, self.bias).squeeze(2)
+        if _NKI_CONV3D_CHECK and (tuple(x.shape), "2d") not in _nki_conv3d_checked:
+            _nki_conv3d_checked.add((tuple(x.shape), "2d"))
+            ref = super().forward(x)
+            err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
+            logging.warning(f"[nki_conv2d] x={list(x.shape)} rel_err={err.item():.4f}")
+        return out
 
 
 class Resample(nn.Module):
@@ -196,12 +260,12 @@ class Resample(nn.Module):
         if mode == "upsample2d":
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim, 3, padding=1),
+                NkiConv2d(dim, dim, 3, padding=1),
             )
         elif mode == "upsample3d":
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim, 3, padding=1),
+                NkiConv2d(dim, dim, 3, padding=1),
                 # nn.Conv2d(dim, dim//2, 3, padding=1)
             )
             self.time_conv = CausalConv3d(
