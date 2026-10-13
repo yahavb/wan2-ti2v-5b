@@ -67,7 +67,7 @@ fi
 echo "=== [1+2] CLEAN: NUM_RUNS=$CLEAN_RUNS, no profiler ==="
 NUM_RUNS="$CLEAN_RUNS" "${LAUNCH[@]}" inference_neuron_ti2v.py > "$RESULTS/clean.log" 2>&1
 echo "clean exit=$?"
-grep -E "denoising:|DONE:|graph breaks|Warm run|Error|Traceback|vae_tiled|mp4 write" "$RESULTS/clean.log" | tail -30
+grep -E "denoising:|DONE:|graph breaks|Warm run|Error|ERROR|Traceback|vae_tiled|mp4 write|nki_conv3d|conv3d:|NRT|nrt" "$RESULTS/clean.log" | grep -v "^ *File " | tail -80
 mapfile -t CS < <(steps_of "$RESULTS/clean.log")
 T_CLEAN=$(printf '%s\n' "${CS[@]:1}" | sort -n | awk '{a[NR]=$1} END{if(NR) print a[int((NR+1)/2)]}')
 echo "CLEAN s/step per run: ${CS[*]:-none}  -> T_CLEAN (median of warm runs) = ${T_CLEAN:-N/A} s/step"
