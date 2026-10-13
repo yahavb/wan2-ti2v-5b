@@ -67,8 +67,10 @@ fi
 echo "=== [1+2] CLEAN: NUM_RUNS=$CLEAN_RUNS, no profiler ==="
 NUM_RUNS="$CLEAN_RUNS" "${LAUNCH[@]}" inference_neuron_ti2v.py > "$RESULTS/clean.log" 2>&1
 echo "clean exit=$?"
-grep -E "denoising:|DONE:|graph breaks|Warm run|Error|ERROR|Traceback|vae_tiled|mp4 write|nki_conv3d|conv3d:|NRT|nrt" "$RESULTS/clean.log" \
+grep -E "denoising:|DONE:|graph breaks|Warm run|Error|ERROR|Traceback|vae_tiled|mp4 write|conv3d: FAILED|NRT|nrt" "$RESULTS/clean.log" \
   | grep -vE "^ *File |nrt_infodump|Failed to allocate|tensor_allocate|TDRV:|NeuronMetrics" | tail -80
+echo "--- NKI conv checks (count, shape, rel_err) ---"
+grep -oE "\[nki_conv[23]d\] x=\[[0-9, ]+\]( C_out=[0-9]+)? rel_err=[0-9.]+" "$RESULTS/clean.log" | sort | uniq -c || true
 grep -E "^\[mem\]" "$RESULTS/clean.log" | sort -t' ' -k3,3n -s | head -40
 grep -m3 "Neuron OOM: Segment pool" "$RESULTS/clean.log" | cut -c1-300
 grep -m3 "Neuron Cores using this HBM" "$RESULTS/clean.log" | cut -c1-200
