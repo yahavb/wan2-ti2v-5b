@@ -58,6 +58,8 @@ python test_vae_kernels.py
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism (1=NKI, 2=channel-split) |
 | `USE_NKI_KERNELS` | 0 | Enable NKI kernels for DiT attention |
 | `USE_NKI_VAE` | 1 | Enable NKI kernels for VAE conv/attention |
+| `USE_NKI_CONV3D` | 0 | VAE causal 3x3x3 convs (C>=96, D_out>=2) via nkilib conv3d (`kernels/vae_conv3d.py`, vendored in `kernels/nkilib_vendor/`) |
+| `NKI_CONV3D_CHECK` | 0 | Log rel error of each nkilib conv3d shape vs the eager conv (once per shape) |
 | `USE_NST_SELF_ATTN` | 0 | Use Neuron Science Team self-attention kernel (no mask/identity needed) |
 | `DIT_FAST` | 1 | Block-compiled DiT, in-graph all-reduces, batched CFG (`models/fast_dit.py`); requires SP=1. 0 = original eager path |
 | `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron built-in flash kernel, LNC2-aware), `nki` (our kernels/, single-program), or `constmax` (const-max self-attn from odyssey-trainium) |
