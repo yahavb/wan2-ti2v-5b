@@ -175,7 +175,7 @@ spec:
             - name: USE_NKI_CONV3D
               value: "1"
             - name: NKI_CONV3D_CHECK
-              value: "0"
+              value: "1"
             - name: USE_NST_SELF_ATTN
               value: "1"
             - name: VAE_COMPILE

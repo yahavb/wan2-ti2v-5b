@@ -214,7 +214,32 @@ class Upsample(nn.Upsample):
         """
         Fix bfloat16 support for nearest neighbor interpolation.
         """
+        # Integer 2x nearest == repeat each pixel; avoids nn.Upsample's fp32 cast and the
+        # indirect-DMA gathers it lowers to on Neuron (vllm-omni-neuron-staging).
+        if tuple(self.scale_factor) == (2.0, 2.0) and self.mode in ("nearest", "nearest-exact"):
+            return x.repeat_interleave(2, dim=-2).repeat_interleave(2, dim=-1)
         return super().forward(x.float()).type_as(x)
+
+
+class NkiConv2d(nn.Conv2d):
+    """3x3 / pad 1 Conv2d run as nkilib conv3d with D=1 when USE_NKI_CONV3D=1 (the
+    upsample convs; staging measured them paying off together with the 3D group)."""
+
+    def forward(self, x):
+        if _nki_conv3d is None or min(self.in_channels, self.out_channels) < _nki_conv3d.MIN_CHANNELS:
+            return super().forward(x)
+        if getattr(self, "_nki_filters", None) is None:
+            self._nki_filters = _nki_conv3d.pack_filters(self.weight.unsqueeze(2))
+            if not _NKI_CONV3D_CHECK:
+                self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
+        out = _nki_conv3d.conv3d_3x3x3(x.unsqueeze(2).to(self._nki_filters.dtype),
+                                       self._nki_filters, self.bias).squeeze(2)
+        if _NKI_CONV3D_CHECK and (tuple(x.shape), "2d") not in _nki_conv3d_checked:
+            _nki_conv3d_checked.add((tuple(x.shape), "2d"))
+            ref = super().forward(x)
+            err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
+            logging.warning(f"[nki_conv2d] x={list(x.shape)} rel_err={err.item():.4f}")
+        return out
 
 
 class Resample(nn.Module):
@@ -235,12 +260,12 @@ class Resample(nn.Module):
         if mode == "upsample2d":
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim, 3, padding=1),
+                NkiConv2d(dim, dim, 3, padding=1),
             )
         elif mode == "upsample3d":
             self.resample = nn.Sequential(
                 Upsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
-                nn.Conv2d(dim, dim, 3, padding=1),
+                NkiConv2d(dim, dim, 3, padding=1),
                 # nn.Conv2d(dim, dim//2, 3, padding=1)
             )
             self.time_conv = CausalConv3d(
