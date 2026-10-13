@@ -159,7 +159,10 @@ class CausalConv3d(nn.Conv3d):
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
             padding[4] -= cache_x.shape[2]
-        if (_nki_conv3d is not None and x.shape[2] + padding[4] - 2 >= _nki_conv3d.MIN_D_OUT
+        # Once packed (first call with D_out >= 2), every call takes the kernel: the original
+        # weight is freed, and the D_out=1 calls left are chunk 0's.
+        if self._nki_filters is not None or (
+                _nki_conv3d is not None and x.shape[2] + padding[4] - 2 >= _nki_conv3d.MIN_D_OUT
                 and _nki_conv3d.eligible(self)):
             return self._nki_forward(x, padding)
         x = F.pad(x, padding)
@@ -171,7 +174,9 @@ class CausalConv3d(nn.Conv3d):
             x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
         if self._nki_filters is None:
             self._nki_filters = _nki_conv3d.pack_filters(self.weight)
-        out = _nki_conv3d.conv3d_3x3x3(x.to(self.weight.dtype), self._nki_filters, self.bias)
+            if not _NKI_CONV3D_CHECK:  # drop the unpacked copy (~0.5 GB per rank in total)
+                self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
+        out = _nki_conv3d.conv3d_3x3x3(x.to(self._nki_filters.dtype), self._nki_filters, self.bias)
         if _NKI_CONV3D_CHECK:
             key = (tuple(x.shape), self.out_channels)
             if key not in _nki_conv3d_checked:
