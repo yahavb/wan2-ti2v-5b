@@ -99,6 +99,9 @@ USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "0")
 def main():
     rank, world_size = setup_distributed()
     torch.set_grad_enabled(False)
+    if rank == 0:
+        # torchrun sets OMP_NUM_THREADS=1; rank 0 sums the VAE tiles and converts the video on CPU.
+        torch.set_num_threads(int(os.environ.get("RANK0_CPU_THREADS", "16")))
 
     global T5_RANK
     if T5_RANK >= world_size:
@@ -478,15 +481,16 @@ def main():
             print(f"[mem] rank {rank} after VAE: {device_mem_str()}", flush=True)
             if rank == 0:
                 t_w = time.time()
-                video = crop_video(video)
                 import imageio
                 output_path = "/tmp/wan2_ti2v_output.mp4"
-                video_np = ((video.float().clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
-                video_np = video_np.permute(1, 2, 3, 0)  # [F, H, W, C]
-                frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
-                imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
-                logger.info(f"Video saved to {output_path} ({len(frames)} frames); "
-                            f"convert+mp4 write {time.time() - t_w:.2f}s")
+                # video is float32 in [-1, 1] (clamped in decode_tiled); same truncation as
+                # ((v * 0.5 + 0.5) * 255).byte(), without the extra full-size temporaries.
+                video_np = crop_video(video).add_(1).mul_(127.5).to(torch.uint8)
+                video_np = video_np.permute(1, 2, 3, 0).contiguous().numpy()  # [F, H, W, C]
+                t_c = time.time()
+                imageio.mimwrite(output_path, list(video_np), fps=24, codec='libx264', **MP4_KW)
+                logger.info(f"Video saved to {output_path} ({len(video_np)} frames); "
+                            f"convert {t_c - t_w:.2f}s + mp4 write {time.time() - t_c:.2f}s")
         elif rank == VAE_RANK:
             # Original single-rank decode with NKI kernels
             logger.info(f"{run_label} VAE decode on Neuron...")
