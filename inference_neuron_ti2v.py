@@ -68,7 +68,21 @@ def setup_distributed():
     dist.init_process_group(backend="neuron")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.neuron.set_device(local_rank)
+    print(f"[mem] rank {dist.get_rank()} local_rank {local_rank} "
+          f"NEURON_RT_VISIBLE_CORES={os.environ.get('NEURON_RT_VISIBLE_CORES')}", flush=True)
     return dist.get_rank(), dist.get_world_size()
+
+
+def device_mem_str():
+    """Allocated / reserved device memory of this rank, in GB (best effort)."""
+    for mod in (getattr(torch, "neuron", None), getattr(torch, "accelerator", None)):
+        try:
+            return (f"alloc={mod.memory_allocated() / 2**30:.2f}GB "
+                    f"reserved={mod.memory_reserved() / 2**30:.2f}GB "
+                    f"max_alloc={mod.max_memory_allocated() / 2**30:.2f}GB")
+        except Exception:
+            continue
+    return "n/a"
 
 
 FRAME_NUM = int(os.environ.get("FRAME_NUM", "81"))
@@ -456,7 +470,9 @@ def main():
                 th, tw, ys, xs = tile_grid(latent.shape[2], latent.shape[3], world_size, VAE_TILE_OVERLAP)
                 logger.info(f"VAE tiled decode: {len(ys)}x{len(xs)} tiles of {th}x{tw} latent "
                             f"(overlap {VAE_TILE_OVERLAP}) over {world_size} ranks")
+            print(f"[mem] rank {rank} before VAE: {device_mem_str()}", flush=True)
             video = decode_tiled(vae, latent.to(torch.bfloat16), cpu_group, VAE_TILE_OVERLAP)
+            print(f"[mem] rank {rank} after VAE: {device_mem_str()}", flush=True)
             if rank == 0:
                 t_w = time.time()
                 video = crop_video(video)
