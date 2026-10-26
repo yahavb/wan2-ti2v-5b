@@ -193,7 +193,7 @@ spec:
             - name: CONST_MAX_LAYERS
               value: "auto"
             - name: SKIP_PROFILE
-              value: "1"
+              value: "0"
             - name: CLEAN_RUNS
               value: "3"
             - name: PROFILE_STEPS
