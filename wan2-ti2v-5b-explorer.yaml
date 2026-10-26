@@ -1,0 +1,67 @@
+# Long-running Neuron Explorer UI server. No Neuron device needed (it only parses traces).
+# No Service: reachable only through kubectl port-forward from your Mac.
+#
+#   kubectl apply -f wan2-ti2v-5b-explorer.yaml
+#   kubectl port-forward pod/wan2-ti2v-5b-explorer 3001:3001 3002:3002
+#   open http://localhost:3001
+#
+# Load profiles: copy a pairs dir (each subdir = one .neff + one .ntff) into /profiles,
+# the pod ingests new pairs every 30s:
+#   kubectl cp <bench-pod>:/tmp/results/<run>/pairs ./pairs
+#   kubectl cp ./pairs wan2-ti2v-5b-explorer:/profiles/<run>
+# Or use "Upload Profile" in the UI.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wan2-ti2v-5b-explorer
+  namespace: default
+  labels:
+    app: wan2-ti2v-5b-explorer
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    node-type: trn2
+  containers:
+    - name: explorer
+      image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/bash
+        - "-c"
+        - |
+          set -u
+          PROF="$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)"
+          echo "neuron-explorer: $PROF ($("$PROF" --version 2>&1 | head -1))"
+          mkdir -p /profiles
+
+          "$PROF" view &
+          SERVER=$!
+          sleep 20
+
+          # Ingest each new dir holding one .neff + one .ntff, once.
+          while kill -0 "$SERVER" 2>/dev/null; do
+            find /profiles -type f -name '*.neff' | while read -r neff; do
+              d="$(dirname "$neff")"
+              [ -e "$d/.ingested" ] && continue
+              ntff="$(ls "$d"/*.ntff 2>/dev/null | head -1)"
+              [ -z "$ntff" ] && continue
+              name="$(basename "$(dirname "$d")")_$(basename "$d")"
+              echo "ingest $name"
+              if "$PROF" view -n "$neff" -s "$ntff" --ingest-only --display-name "$name"; then
+                touch "$d/.ingested"
+              else
+                echo "ingest FAILED: $name"; touch "$d/.ingested"
+              fi
+            done
+            sleep 30
+          done
+          echo "server exited"
+      resources:
+        requests:
+          cpu: 8
+          memory: 64Gi
+          ephemeral-storage: 50Gi
+        limits:
+          cpu: 16
+          memory: 128Gi
+          ephemeral-storage: 100Gi
