@@ -126,17 +126,8 @@ spec:
               if [[ "${KEEP_ALIVE_SECONDS:-0}" != "0" ]]; then
                 # Neuron Explorer UI on the preserved pairs. No Service; view from your Mac with:
                 #   kubectl port-forward <pod> 3001:3001 3002:3002   -> http://localhost:3001
-                if [[ "${EXPLORER:-0}" = "1" && -d "${RESULTS}/pairs" ]]; then
-                  PROF="$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)"
-                  "$PROF" view > /tmp/explorer.log 2>&1 &
-                  sleep 20
-                  for d in "${RESULTS}"/pairs/*/; do
-                    neff=$(ls "$d"*.neff 2>/dev/null | head -1 || true); ntff=$(ls "$d"*.ntff 2>/dev/null | head -1 || true)
-                    [[ -z "$neff" || -z "$ntff" ]] && continue
-                    "$PROF" view -n "$neff" -s "$ntff" --ingest-only --display-name "$(basename "$d")" \
-                      || echo "explorer ingest FAILED: $d"
-                  done
-                  echo "EXPLORER READY: kubectl port-forward $(hostname) 3001:3001 3002:3002  -> http://localhost:3001"
+                if [[ "${EXPLORER:-0}" = "1" && -n "${RESULTS}" ]]; then
+                  bash scripts/prof/explorer_ingest.sh "${RESULTS}"
                 fi
                 echo "Keeping pod alive for ${KEEP_ALIVE_SECONDS}s. Pull results with:"
                 echo "  kubectl cp $(hostname):${RESULTS}.tar.gz ./$(basename "${RESULTS:-results}").tar.gz"
@@ -213,6 +204,12 @@ spec:
             - name: PROFILE_STEPS
               value: "2"
             - name: PROFILE_RANKS
+              value: "0"
+            - name: SYSTEM_RANKS
+              value: "all"
+            - name: DEVICE_PROFILE_MODE
+              value: "session"
+            - name: SWEEP_MAX
               value: "0"
             - name: MAX_PAIRS
               value: "3"

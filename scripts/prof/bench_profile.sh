@@ -3,13 +3,14 @@
 #
 #   [1+2] CLEAN   : torchrun, NUM_RUNS=$CLEAN_RUNS, NO profiler. Run 1 compiles/loads (not
 #                   timed); runs 2..N are the real latency.
-#   [3a]  PROFILED: torchrun, runtime inspector (system + device profile) on PROFILE_RANKS
-#                   only, NUM_STEPS=$PROFILE_STEPS. Gives trace_info.pb + per-graph .ntff and
-#                   the profiler-overhead delta.
+#   [3a]  PROFILED: torchrun, runtime inspector, NUM_STEPS=$PROFILE_STEPS. System profile
+#                   (trace_info.pb) on every rank; device profile (.ntff, DEVICE_PROFILE_MODE=
+#                   session) on PROFILE_RANKS only. Also the profiler-overhead delta.
 #   [3b]  system timeline -> perfetto
 #   [4]   per-graph summary-json for every paired .neff/.ntff -> engine table + fixability
 #         ranking; summary-text on the dominant graph; preserve top pairs in pairs/rankNN_*
-#   [4b]  --single-io sweep over the NEFF cache (capped; expect 0/N on collective graphs)
+#   [4b]  --single-io sweep over the NEFF cache (SWEEP_MAX, 0=all; collective graphs time out).
+#         Every captured pair is preserved as pairs/rankNN_<component>_<ms>_<hash>, heaviest first.
 #   [5]   parquet ingest + duckdb op/DMA report on the preserved pairs (analyze_trace.sh)
 #
 # Everything is written to local disk under $RESULTS and tarred to $RESULTS.tar.gz (no S3).
@@ -23,7 +24,7 @@ CLEAN_RUNS="${CLEAN_RUNS:-3}"
 PROFILE_STEPS="${PROFILE_STEPS:-2}"
 MAX_SUMMARY="${MAX_SUMMARY:-40}"
 MAX_PAIRS="${MAX_PAIRS:-3}"
-SWEEP_MAX="${SWEEP_MAX:-6}"
+SWEEP_MAX="${SWEEP_MAX:-0}"   # 0 = every cached NEFF
 TS=$(date +%Y%m%d_%H%M%S)
 RESULTS="/tmp/results/wan2_tp${TP}_${TS}"
 mkdir -p "$RESULTS"
@@ -114,6 +115,8 @@ echo "  .ntff count        : $(find "$SYSTRACE" -name '*.ntff' | wc -l)   size $
 ANA="$RESULTS/analysis"; JSON="$ANA/summary_json"; mkdir -p "$JSON"
 python3 scripts/prof/pair_systrace.py "$SYSTRACE" "$ANA" 2>&1 | tee "$ANA/pairing.txt"
 RANKDIR=$(cat "$ANA/rank_dir.txt" 2>/dev/null || true)
+echo "$SYSTRACE" > "$RESULTS/systrace_root.txt"
+find "$SYSTRACE" -name '*.ntff' -exec ls -l {} \; 2>/dev/null | awk '{print "  ntff", $5, $NF}' | head -20
 
 if [ -n "$RANKDIR" ]; then
   echo "=== [3b] system timeline -> perfetto ==="
@@ -149,6 +152,12 @@ python3 scripts/prof/rank_neffs.py "$JSON" 2>&1 | tee "$RESULTS/neff_ranking.txt
 
 # Preserve the heaviest graphs (by total_time x exec_count) as pre-joined pairs.
 PAIRS="$RESULTS/pairs"; mkdir -p "$PAIRS"
+# Component slug (dit/vae/t5..., "_cc" = has collectives) for naming pairs in Explorer.
+comp_of() {
+  local c; c=$(awk -F'\t' -v n="$1" '$1==n {print $2; exit}' "$ANA/neff_components.tsv" 2>/dev/null)
+  [ -n "$c" ] || c=$(python3 scripts/prof/neff_component.py "$1" 2>/dev/null | cut -f2)
+  echo "${c:-unk}"
+}
 python3 - "$JSON" "$ANA/exec_counts.json" "$MAX_PAIRS" > "$ANA/top_pairs.txt" <<'PY'
 import glob, json, os, sys
 jdir, counts, n = sys.argv[1], json.load(open(sys.argv[2])), int(sys.argv[3])
@@ -167,7 +176,7 @@ while read -r S W T; do
   i=$((i+1))
   LINE=$(awk -F'\t' -v s="$S.neff" '{n=$1; sub(".*/","",n); if (n==s) {print; exit}}' "$ANA/pairs.tsv")
   NEFF=$(echo "$LINE" | cut -f1); NTFF=$(echo "$LINE" | cut -f2)
-  D="$PAIRS/$(printf 'rank%02d' $i)_${S:0:24}__${W}_${T}"
+  D="$PAIRS/$(printf 'rank%02d' $i)_$(comp_of "$NEFF")_${W}_${T}_${S:0:16}"
   mkdir -p "$D"; cp "$NEFF" "$D/"; cp "$NTFF" "$D/$S.ntff"; cp "$JSON/$S.json" "$D/summary.json"
   echo "preserved $D ($(wc -c < "$D/$S.ntff") bytes ntff)"
 done < "$ANA/top_pairs.txt"
@@ -190,32 +199,48 @@ if [ -n "$RANKDIR" ]; then
   tar -czf "$RESULTS/explorer/upload_bundle.tar.gz" -C "$UB" .
 fi
 
-# ═══ [4b] --single-io sweep (capped; collective graphs deadlock -> expect 0/N for the DiT) ═══
-echo "=== [4b] --single-io sweep over the $SWEEP_MAX largest cached NEFFs ==="
+# ═══ [4b] --single-io sweep (collective graphs deadlock alone -> they time out; the session
+#          device trace from [3a] covers those) ═══
 SW="$ANA/single_io"; mkdir -p "$SW"; OK=0; N=0
+if [ "$SWEEP_MAX" -gt 0 ]; then SEL=(head -"$SWEEP_MAX"); else SEL=(cat); fi
+echo "=== [4b] --single-io sweep over $([ "$SWEEP_MAX" -gt 0 ] && echo "the $SWEEP_MAX largest" || echo all) cached NEFFs ($(wc -l < "$RESULTS/neff_cache_list.txt")) ==="
+python3 scripts/prof/neff_component.py $(cat "$RESULTS/neff_cache_list.txt") > "$ANA/neff_components.tsv" 2>/dev/null || true
+echo "components: $(cut -f2 "$ANA/neff_components.tsv" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')"
 while read -r NEFF; do
   N=$((N+1)); h=$(basename "$NEFF" .neff)
-  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 120 "$PROF" capture --single-io -n "$NEFF" -s "$SW/$h.ntff" \
-    > "$SW/$h.capture.log" 2>&1 || continue
+  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout "${SINGLEIO_TIMEOUT:-120}" "$PROF" capture --single-io -n "$NEFF" -s "$SW/$h.ntff" \
+    > "$SW/$h.capture.log" 2>&1 || { echo "  capture FAILED/timeout: $h ($(comp_of "$NEFF"))"; continue; }
   [ -f "$SW/$h.ntff" ] && timeout 300 "$PROF" view -n "$NEFF" -s "$SW/$h.ntff" --output-format summary-json \
     > "$SW/$h.json" 2>/dev/null && [ -s "$SW/$h.json" ] && OK=$((OK+1))
-done < <(xargs -r ls -S < "$RESULTS/neff_cache_list.txt" 2>/dev/null | head -"$SWEEP_MAX")
+done < <(xargs -r ls -S < "$RESULTS/neff_cache_list.txt" 2>/dev/null | "${SEL[@]}")
 echo "single-io captured+viewed OK: $OK / $N"
 if [ "$OK" -gt 0 ]; then
   echo "=== [4b] single-io engine table + ranking ==="
   python3 scripts/prof/profile_all_neffs.py "$SW" 2>&1 | tee "$RESULTS/single_io_breakdown.txt"
   python3 scripts/prof/rank_neffs.py "$SW" 2>&1 | tee "$RESULTS/single_io_ranking.txt"
-  # If the runtime trace gave no pairs, preserve the single-io captures (content-hash pairs).
-  if ! ls -d "$PAIRS"/rank* >/dev/null 2>&1; then
-    i=0
-    for h in $(python3 scripts/prof/top_neffs.py "$SW" "$MAX_PAIRS"); do
-      i=$((i+1)); NEFF=$(grep "/$h.neff$" "$RESULTS/neff_cache_list.txt" | head -1)
-      [ -n "$NEFF" ] && [ -f "$SW/$h.ntff" ] || continue
-      D="$PAIRS/$(printf 'rank%02d' $i)_${h:0:24}__singleio"
-      mkdir -p "$D"; cp "$NEFF" "$D/"; cp "$SW/$h.ntff" "$D/"; cp "$SW/$h.json" "$D/summary.json"
-      echo "preserved $D"
-    done
-  fi
+  # Preserve EVERY captured pair, heaviest (per-exec total_time) first, named by component.
+  i=$(ls -d "$PAIRS"/rank* 2>/dev/null | wc -l)
+  python3 - "$SW" > "$ANA/singleio_order.tsv" <<'PY2'
+import glob, json, os, sys
+rows = []
+for f in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    try:
+        d = json.load(open(f))
+    except Exception:
+        continue
+    nodes = [v for v in d.values() if isinstance(v, dict)] or [d]
+    rows.append((max((n.get("total_time", 0) or 0) for n in nodes), os.path.basename(f)[:-5]))
+for t, h in sorted(rows, reverse=True):
+    print(f"{h}\t{t*1e3:.2f}ms")
+PY2
+  while IFS=$'\t' read -r h MS; do
+    i=$((i+1)); NEFF=$(grep "/$h.neff$" "$RESULTS/neff_cache_list.txt" | head -1)
+    [ -n "$NEFF" ] && [ -f "$SW/$h.ntff" ] || continue
+    COMP=$(comp_of "$NEFF")
+    D="$PAIRS/$(printf 'rank%02d' $i)_${COMP}_${MS}_${h:0:12}"
+    mkdir -p "$D"; cp "$NEFF" "$D/"; cp "$SW/$h.ntff" "$D/"; cp "$SW/$h.json" "$D/summary.json"
+    echo "preserved $(basename "$D")"
+  done < "$ANA/singleio_order.tsv"
 fi
 
 # ═══ [5] instruction-level op/DMA report on the preserved pairs ═══
