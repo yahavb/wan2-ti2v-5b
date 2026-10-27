@@ -8,6 +8,8 @@
 #   02_SYSTEM_DEVICE_rank0_session   system + session device trace of the profiled rank -- the
 #                                    collective DiT graphs that single-io cannot capture. Last,
 #                                    because it is the slowest to ingest.
+# Device profiles are ingested with --framework-source-root / --nki-source-root (built by
+# profile_sources.sh) so the Code Editor widget links instructions to the torch and NKI source.
 # View from your Mac: kubectl port-forward <pod> 3001:3001 3002:3002 -> http://localhost:3001
 # Usage: explorer_ingest.sh <results-dir>
 set -uo pipefail
@@ -15,6 +17,10 @@ RESULTS="${1:?usage: explorer_ingest.sh <results-dir>}"
 PROF="$(command -v neuron-explorer || echo /opt/aws/neuron/bin/neuron-explorer)"
 SYSTRACE=$(cat "$RESULTS/systrace_root.txt" 2>/dev/null || echo /tmp/systrace)
 RANKDIR=$(cat "$RESULTS/analysis/rank_dir.txt" 2>/dev/null || true)
+
+SRC="$RESULTS/profile_src"
+bash "$(dirname "${BASH_SOURCE[0]}")/profile_sources.sh" "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" "$SRC"
+SRCFLAGS=(--framework-source-root "$SRC/framework" --nki-source-root "$SRC/nki")
 
 "$PROF" view > /tmp/explorer.log 2>&1 &
 sleep 20
@@ -26,6 +32,10 @@ ingest() {  # <display-name> <timeout> <view args...>
   else
     echo "explorer ingest FAILED: $name ($(tail -1 "/tmp/ingest_$name.log"))"; return 1
   fi
+}
+ingest_src() {  # same, with source roots; retried without them if this CLI rejects the flags
+  local name="$1" t="$2"; shift 2
+  ingest "$name" "$t" "$@" "${SRCFLAGS[@]}" || { echo "  retrying $name without source roots"; ingest "$name" "$t" "$@"; }
 }
 
 if [ -d "$SYSTRACE" ]; then
@@ -40,10 +50,11 @@ for d in "$RESULTS"/pairs/rank*/; do
   [ -d "$d" ] || continue
   neff=$(ls "$d"*.neff 2>/dev/null | head -1); ntff=$(ls "$d"*.ntff 2>/dev/null | head -1)
   [ -n "$neff" ] && [ -n "$ntff" ] || continue
-  ingest "dev_$(basename "$d")" 1800 -n "$neff" -s "$ntff"
+  ingest_src "dev_$(basename "$d")" 1800 -n "$neff" -s "$ntff"
 done
 
 if [ -n "$RANKDIR" ] && [ -n "$(find "$RANKDIR" -name '*.ntff' | head -1)" ]; then
-  ingest 02_SYSTEM_DEVICE_rank0_session "${SESSION_INGEST_TIMEOUT:-7200}" -d "$RANKDIR"
+  ingest_src 02_SYSTEM_DEVICE_rank0_session "${SESSION_INGEST_TIMEOUT:-7200}" -d "$RANKDIR"
 fi
+echo "SOURCE TREE for the web UI 'Source Code' upload: kubectl cp $(hostname):$SRC.tar.gz ./profile_src.tar.gz"
 echo "EXPLORER READY: kubectl port-forward $(hostname) 3001:3001 3002:3002  -> http://localhost:3001"

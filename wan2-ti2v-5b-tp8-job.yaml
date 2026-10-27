@@ -165,6 +165,13 @@ spec:
               value: "--model-type=transformer"
             - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
               value: "0"
+            # Source locations in the NEFFs for the Neuron Explorer Code Editor (set before compile)
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: NKI_DEBUG_INFO
+              value: "True"
             - name: TP_DEGREE
               value: "8"
             - name: SP_DEGREE
