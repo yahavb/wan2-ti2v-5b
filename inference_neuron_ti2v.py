@@ -51,6 +51,9 @@ VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 # (models/vae_tiled.py); rank 0 blends. VAE_TILE_OVERLAP is in latent units.
 VAE_TILED = os.environ.get("VAE_TILED", "0") == "1"
 VAE_TILE_OVERLAP = int(os.environ.get("VAE_TILE_OVERLAP", "8"))
+# VAE_STREAM=1 (with VAE_TILED): ship each decoded latent-frame chunk to rank 0 right away so the
+# blend and the mp4 encode run while the tiles are still decoding. Same frames as VAE_STREAM=0.
+VAE_STREAM = os.environ.get("VAE_STREAM", "0") == "1"
 # x264 settings for the output mp4. imageio's default is preset medium, crf 25 (~1.1s for
 # 81 frames at 704x544); veryfast + crf 20 is ~8x faster at about the same PSNR.
 MP4_PRESET = os.environ.get("MP4_PRESET", "veryfast")
@@ -541,6 +544,22 @@ def main():
                 frames = [video_np[i].numpy() for i in range(video_np.shape[0])]
                 imageio.mimwrite(output_path, frames, fps=24, codec='libx264', **MP4_KW)
                 logger.info(f"Video saved to {output_path} ({len(frames)} frames)")
+        elif VAE_TILED and VAE_STREAM:
+            # Streaming tiled decode: rank 0 blends and encodes each latent-frame chunk while
+            # the ranks are still decoding the rest (models/vae_tiled.decode_tiled_stream).
+            from models.vae_tiled import decode_tiled_stream
+            import imageio
+            output_path = "/tmp/wan2_ti2v_output.mp4"
+
+            def _to_frames(acc):  # same truncation as the non-streaming branch below
+                return crop_video(acc).add_(1).mul_(127.5).to(torch.uint8).permute(1, 2, 3, 0).contiguous().numpy()
+
+            video_np = decode_tiled_stream(
+                vae, latent.to(torch.bfloat16), cpu_group, VAE_TILE_OVERLAP,
+                lambda: imageio.get_writer(output_path, fps=24, codec='libx264', **MP4_KW), _to_frames)
+            if rank == 0:
+                dump_video = video_np
+                logger.info(f"Video saved to {output_path} ({len(video_np)} frames, streamed)")
         elif VAE_TILED:
             # Tiled decode across all ranks; rank 0 receives the blended video
             from models.vae_tiled import decode_tiled, tile_grid

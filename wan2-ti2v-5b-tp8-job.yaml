@@ -212,6 +212,8 @@ spec:
               value: "interleave"
             - name: VAE_FUSE_NORM
               value: "1"
+            - name: VAE_STREAM
+              value: "1"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
             - name: CONST_MAX_LAYERS

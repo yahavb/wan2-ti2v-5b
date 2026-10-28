@@ -21,13 +21,17 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + Megatron sequence parallelism (AG/RS around the TP matmuls) | 0.68 | 6.8s | 4.4s | 11.1s | 0.0477 |
 | + cross-attention local to the token shard (all heads, no collectives) | 0.64 | 6.4s | 4.4s | 10.8s | 0.0484 |
 | + VAE: RMS_norm + SiLU as one compiled graph (`VAE_FUSE_NORM=1`) | 0.64 | 6.4s | 3.5s | 10.0s | 0.0487* |
-| + CFG groups on alternating cores (`CFG_GROUPS=interleave`) | **0.62** | **6.2s** | **3.5s** | **9.6s** | 0.0487* |
+| + CFG groups on alternating cores (`CFG_GROUPS=interleave`) | 0.62 | 6.2s | 3.5s | 9.6s | 0.0487* |
+| + streamed VAE output: blend + mp4 encode per latent frame during the decode (`VAE_STREAM=1`) | **0.62** | **6.2s** | **3.0s** | **9.2s** | 0.0487* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
-FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1`.
+FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1`.
 \* The fused norm also runs in the VAE encoder, so the conditioning latent (and the step-0 input)
 changes slightly; these rows are scored against an fp32 reference computed on their own input.
-`CFG_GROUPS=interleave` gives bit-identical output to the contiguous layout.
+`CFG_GROUPS=interleave` gives bit-identical output to the contiguous layout. `VAE_STREAM=1` writes a
+byte-identical mp4: the decode, blend and uint8 conversion do the same per-element math, only
+chunk by chunk; what it removes is the 0.53 s that ran after the decode (collect+sum 0.16 s,
+convert 0.03 s, mp4 write 0.34 s), leaving a 0.07-0.12 s tail.
 
 VAE accuracy, same final latent, against an exact fp32 CPU decode without tiling
 (`scripts/validate/vae_cpu_ref.py`): tiled bf16 decode (overlap 4) 44.67 dB, with

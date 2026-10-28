@@ -1097,6 +1097,25 @@ class WanVAE_(nn.Module):
         self.clear_cache()
         return out
 
+    def decode_chunks(self, z, scale):
+        """Eager decode() that yields each latent frame's output as soon as it is decoded
+        ([1, 3, f, H, W]; f = 1 for the first chunk, 4 after). Same ops as decode(), so the
+        concatenated chunks equal decode()'s output."""
+        self.clear_cache()
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+        z = z.to(self.conv2.weight.dtype)
+        x = self.conv2(z)
+        for i in range(z.shape[2]):
+            self._conv_idx = [0]
+            out_ = self.decoder(x[:, :, i:i + 1, :, :], feat_cache=self._feat_map,
+                                feat_idx=self._conv_idx, first_chunk=(i == 0))
+            yield unpatchify(out_, patch_size=2)
+        self.clear_cache()
+
     def _decode_compiled(self, z):
         """VAE_COMPILE path: static-cache decoder, compiled once (2 graphs)."""
         from models.vae_static import StaticCacheDecoder, decode_static
@@ -1318,6 +1337,12 @@ class Wan2_2_VAE:
         except TypeError as e:
             logging.info(e)
             return None
+
+    def decode_chunks(self, z):
+        """Streaming decode of one latent [C, T, H, W]: yields [3, f, H*16, W*16] float32
+        clamped chunks (the same values decode([z])[0] has for those frames)."""
+        for out in self.model.decode_chunks(z.unsqueeze(0), self.scale):
+            yield out.float().clamp_(-1, 1).squeeze(0)
 
     def decode(self, zs):
         try:

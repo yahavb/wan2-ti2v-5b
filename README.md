@@ -6,13 +6,14 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **9.6s** total
-(denoise 6.2s = 0.62 s/step, VAE 3.5s), down from 16.2s on `main` with the same image and SDK —
-**1.76x faster than A100** (16.92s), 1.2x slower than H100 (8.02s). DiT changes: nkilib
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **9.2s** total
+(denoise 6.2s = 0.62 s/step, VAE 3.0s), down from 16.2s on `main` with the same image and SDK —
+**1.84x faster than A100** (16.92s), 1.15x slower than H100 (8.02s). DiT changes: nkilib
 `attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
 cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard.
-VAE: RMS_norm + SiLU compiled as one graph. Step-0 noise prediction vs an fp32 CPU reference:
-rel-RMS 0.0487 (`main` const-max: 0.0474, exact SDPA: 0.0485). See RESULTS.md.
+VAE: RMS_norm + SiLU compiled as one graph; tile blend and mp4 encode streamed during the decode.
+Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0487 (`main` const-max: 0.0474,
+exact SDPA: 0.0485). See RESULTS.md.
 
 **Versus GPUs** (`main`, 5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
 
@@ -168,6 +169,7 @@ FastAPI server on port 8000:
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
 | `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile |
 | `VAE_TILED`, `VAE_TILE_OVERLAP` | 0, 8 (job: 4) | Decode overlapping spatial tiles on all ranks, blend on rank 0 (`models/vae_tiled.py`); overlap in latent units |
+| `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
 | `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |
