@@ -173,6 +173,7 @@ FastAPI server on port 8000:
 | `NKI_CONV3D_SMALL_COUT` | 0 | 1 = the nkilib conv3d gate also takes convs with C_out < 96 (the VAE decoder head, 256 -> 12); rel-RMS 2.3e-5 vs eager |
 | `VAE_SUBPIXEL` | 0 | 1 (with `USE_NKI_CONV3D=1`) = each upsample conv (nearest-2x + 3x3) runs as four 2x2 nkilib convs on the low-res frames, one per output phase, plus one interleave copy (2.25x fewer MACs; 44.68 vs 44.69 dB against the exact fp32 decode) |
 | `VAE_FUSE_CAT` | 0 | 1 (with `VAE_FUSE_NORM=1`) = the compiled RMS_norm + SiLU in front of each nkilib causal conv also writes the 2 cached frames in front and returns the next cache, replacing the eager concat, clone and time pad (bit-identical) |
+| `VAE_FUSE_RES` | 0 | 1 (with `VAE_FUSE_CAT=1`) = each ResidualBlock's last conv adds the shortcut inside the nkilib kernel (`residual_add_loc`, installed nkilib) instead of a separate eager add |
 | `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |

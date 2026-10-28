@@ -26,6 +26,10 @@ _VAE_SUBPIXEL = os.environ.get("VAE_SUBPIXEL", "0") == "1"
 # the next chunk's cache, replacing the eager torch.cat (a full copy of the conv input), the
 # cache .clone() and the time pad. Same values.
 _VAE_FUSE_CAT = os.environ.get("VAE_FUSE_CAT", "0") == "1"
+# VAE_FUSE_RES=1 (with VAE_FUSE_CAT=1): each ResidualBlock's last conv adds the shortcut inside the
+# nkilib kernel (residual_add_loc) instead of a separate full-size eager add. One bf16 rounding of
+# conv + shortcut instead of two.
+_VAE_FUSE_RES = os.environ.get("VAE_FUSE_RES", "0") == "1"
 # VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
 # splitting the decoder into fragments.
 _VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
@@ -181,29 +185,34 @@ class CausalConv3d(nn.Conv3d):
 
         return super().forward(x)
 
-    def forward_time_padded(self, z):
+    def forward_time_padded(self, z, residual=None):
         """forward() for an input that already carries the 2 causal frames in front
-        (VAE_FUSE_CAT); same kernel choice and result."""
+        (VAE_FUSE_CAT); same kernel choice and result. residual (VAE_FUSE_RES) is added to the
+        output, inside the kernel on the nkilib path."""
         if self._nki_filters is not None or (
                 _nki_conv3d is not None and z.shape[2] - 2 >= _nki_conv3d.MIN_D_OUT
                 and _nki_conv3d.eligible(self)):
-            return self._nki_forward(z, [0, 0, 0, 0, 0, 0])
+            return self._nki_forward(z, [0, 0, 0, 0, 0, 0], residual)
         p = self._padding
-        return super().forward(F.pad(z, (p[0], p[1], p[2], p[3], 0, 0)))
+        out = super().forward(F.pad(z, (p[0], p[1], p[2], p[3], 0, 0)))
+        return out if residual is None else out + residual
 
-    def _nki_forward(self, x, padding):
+    def _nki_forward(self, x, padding, residual=None):
         if padding[4] > 0:  # fewer than 2 cached frames: zero-pad time, kernel pads H/W
             x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
         if self._nki_filters is None:
             self._nki_filters = _nki_conv3d.pack_filters(self.weight)
             if not _NKI_CONV3D_CHECK:  # drop the unpacked copy (~0.5 GB per rank in total)
                 self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
-        out = _nki_conv3d.conv3d_3x3x3(x.to(self._nki_filters.dtype), self._nki_filters, self.bias)
+        out = _nki_conv3d.conv3d_3x3x3(x.to(self._nki_filters.dtype), self._nki_filters, self.bias,
+                                       residual)
         if _NKI_CONV3D_CHECK:
-            key = (tuple(x.shape), self.out_channels)
+            key = (tuple(x.shape), self.out_channels, residual is not None)
             if key not in _nki_conv3d_checked:
                 _nki_conv3d_checked.add(key)
                 ref = super().forward(F.pad(x, (1, 1, 1, 1, 0, 0)))
+                if residual is not None:
+                    ref = ref + residual
                 err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
                 logging.warning(f"[nki_conv3d] x={list(x.shape)} C_out={self.out_channels} "
                                 f"rel_err={err.item():.4f} shape_ok={out.shape == ref.shape}")
@@ -253,10 +262,11 @@ def _fused_cat_conv(layers, i):
     return None, None
 
 
-def _norm_cat_conv(x, gamma, conv, feat_cache, idx):
+def _norm_cat_conv(x, gamma, conv, feat_cache, idx, residual=None):
     """RMS_norm + SiLU + causal conv with the cache concat done inside the compiled norm graph.
     Same values as the eager path: the conv sees [2 cached (or zero) frames, normed x] and the
-    cache keeps the last 2 frames of that (a zero frame stands in for a missing one)."""
+    cache keeps the last 2 frames of that (a zero frame stands in for a missing one).
+    residual: added to the conv output (inside the nkilib kernel)."""
     prev = feat_cache[idx]
     if prev is None:
         z, cache = _rms_silu_pad(x, gamma)
@@ -265,7 +275,7 @@ def _norm_cat_conv(x, gamma, conv, feat_cache, idx):
             prev = F.pad(prev, (0, 0, 0, 0, CACHE_T - prev.shape[2], 0))
         z, cache = _rms_silu_cat(x, gamma, prev)
     feat_cache[idx] = cache
-    return conv.forward_time_padded(z)
+    return conv.forward_time_padded(z, residual)
 
 
 def _norm_silu_fusable(layers, i):
@@ -504,9 +514,14 @@ class ResidualBlock(nn.Module):
             if _norm_silu_fusable(layers, i):
                 conv, j = _fused_cat_conv(layers, i) if feat_cache is not None else (None, None)
                 if conv is not None:
-                    x = _norm_cat_conv(x, layer.gamma, conv, feat_cache, feat_idx[0])
+                    # VAE_FUSE_RES: the block's last conv adds the shortcut inside the kernel
+                    res = h if (_VAE_FUSE_RES and _nki_conv3d.HAS_RESIDUAL
+                                and j == len(layers) - 1) else None
+                    x = _norm_cat_conv(x, layer.gamma, conv, feat_cache, feat_idx[0], res)
                     feat_idx[0] += 1
                     skip_to = j
+                    if res is not None:
+                        return x
                 else:
                     x = _rms_silu(x, layer.gamma)
                     skip_to = i + 1

@@ -16,6 +16,10 @@ try:
     from nkilib.experimental.conv.conv3d import conv3d
 except ImportError:
     from kernels.nkilib_vendor.experimental.conv.conv3d import conv3d
+try:  # fused residual add (installed nkilib; the vendored copy predates it)
+    from nkilib.experimental.conv.conv3d import ResidualAddLoc
+except ImportError:
+    ResidualAddLoc = None
 from torch_neuronx.nki_hop import wrap_nki
 
 PADDING = (0, 0, 1, 1, 1, 1)
@@ -32,6 +36,16 @@ def _conv3d_3x3x3_kernel(x, filters, bias):
 
 
 _conv3d_3x3x3 = wrap_nki(_conv3d_3x3x3_kernel)
+HAS_RESIDUAL = ResidualAddLoc is not None
+
+
+@nki.jit
+def _conv3d_3x3x3_res_kernel(x, filters, bias, residual):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=PADDING, dilation=(1, 1, 1),
+                  residual_add_loc=ResidualAddLoc.POST_ACT, residuals_in=residual)
+
+
+_conv3d_3x3x3_res = wrap_nki(_conv3d_3x3x3_res_kernel) if HAS_RESIDUAL else None
 
 
 def eligible(conv):
@@ -102,6 +116,9 @@ def pack_filters(weight):
     return weight.detach().cpu().permute(2, 3, 4, 1, 0).contiguous().to(weight.device)
 
 
-def conv3d_3x3x3(x, filters, bias):
-    """x: [B, C_in, D, H, W] with the causal time padding already applied."""
+def conv3d_3x3x3(x, filters, bias, residual=None):
+    """x: [B, C_in, D, H, W] with the causal time padding already applied. residual (optional,
+    [B, C_out, D - 2, H, W], same dtype): added to the output inside the kernel."""
+    if residual is not None:
+        return _conv3d_3x3x3_res(x.contiguous(), filters, bias, residual.to(x.dtype).contiguous())
     return _conv3d_3x3x3(x.contiguous(), filters, bias)

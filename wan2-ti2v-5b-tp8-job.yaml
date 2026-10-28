@@ -220,6 +220,8 @@ spec:
               value: "1"
             - name: VAE_FUSE_CAT
               value: "1"
+            - name: VAE_FUSE_RES
+              value: "1"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
             - name: CONST_MAX_LAYERS
