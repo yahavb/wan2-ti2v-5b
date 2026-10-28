@@ -214,6 +214,12 @@ spec:
               value: "1"
             - name: VAE_STREAM
               value: "1"
+            - name: NKI_CONV3D_SMALL_COUT
+              value: "1"
+            - name: VAE_SUBPIXEL
+              value: "1"
+            - name: VAE_FUSE_CAT
+              value: "1"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
             - name: CONST_MAX_LAYERS

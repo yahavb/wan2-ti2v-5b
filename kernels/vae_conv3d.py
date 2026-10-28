@@ -7,6 +7,8 @@ traced config covers every site. Filters are packed once to [K_d, K_h, K_w, C_in
 Gates (from staging's full-model A/B): C_in and C_out >= 96 and D_out >= 2. Below these the
 compiler/eager conv wins; D_out=1 regressed vae_decode by 25% there.
 """
+import os
+
 import nki
 import torch
 
@@ -19,6 +21,9 @@ from torch_neuronx.nki_hop import wrap_nki
 PADDING = (0, 0, 1, 1, 1, 1)
 MIN_CHANNELS = 96
 MIN_D_OUT = 2
+# NKI_CONV3D_SMALL_COUT=1: also take convs with a small C_out (C_in still >= MIN_CHANNELS) -- in
+# the decoder that is only the head conv, 256 -> 12 at full tile resolution.
+SMALL_COUT = os.environ.get("NKI_CONV3D_SMALL_COUT", "0") == "1"
 
 
 @nki.jit
@@ -34,7 +39,61 @@ def eligible(conv):
     return (tuple(conv.kernel_size) == (3, 3, 3) and tuple(conv.stride) == (1, 1, 1)
             and tuple(conv.dilation) == (1, 1, 1) and conv.groups == 1 and conv.bias is not None
             and conv._padding[0] == 1 and conv._padding[2] == 1
-            and conv.in_channels >= MIN_CHANNELS and conv.out_channels >= MIN_CHANNELS)
+            and conv.in_channels >= MIN_CHANNELS
+            and (conv.out_channels >= MIN_CHANNELS or SMALL_COUT))
+
+
+# Sub-pixel form of nearest-2x upsample + 3x3/pad-1 conv: output phase (py, px), i.e. pixels
+# (2i + py, 2j + px), is a 2x2 conv on the low-res input with H padding (top, bottom) = (1, 0)
+# for py = 0 and (0, 1) for py = 1 (W likewise for px), using the 3x3 taps summed per phase.
+@nki.jit
+def _phase00_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 1, 0, 1, 0), dilation=(1, 1, 1))
+
+
+@nki.jit
+def _phase01_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 1, 0, 0, 1), dilation=(1, 1, 1))
+
+
+@nki.jit
+def _phase10_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 0, 1, 1, 0), dilation=(1, 1, 1))
+
+
+@nki.jit
+def _phase11_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 0, 1, 0, 1), dilation=(1, 1, 1))
+
+
+_PHASES = [wrap_nki(k) for k in (_phase00_kernel, _phase01_kernel, _phase10_kernel, _phase11_kernel)]
+# rows of the 3 taps folded into each of the 2 taps of a phase (index [phase][tap2][tap3])
+_FOLD = ([[1.0, 0.0, 0.0], [0.0, 1.0, 1.0]], [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def pack_phase_filters(weight):
+    """3x3 Conv2d weight [C_out, C_in, 3, 3] -> 4 packed 2x2 phase filters [1, 2, 2, C_in, C_out]
+    (phase index 2*py + px). Taps are summed in fp32 and rounded to the weight dtype once."""
+    w3 = weight.detach().cpu().float()
+    out = []
+    for py in (0, 1):
+        for px in (0, 1):
+            ry, rx = torch.tensor(_FOLD[py]), torch.tensor(_FOLD[px])
+            w2 = torch.einsum("ak,oikl,bl->oiab", ry, w3, rx).to(weight.dtype)
+            out.append(w2.unsqueeze(2).permute(2, 3, 4, 1, 0).contiguous().to(weight.device))
+    return out
+
+
+def upsample_conv_subpixel(x, phase_filters, bias):
+    """x [B, C_in, T, h, w] -> nearest-2x + 3x3 conv output [B, C_out, T, 2h, 2w]: one 2x2 conv
+    per phase on the low-res frames (2.25x fewer MACs, no 4x upsampled input), then one
+    interleave copy."""
+    B, _, T, h, w = x.shape
+    x = x.to(phase_filters[0].dtype).contiguous()
+    ys = [_PHASES[p](x, phase_filters[p], bias) for p in range(4)]  # 4 x [B, C_out, T, h, w]
+    c_out = ys[0].shape[1]
+    y = torch.stack(ys, dim=2).view(B, c_out, 2, 2, T, h, w)       # [B, C, py, px, T, h, w]
+    return y.permute(0, 1, 4, 5, 2, 6, 3).reshape(B, c_out, T, 2 * h, 2 * w)
 
 
 def pack_filters(weight):

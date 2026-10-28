@@ -6,12 +6,13 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **9.2s** total
-(denoise 6.2s = 0.62 s/step, VAE 3.0s), down from 16.2s on `main` with the same image and SDK —
-**1.84x faster than A100** (16.92s), 1.15x slower than H100 (8.02s). DiT changes: nkilib
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **8.8s** total
+(denoise 6.1s = 0.61 s/step, VAE 2.7s), down from 16.2s on `main` with the same image and SDK —
+**1.92x faster than A100** (16.92s), 1.10x slower than H100 (8.02s). DiT changes: nkilib
 `attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
 cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard.
-VAE: RMS_norm + SiLU compiled as one graph; tile blend and mp4 encode streamed during the decode.
+VAE: RMS_norm + SiLU compiled as one graph together with the causal-cache concat; head conv on
+nkilib; upsample convs in sub-pixel form; tile blend and mp4 encode streamed during the decode.
 Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0487 (`main` const-max: 0.0474,
 exact SDPA: 0.0485). See RESULTS.md.
 
@@ -169,6 +170,9 @@ FastAPI server on port 8000:
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
 | `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile |
 | `VAE_TILED`, `VAE_TILE_OVERLAP` | 0, 8 (job: 4) | Decode overlapping spatial tiles on all ranks, blend on rank 0 (`models/vae_tiled.py`); overlap in latent units |
+| `NKI_CONV3D_SMALL_COUT` | 0 | 1 = the nkilib conv3d gate also takes convs with C_out < 96 (the VAE decoder head, 256 -> 12); rel-RMS 2.3e-5 vs eager |
+| `VAE_SUBPIXEL` | 0 | 1 (with `USE_NKI_CONV3D=1`) = each upsample conv (nearest-2x + 3x3) runs as four 2x2 nkilib convs on the low-res frames, one per output phase, plus one interleave copy (2.25x fewer MACs; 44.68 vs 44.69 dB against the exact fp32 decode) |
+| `VAE_FUSE_CAT` | 0 | 1 (with `VAE_FUSE_NORM=1`) = the compiled RMS_norm + SiLU in front of each nkilib causal conv also writes the 2 cached frames in front and returns the next cache, replacing the eager concat, clone and time pad (bit-identical) |
 | `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |

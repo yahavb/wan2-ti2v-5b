@@ -17,6 +17,15 @@ _VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
 # VAE_FUSE_NORM=1: each RMS_norm + SiLU pair runs as one torch.compile'd graph (1 kernel instead
 # of ~9 eager ones, one HBM read + write instead of several fp32 passes).
 _VAE_FUSE_NORM = os.environ.get("VAE_FUSE_NORM", "0") == "1"
+# VAE_SUBPIXEL=1 (with USE_NKI_CONV3D=1): each upsample conv (nearest-2x + 3x3) runs as four 2x2
+# convs on the low-res frames, one per output phase, plus one interleave copy: 2.25x fewer MACs
+# and no 4x upsampled input. Differs from the original by the bf16 rounding of the summed taps.
+_VAE_SUBPIXEL = os.environ.get("VAE_SUBPIXEL", "0") == "1"
+# VAE_FUSE_CAT=1 (with VAE_FUSE_NORM=1, USE_NKI_CONV3D=1): the compiled RMS_norm + SiLU in front of
+# each nkilib-eligible causal conv also writes its output behind the 2 cached frames and returns
+# the next chunk's cache, replacing the eager torch.cat (a full copy of the conv input), the
+# cache .clone() and the time pad. Same values.
+_VAE_FUSE_CAT = os.environ.get("VAE_FUSE_CAT", "0") == "1"
 # VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
 # splitting the decoder into fragments.
 _VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
@@ -172,6 +181,16 @@ class CausalConv3d(nn.Conv3d):
 
         return super().forward(x)
 
+    def forward_time_padded(self, z):
+        """forward() for an input that already carries the 2 causal frames in front
+        (VAE_FUSE_CAT); same kernel choice and result."""
+        if self._nki_filters is not None or (
+                _nki_conv3d is not None and z.shape[2] - 2 >= _nki_conv3d.MIN_D_OUT
+                and _nki_conv3d.eligible(self)):
+            return self._nki_forward(z, [0, 0, 0, 0, 0, 0])
+        p = self._padding
+        return super().forward(F.pad(z, (p[0], p[1], p[2], p[3], 0, 0)))
+
     def _nki_forward(self, x, padding):
         if padding[4] > 0:  # fewer than 2 cached frames: zero-pad time, kernel pads H/W
             x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
@@ -197,10 +216,56 @@ def _rms_silu_impl(x, gamma):
     return F.silu((x * rms).to(gamma.dtype) * gamma)
 
 
+def _rms_silu_cat_impl(x, gamma, prev):
+    """_rms_silu written behind the 2 cached frames prev: (conv input [b, C, 2 + T, H, W],
+    the next chunk's 2-frame cache)."""
+    z = torch.cat([prev, _rms_silu_impl(x, gamma)], dim=2)
+    return z, z[:, :, -CACHE_T:].clone()
+
+
+def _rms_silu_pad_impl(x, gamma):
+    """First chunk: _rms_silu behind 2 zero frames (the causal padding)."""
+    z = F.pad(_rms_silu_impl(x, gamma), (0, 0, 0, 0, CACHE_T, 0))
+    return z, z[:, :, -CACHE_T:].clone()
+
+
 _rms_silu = None
+_rms_silu_cat = None
+_rms_silu_pad = None
 if _VAE_FUSE_NORM:
     torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
     _rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
+    if _VAE_FUSE_CAT:
+        _rms_silu_cat = torch.compile(_rms_silu_cat_impl, backend="neuron", dynamic=False)
+        _rms_silu_pad = torch.compile(_rms_silu_pad_impl, backend="neuron", dynamic=False)
+
+
+def _fused_cat_conv(layers, i):
+    """VAE_FUSE_CAT: (conv, index) of the nkilib-eligible CausalConv3d fed by the fusable
+    RMS_norm + SiLU at layers[i] (an eval-mode Dropout in between is skipped), else (None, None)."""
+    if _rms_silu_cat is None or _nki_conv3d is None:
+        return None, None
+    j = i + 2
+    if j < len(layers) and isinstance(layers[j], nn.Dropout) and not layers[j].training:
+        j += 1
+    if j < len(layers) and isinstance(layers[j], CausalConv3d) and _nki_conv3d.eligible(layers[j]):
+        return layers[j], j
+    return None, None
+
+
+def _norm_cat_conv(x, gamma, conv, feat_cache, idx):
+    """RMS_norm + SiLU + causal conv with the cache concat done inside the compiled norm graph.
+    Same values as the eager path: the conv sees [2 cached (or zero) frames, normed x] and the
+    cache keeps the last 2 frames of that (a zero frame stands in for a missing one)."""
+    prev = feat_cache[idx]
+    if prev is None:
+        z, cache = _rms_silu_pad(x, gamma)
+    else:
+        if prev.shape[2] < CACHE_T:
+            prev = F.pad(prev, (0, 0, 0, 0, CACHE_T - prev.shape[2], 0))
+        z, cache = _rms_silu_cat(x, gamma, prev)
+    feat_cache[idx] = cache
+    return conv.forward_time_padded(z)
 
 
 def _norm_silu_fusable(layers, i):
@@ -345,6 +410,9 @@ class Resample(nn.Module):
                     x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),
                                     3)
                     x = x.reshape(b, c, t * 2, h, w)
+        if (_VAE_SUBPIXEL and self.mode in ("upsample2d", "upsample3d") and _nki_conv3d is not None
+                and _is_neuron_tensor(x) and self.dim >= _nki_conv3d.MIN_CHANNELS):
+            return self._subpixel(x)
         t = x.shape[2]
         x = rearrange(x, "b c t h w -> (b t) c h w")
         x = self.resample(x)
@@ -363,6 +431,25 @@ class Resample(nn.Module):
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
         return x
+
+    def _subpixel(self, x):
+        """VAE_SUBPIXEL: nearest-2x + 3x3 conv on [b, c, t, h, w] as 4 phase 2x2 convs on the
+        low-res frames (kernels/vae_conv3d.upsample_conv_subpixel); no (b t) rearranges."""
+        conv = self.resample[1]
+        if getattr(self, "_phase_filters", None) is None:
+            self._phase_filters = _nki_conv3d.pack_phase_filters(conv.weight)
+            if not _NKI_CONV3D_CHECK:
+                conv.weight = nn.Parameter(conv.weight.new_empty(0), requires_grad=False)
+        out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias)
+        if _NKI_CONV3D_CHECK and (tuple(x.shape), "subpix") not in _nki_conv3d_checked:
+            _nki_conv3d_checked.add((tuple(x.shape), "subpix"))
+            t = x.shape[2]
+            ref = F.conv2d(self.resample[0](rearrange(x, "b c t h w -> (b t) c h w")),
+                           conv.weight, conv.bias, padding=1)
+            ref = rearrange(ref, "(b t) c h w -> b c t h w", t=t)
+            err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
+            logging.warning(f"[subpixel] x={list(x.shape)} rel_err={err.item():.4f}")
+        return out
 
     def init_weight(self, conv):
         conv_weight = conv.weight.detach().clone()
@@ -410,14 +497,19 @@ class ResidualBlock(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
         layers = list(self.residual)
-        skip = False
+        skip_to = -1
         for i, layer in enumerate(layers):
-            if skip:  # the SiLU already applied by the fused norm
-                skip = False
+            if i <= skip_to:  # already applied by a fused norm (SiLU, and with VAE_FUSE_CAT the conv)
                 continue
             if _norm_silu_fusable(layers, i):
-                x = _rms_silu(x, layer.gamma)
-                skip = True
+                conv, j = _fused_cat_conv(layers, i) if feat_cache is not None else (None, None)
+                if conv is not None:
+                    x = _norm_cat_conv(x, layer.gamma, conv, feat_cache, feat_idx[0])
+                    feat_idx[0] += 1
+                    skip_to = j
+                else:
+                    x = _rms_silu(x, layer.gamma)
+                    skip_to = i + 1
                 continue
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
@@ -949,14 +1041,19 @@ class Decoder3d(nn.Module):
 
         ## head
         head_layers = list(self.head)
-        skip = False
+        skip_to = -1
         for i, layer in enumerate(head_layers):
-            if skip:  # SiLU already applied by the fused norm
-                skip = False
+            if i <= skip_to:  # already applied by the fused norm
                 continue
             if _norm_silu_fusable(head_layers, i):
-                x = _rms_silu(x, layer.gamma)
-                skip = True
+                conv, j = _fused_cat_conv(head_layers, i) if feat_cache is not None else (None, None)
+                if conv is not None:
+                    x = _norm_cat_conv(x, layer.gamma, conv, feat_cache, feat_idx[0])
+                    feat_idx[0] += 1
+                    skip_to = j
+                else:
+                    x = _rms_silu(x, layer.gamma)
+                    skip_to = i + 1
                 continue
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
