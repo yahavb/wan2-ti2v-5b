@@ -30,6 +30,8 @@ def main():
     vae = Wan2_2_VAE(vae_pth=os.path.join(MODEL_PATH, "Wan2.2_VAE.pth"), device=torch.device("cpu"))
     vae.model = vae.model.to(device=dev, dtype=torch.bfloat16)
     vae.scale = [s.to(device=dev, dtype=torch.bfloat16) for s in vae.scale]
+    if os.environ.get("VAE_PREPACK", "1") == "1":  # as the pipeline does
+        print(f"[vae_bench] pre-packed {vae.prepack_nki_filters()} decoder convs", flush=True)
     dec = vae.model.decoder
     acc = defaultdict(float)
     counts = defaultdict(int)
@@ -70,6 +72,8 @@ def main():
         tot = time.perf_counter() - t0
         tag = "warmup/compile" if rep == 0 else f"timed rep {rep}"
         print(f"[vae_bench] {tag}: decode {tot:.3f}s out {tuple(out.shape)}", flush=True)
+        if rep == 0:
+            out_first = out.float().cpu()  # the first (compiling) decode, checked against the last
         if rep > 0:
             s = sum(acc.values())
             for k, v in acc.items():
@@ -83,6 +87,18 @@ def main():
         t_host = time.perf_counter() - t0  # host-side enqueue time (device runs async)
         sync()
         print(f"[vae_bench] untimed decode {time.perf_counter() - t0:.3f}s (host enqueue {t_host:.3f}s)", flush=True)
+    from wan.modules.vae2_2 import CausalConv3d
+    packed = sum(1 for m in dec.modules() if isinstance(m, CausalConv3d) and m._nki_filters is not None)
+    print(f"[vae_bench] decoder convs on the nkilib kernel after the decodes: {packed}", flush=True)
+    o = out.float().cpu()
+    d = (o - out_first).abs()
+    print(f"[vae_bench] last vs first decode: equal={torch.equal(o, out_first)} max_abs {d.max().item():.5f} "
+          f"rel_rms {((o - out_first).pow(2).mean().sqrt() / out_first.pow(2).mean().sqrt()).item():.6f}",
+          flush=True)
+    if not torch.equal(o, out_first):
+        per_t = d.amax(dim=(0, 2, 3))  # [C, T, H, W] -> per output frame
+        print(f"[vae_bench] frames differing: {int((per_t > 0).sum())}/{per_t.numel()}, max per frame "
+              f"{[round(x, 4) for x in per_t.tolist()[:12]]} ...", flush=True)
     ref = os.environ.get("VAE_REF_OUT")
     if ref:  # compare against a saved output of another configuration (exactness check)
         o = out.float().cpu()

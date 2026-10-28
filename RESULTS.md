@@ -26,13 +26,27 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + VAE head conv (256->12) on nkilib (`NKI_CONV3D_SMALL_COUT=1`), sub-pixel upsample convs (`VAE_SUBPIXEL=1`) | 0.61 | 6.1s | 2.8s | 8.9s | 0.0487* |
 | + norm and causal-cache concat in one compiled graph (`VAE_FUSE_CAT=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
 | + ResidualBlock shortcut added inside the nkilib conv (`VAE_FUSE_RES=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
-| + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | **0.60** | **6.0s** | **2.6s** | **8.7s** | 0.0487* |
+| + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
+| + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | **0.60** | **6.0s** | **2.6s** | **8.7s** | 0.0487* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
-VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
+VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
+`VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
+the add as one graph and drops a clone of the stage input that nothing writes to. One 15x21 tile
+on one core 2.298 -> 2.238 s; in the pipeline, 8 warm runs each with the two devices swapped,
+VAE 2.659 -> 2.610 s and total 8.702 -> 8.657 s (both round to 8.7).
+Run 2 is warm. The nkilib conv filters are now packed when the model loads
+(`Decoder3d.prepack_nki_filters`). Before, each conv after the first temporal upsample packed them
+on its first call with 2+ output frames, in chunk 1 of the first decode. Chunk 0 of that decode
+(1 frame) therefore ran the eager conv plus a separate residual add, and run 2 was the first to
+trace the kernel at the 1-frame shapes: its VAE took 11-20 s instead of 2.6 s, which is what
+`NUM_RUNS=2` reported. Run 1's frames also differed from every later run's by one bf16 rounding in
+chunk 0 under `VAE_FUSE_RES` (rel-RMS 1.7e-3). Now run 2's VAE takes 2.5-2.6 s, every run writes
+the same mp4, and the steady-state output is unchanged (bit-identical decode with the loop flags on
+and off).
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

@@ -73,6 +73,11 @@ NEURON_DEVICE = torch.device("neuron")
 # DUMP_DIR: rank 0 saves the last run's final latent (latent.pt) and uint8 frames (frames.npy)
 # there, for comparing configurations numerically. Not timed (outside the convert timer).
 DUMP_DIR = os.environ.get("DUMP_DIR", "")
+# RUN_HASH=1 (determinism probe): after each run's timers, every rank logs an md5 of its final latent
+# and rank 0 of the mp4; after the last run, md5s of the encoder outputs, every block's cross-attn
+# K/V and per-parameter weight sums. All copies run outside the timed region.
+# RUN_HASH_KEEP=<prefix>: also keep each run's mp4 as <prefix>_run<i>.mp4.
+RUN_HASH = os.environ.get("RUN_HASH", "0") == "1"
 # STEP_TIMING=1: rank 0 logs, per denoising step, how long the host waited for the DiT and how
 # long the host-side scheduler round trip took (no extra device syncs).
 STEP_TIMING = os.environ.get("STEP_TIMING", "0") == "1"
@@ -219,7 +224,10 @@ def main():
             device=torch.device('cpu'))
         vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
         vae.scale = [s.to(device=NEURON_DEVICE, dtype=torch.bfloat16) if isinstance(s, torch.Tensor) else s for s in vae.scale]
-        logger.info("VAE loaded on Neuron with NKI kernels")
+        # Pack the nkilib conv filters now, so the first decode runs the same kernels (and
+        # VAE_FUSE_RES rounding) as every later one (see Decoder3d.prepack_nki_filters).
+        n_packed = vae.prepack_nki_filters()
+        logger.info(f"VAE loaded on Neuron with NKI kernels ({n_packed} decoder convs pre-packed)")
     else:
         vae = None
 
@@ -469,6 +477,10 @@ def main():
 
     # Save original latent for re-use across runs
     latent_orig = latent.clone()
+    if RUN_HASH:
+        import hashlib
+        def _h(t):
+            return hashlib.md5(t.detach().float().cpu().numpy().tobytes()).hexdigest()[:12]
     run_results = []
 
     for run_idx in range(NUM_RUNS):
@@ -642,7 +654,34 @@ def main():
                 'vae': vae_time,
                 'total': run_time,
             })
+        if RUN_HASH:
+            lh = _h(latent)
+            mh = ""
+            if rank == 0 and os.path.exists("/tmp/wan2_ti2v_output.mp4"):
+                with open("/tmp/wan2_ti2v_output.mp4", "rb") as fh:
+                    mh = " mp4=" + hashlib.md5(fh.read()).hexdigest()[:12]
+                if os.environ.get("RUN_HASH_KEEP"):  # keep each run's mp4: <prefix>_run<i>.mp4
+                    import shutil
+                    shutil.copy("/tmp/wan2_ti2v_output.mp4",
+                                f"{os.environ['RUN_HASH_KEEP']}_run{run_idx + 1}.mp4")
+            print(f"[hash] rank {rank} run {run_idx + 1} latent={lh}{mh}", flush=True)
 
+    if RUN_HASH:  # once-per-process state, hashed after the runs (no extra syncs before them)
+        print(f"[hash] rank {rank} inputs ctx={_h(context[0])} ctx_null={_h(context_null[0])} "
+              f"z_img={_h(z_img_device)} latent0={_h(latent_orig)}", flush=True)
+        # Once-per-process device state: every block's cross-attention K/V, and per-parameter
+        # fp32 sums of the device weights (DiT, unsharded cross-attention copies, VAE).
+        if fast_dit is not None:
+            kv = torch.cat([t.float().flatten().cpu() for pair in fast_dit.context for t in pair])
+            print(f"[hash] rank {rank} ctxkv={_h(kv)}", flush=True)
+        mods = [("dit", model)] + [("xca", m) for m in (full_cross or [])]
+        if locals().get("vae") is not None:
+            mods.append(("vae", vae.model))
+        for tag in ("dit", "xca", "vae"):
+            ps = [p for t, m in mods if t == tag for p in m.parameters() if p.numel() > 0]
+            if ps:
+                sums = torch.stack([p.detach().float().sum() for p in ps]).cpu()
+                print(f"[hash] rank {rank} wsum_{tag}={_h(sums)} (n={len(ps)})", flush=True)
     # ── Final benchmark summary ──
     if rank == 0 and run_results:
         logger.info("")

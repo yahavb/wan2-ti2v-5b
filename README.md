@@ -156,6 +156,7 @@ FastAPI server on port 8000:
 | `STEP_TIMING` | 0 | 1 = rank 0 logs per denoising step how long it waited for the DiT and how long the host-side scheduler round trip took |
 | `FAST_TIMING` | 0 | 1 = device-synced per-block timing log (diagnostic; adds syncs) |
 | `DUMP_DIR` | unset | Rank 0 saves the last run's final latent, uint8 frames and step-0 noise prediction (for comparing configurations; outside the timers) |
+| `RUN_HASH`, `RUN_HASH_KEEP` | 0, unset | Determinism probe: after each run's timers every rank logs an md5 of its final latent and rank 0 of the mp4; after the last run, md5s of the encoder outputs, cross-attention K/V and per-parameter weight sums. `RUN_HASH_KEEP=<prefix>` keeps each run's mp4 as `<prefix>_run<i>.mp4` |
 | `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |
 | `CONST_MAX_LAYERS`, `CONST_MAX_HARD_LIMIT` | auto, 70 | `auto`: const-max only on layers whose worst-case score (from QK-norm weights) stays under the kernel's clip; others use sdpa. Or `all`, or a comma list |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
@@ -164,7 +165,7 @@ FastAPI server on port 8000:
 | `FRAME_NUM` | 81 | Output frames (must be 4k+1) |
 | `MP4_PRESET`, `MP4_CRF` | veryfast, 20 | x264 settings for the output mp4 (imageio default medium/25 is ~8x slower) |
 | `NUM_STEPS` | 10 | Denoising steps |
-| `NUM_RUNS` | 2 | Iterations per process (run 1 compiles) |
+| `NUM_RUNS` | 2 | Iterations per process (run 1 compiles and loads; run 2 on is warm) |
 | `T5_RANK` | 2 | Rank hosting the T5 encoder (clamped to world size) |
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
@@ -177,6 +178,7 @@ FastAPI server on port 8000:
 | `DEVICE_SCHEDULER` | 0 | 1 (with `DIT_FAST=1`) = the UniPC step runs on the device tensors (`models/device_unipc.py`, coefficients on the CPU as upstream): no per-step device-host round trip; bit-identical to the CPU scheduler |
 | `MP4_VFORK` | 0 | 1 = start the mp4 encoder without imageio's `preexec_fn`, so Python spawns ffmpeg with vfork instead of forking the whole process (a fork stalled the device ~90 ms once per decode) |
 | `VAE_FUSE_RES` | 0 | 1 (with `VAE_FUSE_CAT=1`) = each ResidualBlock's last conv adds the shortcut inside the nkilib kernel (`residual_add_loc`, installed nkilib) instead of a separate eager add |
+| `VAE_FUSE_SHORTCUT` | 0 | 1 = in each upsample stage, the duplicate-upsample shortcut (repeat_interleave + permute) and its add run as one compiled graph, without cloning the stage input; bit-identical |
 | `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |

@@ -30,6 +30,10 @@ _VAE_FUSE_CAT = os.environ.get("VAE_FUSE_CAT", "0") == "1"
 # nkilib kernel (residual_add_loc) instead of a separate full-size eager add. One bf16 rounding of
 # conv + shortcut instead of two.
 _VAE_FUSE_RES = os.environ.get("VAE_FUSE_RES", "0") == "1"
+# VAE_FUSE_SHORTCUT=1: in each upsample stage, the duplicate-upsample shortcut (repeat_interleave +
+# permute, two full-resolution copies) and the final add run as one compiled graph, and the input
+# is no longer cloned (nothing writes to it). Pure data movement plus the same add: bit-identical.
+_VAE_FUSE_SHORTCUT = os.environ.get("VAE_FUSE_SHORTCUT", "0") == "1"
 # VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
 # splitting the decoder into fragments.
 _VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
@@ -247,6 +251,24 @@ if _VAE_FUSE_NORM:
     if _VAE_FUSE_CAT:
         _rms_silu_cat = torch.compile(_rms_silu_cat_impl, backend="neuron", dynamic=False)
         _rms_silu_pad = torch.compile(_rms_silu_pad_impl, backend="neuron", dynamic=False)
+
+
+def _dupup_add_impl(main, x, out_channels: int, factor_t: int, factor_s: int, repeats: int,
+                    first_chunk: bool):
+    """main + DupUp3D(x), with DupUp3D's exact ops, as one graph (VAE_FUSE_SHORTCUT)."""
+    B, _, T, H, W = x.shape
+    s = x.repeat_interleave(repeats, dim=1)
+    s = s.view(B, out_channels, factor_t, factor_s, factor_s, T, H, W)
+    s = s.permute(0, 1, 5, 2, 6, 3, 7, 4).reshape(B, out_channels, T * factor_t, H * factor_s, W * factor_s)
+    if first_chunk:
+        s = s[:, :, factor_t - 1:, :, :]
+    return main + s
+
+
+_dupup_add = None
+if _VAE_FUSE_SHORTCUT:
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+    _dupup_add = torch.compile(_dupup_add_impl, backend="neuron", dynamic=False)
 
 
 def _fused_cat_conv(layers, i):
@@ -840,10 +862,14 @@ class Up_ResidualBlock(nn.Module):
         self.upsamples = nn.Sequential(*upsamples)
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
-        x_main = x.clone()
+        x_main = x if _dupup_add is not None else x.clone()
         for module in self.upsamples:
             x_main = module(x_main, feat_cache, feat_idx)
         if self.avg_shortcut is not None:
+            if _dupup_add is not None and _is_neuron_tensor(x):
+                sc = self.avg_shortcut
+                return _dupup_add(x_main, x, sc.out_channels, sc.factor_t, sc.factor_s, sc.repeats,
+                                  bool(first_chunk))
             x_shortcut = self.avg_shortcut(x, first_chunk)
             return x_main + x_shortcut
         else:
@@ -1022,6 +1048,34 @@ class Decoder3d(nn.Module):
             CausalConv3d(out_dim, 12, 3, padding=1),
         )
 
+    def prepack_nki_filters(self):
+        """Pack the nkilib filters of every eligible conv after the first temporal upsample now,
+        instead of on its first call with 2+ output frames (chunk 1 of the first decode). Those
+        convs see 1 frame in chunk 0, which before packing took the eager conv (+ a separate
+        residual add under VAE_FUSE_RES), so the first decode rounded chunk 0 differently from
+        every later decode. Convs before that upsample only ever see 1 frame and stay eager.
+        Returns the number of convs packed."""
+        if _nki_conv3d is None:
+            return 0
+        n = 0
+        def pack(mod):
+            nonlocal n
+            for m in mod.modules():
+                if isinstance(m, CausalConv3d) and m._nki_filters is None and _nki_conv3d.eligible(m):
+                    m._nki_filters = _nki_conv3d.pack_filters(m.weight)
+                    if not _NKI_CONV3D_CHECK:
+                        m.weight = nn.Parameter(m.weight.new_empty(0), requires_grad=False)
+                    n += 1
+        multi_frame = False  # past a temporal upsample: chunks after the first have 2+ frames
+        for up in self.upsamples:
+            for sub in up.upsamples:
+                if multi_frame:
+                    pack(sub)
+                if isinstance(sub, Resample) and sub.mode == "upsample3d":
+                    multi_frame = True
+        if multi_frame:
+            pack(self.head)
+        return n
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
             idx = feat_idx[0]
@@ -1450,6 +1504,9 @@ class Wan2_2_VAE:
             logging.info(e)
             return None
 
+    def prepack_nki_filters(self):
+        """See Decoder3d.prepack_nki_filters; call once the model is on the device."""
+        return self.model.decoder.prepack_nki_filters()
     def decode_chunks(self, z):
         """Streaming decode of one latent [C, T, H, W]: yields [3, f, H*16, W*16] float32
         clamped chunks (the same values decode([z])[0] has for those frames)."""

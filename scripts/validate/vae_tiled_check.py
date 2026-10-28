@@ -39,6 +39,7 @@ def main():
     vae = Wan2_2_VAE(vae_pth=os.path.join(MODEL_PATH, "Wan2.2_VAE.pth"), device=torch.device("cpu"))
     vae.model = vae.model.to(device=dev, dtype=torch.bfloat16)
     vae.scale = [s.to(device=dev, dtype=torch.bfloat16) for s in vae.scale]
+    vae.prepack_nki_filters()  # as the pipeline: rep 0 decodes like every later rep
     z = torch.load(os.path.join(src, "latent.pt")).to(torch.bfloat16).to(dev)
     overlap = int(os.environ.get("VAE_TILE_OVERLAP", "4"))
     for rep in range(int(os.environ.get("REPS", "2"))):
