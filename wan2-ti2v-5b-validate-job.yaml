@@ -12,7 +12,7 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn2
+        node-type: trn3-dev1
       resourceClaims:
         # Same physical device as the TP=4 job, exposed as 8 logical cores (LNC1).
         - name: s-lnc1
@@ -143,7 +143,7 @@ spec:
               memory: 300Gi
               ephemeral-storage: 120Gi
             limits:
-              cpu: 32
+              cpu: 180
               memory: 400Gi
               ephemeral-storage: 200Gi
           volumeMounts:
