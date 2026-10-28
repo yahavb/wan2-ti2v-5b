@@ -80,8 +80,8 @@ for v in off on; do
 done
 echo "  VAE on vs off frames: $(python3 -c "import numpy as np,sys; a,b=(np.load(f'$OUT/vae_{x}/frames.npy') for x in ('off','on')); print('IDENTICAL' if np.array_equal(a,b) else 'DIFFERENT, max |diff| %d' % np.abs(a.astype(int)-b).max())" 2>&1)"
 echo "=== VAE vs exact fp32 CPU decode (untiled) ==="
-USE_NKI_VAE=0 USE_NKI_CONV3D=0 THREADS="$THREADS" python3 scripts/validate/vae_cpu_ref.py "$OUT/loop" "$OUT/vae_fp32" \
-  "$OUT/vae_off/frames.npy" "$OUT/vae_on/frames.npy" 2>&1 | grep vae_cpu_ref | tee "$OUT/vae_fp32.txt"
+USE_NKI_VAE=0 USE_NKI_CONV3D=0 VAE_COMPILE=0 VAE_FUSE_NORM=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_SUBPIXEL=0 VAE_STREAM=0 THREADS="$THREADS" python3 scripts/validate/vae_cpu_ref.py "$OUT/loop" "$OUT/vae_fp32" \
+  "$OUT/vae_off/frames.npy" "$OUT/vae_on/frames.npy" 2>&1 | grep -E "vae_cpu_ref|Error" | tee "$OUT/vae_fp32.txt"
 
 echo "=== step-0 noise prediction vs fp32 CPU DiT (each on its own input) ==="
 THREADS="$THREADS" python3 scripts/validate/ref_fp32.py "$OUT/off" "$OUT/ref_off" "$OUT/exact" 2>&1 \

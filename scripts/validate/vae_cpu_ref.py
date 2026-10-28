@@ -2,7 +2,7 @@
 
 python3 vae_cpu_ref.py <dump_dir_with_latent.pt> <out_dir> [<frames.npy to score> ...]
 Writes <out_dir>/frames.npy (uint8 [F, H, W, 3], same conversion as the pipeline) and prints the
-PSNR of every given frames.npy against it. Run with USE_NKI_VAE=0 USE_NKI_CONV3D=0 (CPU tensors).
+PSNR of every given frames.npy against it. Run with USE_NKI_VAE=0 USE_NKI_CONV3D=0 and the VAE_* fusion flags at 0 (they torch.compile for Neuron).
 """
 import math
 import os
