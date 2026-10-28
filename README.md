@@ -6,13 +6,14 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **8.8s** total
-(denoise 6.1s = 0.61 s/step, VAE 2.7s), down from 16.2s on `main` with the same image and SDK —
-**1.92x faster than A100** (16.92s), 1.10x slower than H100 (8.02s). DiT changes: nkilib
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **8.7s** total
+(denoise 6.0s = 0.60 s/step, VAE 2.6s), down from 16.2s on `main` with the same image and SDK —
+**1.95x faster than A100** (16.92s), 1.08x slower than H100 (8.02s). DiT changes: nkilib
 `attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
-cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard.
-VAE: RMS_norm + SiLU compiled as one graph together with the causal-cache concat; head conv on
-nkilib; upsample convs in sub-pixel form; tile blend and mp4 encode streamed during the decode.
+cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard,
+UniPC scheduler step on the device. VAE: RMS_norm + SiLU compiled as one graph together with the
+causal-cache concat; head conv on nkilib; upsample convs in sub-pixel form; tile blend and mp4
+encode streamed during the decode, encoder spawned with vfork.
 Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0487 (`main` const-max: 0.0474,
 exact SDPA: 0.0485). See RESULTS.md.
 
@@ -173,6 +174,8 @@ FastAPI server on port 8000:
 | `NKI_CONV3D_SMALL_COUT` | 0 | 1 = the nkilib conv3d gate also takes convs with C_out < 96 (the VAE decoder head, 256 -> 12); rel-RMS 2.3e-5 vs eager |
 | `VAE_SUBPIXEL` | 0 | 1 (with `USE_NKI_CONV3D=1`) = each upsample conv (nearest-2x + 3x3) runs as four 2x2 nkilib convs on the low-res frames, one per output phase, plus one interleave copy (2.25x fewer MACs; 44.68 vs 44.69 dB against the exact fp32 decode) |
 | `VAE_FUSE_CAT` | 0 | 1 (with `VAE_FUSE_NORM=1`) = the compiled RMS_norm + SiLU in front of each nkilib causal conv also writes the 2 cached frames in front and returns the next cache, replacing the eager concat, clone and time pad (bit-identical) |
+| `DEVICE_SCHEDULER` | 0 | 1 (with `DIT_FAST=1`) = the UniPC step runs on the device tensors (`models/device_unipc.py`, coefficients on the CPU as upstream): no per-step device-host round trip; bit-identical to the CPU scheduler |
+| `MP4_VFORK` | 0 | 1 = start the mp4 encoder without imageio's `preexec_fn`, so Python spawns ffmpeg with vfork instead of forking the whole process (a fork stalled the device ~90 ms once per decode) |
 | `VAE_FUSE_RES` | 0 | 1 (with `VAE_FUSE_CAT=1`) = each ResidualBlock's last conv adds the shortcut inside the nkilib kernel (`residual_add_loc`, installed nkilib) instead of a separate eager add |
 | `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |

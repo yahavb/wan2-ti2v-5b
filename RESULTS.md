@@ -25,13 +25,31 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + streamed VAE output: blend + mp4 encode per latent frame during the decode (`VAE_STREAM=1`) | 0.62 | 6.2s | 3.0s | 9.2s | 0.0487* |
 | + VAE head conv (256->12) on nkilib (`NKI_CONV3D_SMALL_COUT=1`), sub-pixel upsample convs (`VAE_SUBPIXEL=1`) | 0.61 | 6.1s | 2.8s | 8.9s | 0.0487* |
 | + norm and causal-cache concat in one compiled graph (`VAE_FUSE_CAT=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
-| + ResidualBlock shortcut added inside the nkilib conv (`VAE_FUSE_RES=1`) | **0.61** | **6.1s** | **2.7s** | **8.8s** | 0.0487* |
+| + ResidualBlock shortcut added inside the nkilib conv (`VAE_FUSE_RES=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
+| + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | **0.60** | **6.0s** | **2.6s** | **8.7s** | 0.0487* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
-VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1`. The last three rows round to the same tenths; run-to-run
-(DONE to DONE) they are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and
-2.57-2.58 s.
+VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
+`VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
+are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
+
+Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
+the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next
+step's first in-graph collective, waiting for the ranks whose single-threaded CPU scheduler was
+slower. `DEVICE_SCHEDULER=1` (`models/device_unipc.py`) runs the scheduler's linear combinations on
+the device, with its scalar coefficients computed on the CPU as upstream does, applied with the same
+PyTorch type-promotion rounding: bit-identical to the CPU scheduler on CPU and on device
+(`scripts/validate/unipc_device_check.py`), and the pipeline's mp4 is byte-identical. Denoise device
+busy 96.9% -> 99.5%, idle 0.19 -> 0.03 s. In the VAE, starting ffmpeg with imageio's `preexec_fn`
+forks this tens-of-GB process; the page-table copy blocked the runtime's completion thread for
+88-95 ms once per decode (a `kbl_exec_post` of that length in the trace). `MP4_VFORK=1` lets Python
+spawn it with vfork: ~1 ms instead of 14-20 ms for a 20 GB process measured in isolation, and the
+stall is gone (VAE idle 0.375 -> 0.265 s). Six warm runs, same build:
+both flags 8.59-8.72 s total, `DEVICE_SCHEDULER` alone 8.70-8.87 s, neither 8.81-9.18 s. Tried and
+dropped: more CPU threads on ranks 1-7 (no clear change), freezing/disabling Python GC during a run
+(no collection over 5 ms happens in a warm run), copying VAE frames to the host from a helper thread
+(longer tail: the copies queue behind the device work).
 \* The fused norm also runs in the VAE encoder, so the conditioning latent (and the step-0 input)
 changes slightly; these rows are scored against an fp32 reference computed on their own input.
 `CFG_GROUPS=interleave` gives bit-identical output to the contiguous layout. `VAE_STREAM=1` writes a

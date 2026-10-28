@@ -76,6 +76,15 @@ DUMP_DIR = os.environ.get("DUMP_DIR", "")
 # STEP_TIMING=1: rank 0 logs, per denoising step, how long the host waited for the DiT and how
 # long the host-side scheduler round trip took (no extra device syncs).
 STEP_TIMING = os.environ.get("STEP_TIMING", "0") == "1"
+# MP4_VFORK=1: start the mp4 encoder (ffmpeg) without imageio's preexec_fn, so Python spawns it with
+# vfork instead of fork. Forking this process (tens of GB resident) blocks the other threads while
+# the page tables are copied; the runtime's completion thread stalled ~90 ms once per decode.
+if os.environ.get("MP4_VFORK", "0") == "1":
+    os.environ.setdefault("IMAGEIO_FFMPEG_NO_PREVENT_SIGINT", "1")
+# DEVICE_SCHEDULER=1 (DIT_FAST): the UniPC step runs on the device tensors (models/device_unipc.py);
+# its scalar coefficients stay on the CPU. No per-step device->host->device round trip, so the host
+# queues the next step while the device is still busy. Same math; device elementwise rounding.
+DEVICE_SCHEDULER = os.environ.get("DEVICE_SCHEDULER", "0") == "1"
 
 
 def _dump_outputs(out_dir, latent, video_np):
@@ -122,6 +131,7 @@ def main():
     if rank == 0:
         # torchrun sets OMP_NUM_THREADS=1; rank 0 sums the VAE tiles and converts the video on CPU.
         torch.set_num_threads(int(os.environ.get("RANK0_CPU_THREADS", "16")))
+
 
     global T5_RANK
     if T5_RANK >= world_size:
@@ -470,7 +480,11 @@ def main():
         latent = latent_orig.clone()
 
         # ── Denoising loop ──
-        sample_scheduler = FlowUniPCMultistepScheduler(
+        if DEVICE_SCHEDULER:
+            from models.device_unipc import DeviceFlowUniPC as _Sched
+        else:
+            _Sched = FlowUniPCMultistepScheduler
+        sample_scheduler = _Sched(
             num_train_timesteps=config.num_train_timesteps,
             shift=1, use_dynamic_shifting=False)
         sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
@@ -496,6 +510,13 @@ def main():
                 guide_scale = config.sample_guide_scale
                 noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
+            if DEVICE_SCHEDULER:
+                if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
+                    dump_step0 = (latent.cpu(), noise_pred.cpu(), float(t))
+                latent = sample_scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0),
+                                               return_dict=False)[0].squeeze(0)
+                latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
+                continue
             # Scheduler step on CPU
             if STEP_TIMING:
                 t_s0 = time.perf_counter()
@@ -517,6 +538,10 @@ def main():
                 logger.info(f"[step {step_idx}] wait for DiT {1e3 * (t_s1 - t_s0):.1f}ms, "
                             f"host (D2H + scheduler + H2D) {1e3 * (t_s2 - t_s1):.1f}ms")
 
+        if DEVICE_SCHEDULER:
+            # Nothing in the loop waits for the device any more; wait here so the denoise and VAE
+            # times are each phase's own (the host would otherwise be several steps ahead).
+            torch.neuron.synchronize()
         denoise_time = time.time() - denoise_start
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.2f}s/step)")
