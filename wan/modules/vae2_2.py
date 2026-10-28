@@ -14,6 +14,9 @@ _USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "1") == "1"
 # VAE_COMPILE=1: decode through models/vae_static.py (fixed-shape causal cache, ported from
 # vllm-omni-neuron) under torch.compile: one graph for chunk 0, one for every later chunk.
 _VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
+# VAE_FUSE_NORM=1: each RMS_norm + SiLU pair runs as one torch.compile'd graph (1 kernel instead
+# of ~9 eager ones, one HBM read + write instead of several fp32 passes).
+_VAE_FUSE_NORM = os.environ.get("VAE_FUSE_NORM", "0") == "1"
 # VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
 # splitting the decoder into fragments.
 _VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
@@ -186,6 +189,25 @@ class CausalConv3d(nn.Conv3d):
                 logging.warning(f"[nki_conv3d] x={list(x.shape)} C_out={self.out_channels} "
                                 f"rel_err={err.item():.4f} shape_ok={out.shape == ref.shape}")
         return out
+
+
+def _rms_silu_impl(x, gamma):
+    """RMS_norm(channel_first, bias=False) followed by SiLU, as one compiled graph."""
+    rms = x.to(torch.float32).pow(2).mean(1, keepdim=True).clamp(min=1e-8).rsqrt()
+    return F.silu((x * rms).to(gamma.dtype) * gamma)
+
+
+_rms_silu = None
+if _VAE_FUSE_NORM:
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+    _rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
+
+
+def _norm_silu_fusable(layers, i):
+    """layers[i] is a bias-free channel-first RMS_norm followed by SiLU (fusable pair)."""
+    return (_rms_silu is not None and i + 1 < len(layers) and isinstance(layers[i], RMS_norm)
+            and isinstance(layers[i + 1], nn.SiLU) and layers[i].channel_first
+            and not isinstance(layers[i].bias, torch.Tensor))
 
 
 class RMS_norm(nn.Module):
@@ -387,7 +409,16 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
-        for layer in self.residual:
+        layers = list(self.residual)
+        skip = False
+        for i, layer in enumerate(layers):
+            if skip:  # the SiLU already applied by the fused norm
+                skip = False
+                continue
+            if _norm_silu_fusable(layers, i):
+                x = _rms_silu(x, layer.gamma)
+                skip = True
+                continue
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -917,7 +948,16 @@ class Decoder3d(nn.Module):
                 x = layer(x)
 
         ## head
-        for layer in self.head:
+        head_layers = list(self.head)
+        skip = False
+        for i, layer in enumerate(head_layers):
+            if skip:  # SiLU already applied by the fused norm
+                skip = False
+                continue
+            if _norm_silu_fusable(head_layers, i):
+                x = _rms_silu(x, layer.gamma)
+                skip = True
+                continue
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
                 idx = feat_idx[0]
                 cache_x = x[:, :, -CACHE_T:, :, :].clone()

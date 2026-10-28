@@ -19,18 +19,39 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + `attention_cte` cross-attention | 0.90 | 9.0s | 4.1s | 13.2s | 0.0482 |
 | + CFG-parallel: 2 groups x TP4, batch 1 each | 0.76 | 7.6s | 4.3s | 11.9s | 0.0483 |
 | + Megatron sequence parallelism (AG/RS around the TP matmuls) | 0.68 | 6.8s | 4.4s | 11.1s | 0.0477 |
-| + cross-attention local to the token shard (all heads, no collectives) | **0.64** | **6.4s** | 4.4s | **10.8s** | 0.0484 |
+| + cross-attention local to the token shard (all heads, no collectives) | 0.64 | 6.4s | 4.4s | 10.8s | 0.0484 |
+| + VAE: RMS_norm + SiLU as one compiled graph (`VAE_FUSE_NORM=1`) | 0.64 | 6.4s | 3.5s | 10.0s | 0.0487* |
+| + CFG groups on alternating cores (`CFG_GROUPS=interleave`) | **0.62** | **6.2s** | **3.5s** | **9.6s** | 0.0487* |
 
-Env for the last row: `CFG_PARALLEL=1 FAST_SP=1 FAST_LOCAL_CROSS=1 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte`.
+Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
+FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1`.
+\* The fused norm also runs in the VAE encoder, so the conditioning latent (and the step-0 input)
+changes slightly; these rows are scored against an fp32 reference computed on their own input.
+`CFG_GROUPS=interleave` gives bit-identical output to the contiguous layout.
+
+VAE accuracy, same final latent, against an exact fp32 CPU decode without tiling
+(`scripts/validate/vae_cpu_ref.py`): tiled bf16 decode (overlap 4) 44.67 dB, with
+`VAE_FUSE_NORM=1` 44.69 dB; fused vs unfused 55.75 dB. Overlap 3: 43.74 dB (3.01 s), overlap 2:
+42.24 dB (2.54 s) vs 3.10 s for overlap 4 -- not taken, the speed costs 1-2.5 dB.
 
 Per-call attention microbench (one core, 6 heads x 7854 tokens, d=128, layer-25 QK-norm gammas):
 sdpa 18.2 ms, const-max 5.8 ms, `attention_cte` 5.3 ms, all at bf16-level error (rel-RMS 0.0055
 vs fp32). Per-block (TP4, batch 1): 29.4 ms (TP8 batch 2) -> 24.5 (CFG-parallel) -> 21.9 (+SP) -> 20.6 ms (+local cross).
 
+Where the SP block's 20.6 ms goes (contiguous groups): collectives 6.2 ms (block without them:
+14.4 ms), QK-norm 0.6 ms, RoPE 0.5 ms. Interleaving the CFG groups gives 19.8 ms. Per denoising
+step the host side (D2H, CPU UniPC step, H2D) is 4-6 ms of ~630 ms (`STEP_TIMING=1`).
+
 Tried and rejected (block bench unless noted): chunking the in-graph all-reduces (29.4 -> 36.4 ms),
 `NEURON_COMPILER_OPT_LEVEL=-O3` (no change), frame-chunked sequence split inside the block
 (24.4 -> 24.8/27.1 ms), pre-transposed weights (25.7 ms), fused QKV projection and a [real|imag]
-RoPE layout (both within 0.1 ms), TP8 + SP instead of CFG-parallel (23.7 vs 21.9 ms).
+RoPE layout (both within 0.1 ms), TP8 + SP instead of CFG-parallel (23.7 vs 21.9 ms), runtime
+collective-algorithm knobs `NEURON_RT_DBG_{MESH,RDH,KANGARING}_CC` and friends (20.59-20.72 vs
+20.62 ms), nkilib `allgather_compute_matmul` (fails at our 1964-row shard; 3.95 vs 3.73 ms at 2048
+rows). The compiler does not overlap an in-graph all-gather with independent compute
+(`scripts/validate/overlap_bench.py`: 2.95 + 3.65 -> 6.53 ms together). VAE decoding 2 or 4 latent
+frames per decoder call is 11-18% faster per tile on an empty core (`VAE_TCHUNK`, removed) but
+runs out of HBM next to the resident DiT (drain-and-retry stalls, then OOM) and compiles 7-25 min.
 
 ## 704x544, 81 frames (7854 DiT tokens)
 

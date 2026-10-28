@@ -208,6 +208,10 @@ spec:
               value: "1"
             - name: FAST_LOCAL_CROSS
               value: "1"
+            - name: CFG_GROUPS
+              value: "interleave"
+            - name: VAE_FUSE_NORM
+              value: "1"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
             - name: CONST_MAX_LAYERS

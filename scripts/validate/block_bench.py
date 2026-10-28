@@ -211,6 +211,19 @@ def main():
                       no_rope=dict(rope=False), no_qkn=dict(qkn=False), no_ln=dict(ln=False),
                       no_mod=dict(mod=False))[var]
             unit = Probe(blk, GRID[0], SELF_IMPL, **kw)
+        if var.startswith("sp"):
+            # SP timing probes (change the math): SP_NOCOMM=1 replaces the collectives with
+            # same-shape local ops; SP_NOQKN=1 / SP_NOROPE=1 drop QK-norm / RoPE.
+            tpw_ = get_tp_world_size()
+            if os.environ.get("SP_NOCOMM", "0") == "1":
+                fd._ag = lambda t: t.repeat(tpw_, *([1] * (t.dim() - 1)))
+                fd._rs = lambda t: t[: t.shape[0] // tpw_]
+                fd._all_reduce = lambda t: t
+            if os.environ.get("SP_NOQKN", "0") == "1":
+                fd._tp_rms_qk = lambda q, k, nq, nk: (q, k)
+                fd._local_rms = lambda t, nrm: t
+            if os.environ.get("SP_NOROPE", "0") == "1":
+                fd._rope = lambda t, c_, s_: t
         f = torch.compile(unit, backend="neuron", dynamic=False, fullgraph=True)
         t0 = time.perf_counter()
         try:

@@ -64,11 +64,15 @@ DIT_FAST = os.environ.get("DIT_FAST", "1") == "1"
 # cond branch, group 1 the uncond branch, each at batch 1. Halves the bytes of every TP
 # all-reduce and shrinks the group; the two predictions are combined in the head.
 CFG_PARALLEL = os.environ.get("CFG_PARALLEL", "0") == "1"
+CFG_GROUPS = os.environ.get("CFG_GROUPS", "contiguous")  # or "interleave" (see init below)
 
 NEURON_DEVICE = torch.device("neuron")
 # DUMP_DIR: rank 0 saves the last run's final latent (latent.pt) and uint8 frames (frames.npy)
 # there, for comparing configurations numerically. Not timed (outside the convert timer).
 DUMP_DIR = os.environ.get("DUMP_DIR", "")
+# STEP_TIMING=1: rank 0 logs, per denoising step, how long the host waited for the DiT and how
+# long the host-side scheduler round trip took (no extra device syncs).
+STEP_TIMING = os.environ.get("STEP_TIMING", "0") == "1"
 
 
 def _dump_outputs(out_dir, latent, video_np):
@@ -214,7 +218,11 @@ def main():
 
     # Initialize TP group and shard model
     dit_tp = TP_DEGREE // 2 if CFG_PARALLEL else TP_DEGREE
-    init_tp_group(tp_degree=dit_tp, sp_degree=SP_DEGREE)
+    # CFG_GROUPS=interleave: CFG-parallel TP groups on alternating ranks ([0,2,4,6] cond,
+    # [1,3,5,7] uncond), so each group has one core on every HBM stack (block 19.8 vs 20.6 ms).
+    interleave = CFG_PARALLEL and CFG_GROUPS == "interleave"
+    tp_groups = ([list(range(0, world_size, 2)), list(range(1, world_size, 2))] if interleave else None)
+    init_tp_group(tp_degree=dit_tp, sp_degree=SP_DEGREE, groups=tp_groups)
     tp_rank = get_tp_rank()
     # FAST_LOCAL_CROSS=1 (with CFG_PARALLEL + FAST_SP): keep an unsharded copy of every block's
     # cross-attention so it runs on the token shard with all heads, without collectives.
@@ -228,14 +236,21 @@ def main():
     if CFG_PARALLEL:
         assert DIT_FAST and SP_DEGREE == 1 and world_size == TP_DEGREE and TP_DEGREE % 2 == 0, \
             "CFG_PARALLEL needs DIT_FAST=1, SP_DEGREE=1 and an even world size"
-        cfg_group = rank // dit_tp
-        for i in range(dit_tp):  # every rank creates every pair group, same order
-            g = dist.new_group([i, i + dit_tp])
-            if rank % dit_tp == i:
+        # Pair = the two ranks with the same TP rank (same weight shard and token shard), one
+        # per CFG group; the head sums the weighted cond/uncond predictions over it.
+        if interleave:
+            cfg_group = rank % 2
+            pairs = [[2 * i, 2 * i + 1] for i in range(dit_tp)]
+        else:
+            cfg_group = rank // dit_tp
+            pairs = [[i, i + dit_tp] for i in range(dit_tp)]
+        for p in pairs:  # every rank creates every pair group, same order
+            g = dist.new_group(p)
+            if rank in p:
                 pair_group = g
         if rank == 0:
-            logger.info(f"CFG_PARALLEL=1: TP groups of {dit_tp} (cond ranks 0-{dit_tp - 1}, "
-                        f"uncond ranks {dit_tp}-{2 * dit_tp - 1})")
+            logger.info(f"CFG_PARALLEL=1: 2 TP groups of {dit_tp}, layout {CFG_GROUPS} "
+                        f"(cond {tp_groups[0] if interleave else list(range(dit_tp))})")
 
     # Patch self-attention for SP if enabled
     if SP_DEGREE > 1:
@@ -479,7 +494,11 @@ def main():
                 noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             # Scheduler step on CPU
+            if STEP_TIMING:
+                t_s0 = time.perf_counter()
             noise_pred_cpu = noise_pred.cpu()
+            if STEP_TIMING:
+                t_s1 = time.perf_counter()
             if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
                 dump_step0 = (latent.cpu(), noise_pred_cpu, float(t))  # same input in every config
             temp_x0 = sample_scheduler.step(
@@ -488,6 +507,12 @@ def main():
                 return_dict=False, generator=seed_g)[0]
             latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
             latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
+            if STEP_TIMING and rank == 0:
+                # wait = device still running the DiT when the host asked for the result;
+                # host = D2H copy + CPU scheduler + H2D copy + mask blend enqueue
+                t_s2 = time.perf_counter()
+                logger.info(f"[step {step_idx}] wait for DiT {1e3 * (t_s1 - t_s0):.1f}ms, "
+                            f"host (D2H + scheduler + H2D) {1e3 * (t_s2 - t_s1):.1f}ms")
 
         denoise_time = time.time() - denoise_start
         if rank == 0:

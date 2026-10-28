@@ -6,12 +6,13 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **10.8s** total
-(denoise 6.4s = 0.64 s/step, VAE 4.4s), down from 16.2s on `main` with the same image and SDK —
-**1.57x faster than A100** (16.92s), 1.35x slower than H100 (8.02s). DiT changes: nkilib
-`attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4), Megatron-style
-sequence parallelism, cross-attention local to each rank's token shard. Step-0 noise prediction vs
-an fp32 CPU reference: rel-RMS 0.0484 (`main` const-max: 0.0474, exact SDPA: 0.0485). See RESULTS.md.
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **9.6s** total
+(denoise 6.2s = 0.62 s/step, VAE 3.5s), down from 16.2s on `main` with the same image and SDK —
+**1.76x faster than A100** (16.92s), 1.2x slower than H100 (8.02s). DiT changes: nkilib
+`attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
+cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard.
+VAE: RMS_norm + SiLU compiled as one graph. Step-0 noise prediction vs an fp32 CPU reference:
+rel-RMS 0.0487 (`main` const-max: 0.0474, exact SDPA: 0.0485). See RESULTS.md.
 
 **Versus GPUs** (`main`, 5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
 
@@ -147,6 +148,9 @@ FastAPI server on port 8000:
 | `CFG_PARALLEL` | 0 | 1 = two TP groups of world/2 ranks: ranks 0-3 run the cond branch, 4-7 the uncond branch, batch 1 each; the head combines them over rank pairs (i, i+4) |
 | `FAST_SP` | 0 | 1 = Megatron-style sequence parallelism inside the TP group (`_FastBlockSP`): token-sharded residual stream, all-gather before / reduce-scatter after the TP matmuls |
 | `FAST_LOCAL_CROSS` | 0 | 1 (needs `CFG_PARALLEL=1 FAST_SP=1`) = cross-attention on each rank's token shard with all heads and unsharded weights: no collectives, +2.3 GB HBM per rank |
+| `CFG_GROUPS` | contiguous | With `CFG_PARALLEL=1`: `contiguous` = cond ranks 0-3 / uncond 4-7; `interleave` = cond 0,2,4,6 / uncond 1,3,5,7 (each group spans every HBM stack; 4% faster DiT, same output) |
+| `VAE_FUSE_NORM` | 0 | 1 = every VAE RMS_norm + SiLU pair runs as one `torch.compile`d graph (VAE decode 3.7 -> 2.9 s per tile) |
+| `STEP_TIMING` | 0 | 1 = rank 0 logs per denoising step how long it waited for the DiT and how long the host-side scheduler round trip took |
 | `FAST_TIMING` | 0 | 1 = device-synced per-block timing log (diagnostic; adds syncs) |
 | `DUMP_DIR` | unset | Rank 0 saves the last run's final latent, uint8 frames and step-0 noise prediction (for comparing configurations; outside the timers) |
 | `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |

@@ -29,8 +29,11 @@ _TP_RANK: int = 0
 _TP_WORLD_SIZE: int = 1
 
 
-def init_tp_group(tp_degree: int = 4, sp_degree: int = 1):
+def init_tp_group(tp_degree: int = 4, sp_degree: int = 1, groups=None):
     """Initialize tensor parallelism process group.
+
+    groups: optional explicit list of TP rank lists (each of length tp_degree, covering the
+    world); default is contiguous blocks [0..tp-1], [tp..2tp-1], ...
 
     Must be called after torch.distributed.init_process_group().
     On Trainium, the NeuronCores within a chip form the TP group.
@@ -70,14 +73,18 @@ def init_tp_group(tp_degree: int = 4, sp_degree: int = 1):
         except Exception:
             pass
 
-    # Create TP groups: ranks [0,1,2,3], [4,5,6,7], etc.
+    # Create TP groups: ranks [0,1,2,3], [4,5,6,7], etc. (or the explicit `groups`).
+    # Every rank creates every group, in the same order (required by dist.new_group).
     num_groups = world_size // tp_degree
-    for i in range(num_groups):
-        ranks = list(range(i * tp_degree, (i + 1) * tp_degree))
-        group = dist.new_group(ranks)
+    if groups is None:
+        groups = [list(range(i * tp_degree, (i + 1) * tp_degree)) for i in range(num_groups)]
+    assert len(groups) == num_groups and all(len(g) == tp_degree for g in groups), groups
+    assert sorted(r for g in groups for r in g) == list(range(world_size)), groups
+    for ranks in groups:
+        group = dist.new_group(list(ranks))
         if rank in ranks:
             _TP_GROUP = group
-            _TP_RANK = rank - i * tp_degree
+            _TP_RANK = list(ranks).index(rank)
             _TP_WORLD_SIZE = tp_degree
 
     print(f"[TP] Initialized: rank={_TP_RANK}/{_TP_WORLD_SIZE}, "
