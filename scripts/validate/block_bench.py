@@ -12,6 +12,7 @@ torchrun --nproc_per_node=8 block_bench.py [variant ...]
   ar_only  3 all-reduces of a [B, L, C] bf16 tensor
   sp       _FastBlockSP (Megatron SP); output rows checked against ref
   sp_lx    _FastBlockSP with local all-head cross-attention (CFG_PAR=1 only)
+           SP timing probes: SP_NOCOMM, SP_NOQKN, SP_NOROPE, SP_NOSA, SP_NOXA (=1 each)
 The ablations change the math; they are timing probes only.
 Env: LAYER (0), REPS (20), SELF_IMPL (cte|constmax|sdpa), FAST_CROSS_IMPL,
      CFG_PAR=1 (two TP groups of world/2, batch 1: the CFG_PARALLEL layout)
@@ -216,14 +217,28 @@ def main():
             # same-shape local ops; SP_NOQKN=1 / SP_NOROPE=1 drop QK-norm / RoPE.
             tpw_ = get_tp_world_size()
             if os.environ.get("SP_NOCOMM", "0") == "1":
+                # reduce-scatter -> local sum of the row blocks: reads every row, so the compiler
+                # cannot shrink the matmuls in front of it (a plain row slice let it skip 3/4 of
+                # the O-projection and FFN rows)
                 fd._ag = lambda t: t.repeat(tpw_, *([1] * (t.dim() - 1)))
-                fd._rs = lambda t: t[: t.shape[0] // tpw_]
+                fd._rs = lambda t: t.view(tpw_, t.shape[0] // tpw_, *t.shape[1:]).sum(0)
                 fd._all_reduce = lambda t: t
             if os.environ.get("SP_NOQKN", "0") == "1":
                 fd._tp_rms_qk = lambda q, k, nq, nk: (q, k)
                 fd._local_rms = lambda t, nrm: t
             if os.environ.get("SP_NOROPE", "0") == "1":
                 fd._rope = lambda t, c_, s_: t
+            # SP_NOSA=1 / SP_NOXA=1: drop the self- / cross-attention kernel. Self returns v + q + k
+            # so the q/k projections, QK-norm and RoPE stay live; cross returns q.
+            nosa, noxa = os.environ.get("SP_NOSA", "0") == "1", os.environ.get("SP_NOXA", "0") == "1"
+            if nosa or noxa:
+                _cte0 = fd._cte
+
+                def _cte_probe(q, k, v, _o=_cte0):
+                    if k.shape[1] == q.shape[1]:  # self-attention: Lk == Lq
+                        return v + q + k if nosa else _o(q, k, v)
+                    return q if noxa else _o(q, k, v)
+                fd._cte = _cte_probe
         f = torch.compile(unit, backend="neuron", dynamic=False, fullgraph=True)
         t0 = time.perf_counter()
         try:

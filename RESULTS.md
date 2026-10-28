@@ -68,9 +68,13 @@ Per-call attention microbench (one core, 6 heads x 7854 tokens, d=128, layer-25 
 sdpa 18.2 ms, const-max 5.8 ms, `attention_cte` 5.3 ms, all at bf16-level error (rel-RMS 0.0055
 vs fp32). Per-block (TP4, batch 1): 29.4 ms (TP8 batch 2) -> 24.5 (CFG-parallel) -> 21.9 (+SP) -> 20.6 ms (+local cross).
 
-Where the SP block's 20.6 ms goes (contiguous groups): collectives 6.2 ms (block without them:
-14.4 ms), QK-norm 0.6 ms, RoPE 0.5 ms. Interleaving the CFG groups gives 19.8 ms. Per denoising
-step the host side (D2H, CPU UniPC step, H2D) is 4-6 ms of ~630 ms (`STEP_TIMING=1`).
+Interleaving the CFG groups gives 19.8 ms per block; where that goes is in the profile section
+below. An earlier figure here (collectives 6.2 of the contiguous block's 20.6 ms) was wrong: that
+probe replaced each reduce-scatter with a row slice, which let the compiler skip three quarters of
+the O-projection and FFN-down rows (the 2.3 ms difference matches those matmuls). With a stand-in
+that reads every row, the collectives cost 3.1 ms in place (4.0 ms standalone). Per denoising step
+the host side (D2H, CPU UniPC step, H2D) takes 4-6 ms (`STEP_TIMING=1`); the device sits idle
+~19 ms per step (system trace), which also covers the host work before the first block.
 
 Tried and rejected (block bench unless noted): chunking the in-graph all-reduces (29.4 -> 36.4 ms),
 `NEURON_COMPILER_OPT_LEVEL=-O3` (no change), frame-chunked sequence split inside the block
@@ -82,6 +86,71 @@ rows). The compiler does not overlap an in-graph all-gather with independent com
 (`scripts/validate/overlap_bench.py`: 2.95 + 3.65 -> 6.53 ms together). VAE decoding 2 or 4 latent
 frames per decoder call is 11-18% faster per tile on an empty core (`VAE_TCHUNK`, removed) but
 runs out of HBM next to the resident DiT (drain-and-retry stalls, then OOM) and compiles 7-25 min.
+
+## Where the 8.8 s goes (`loop_engineering`, profiled 2026-10-28)
+
+One warm run of the last configuration above, 8.81 s: denoise 6.13 s (device busy 96.9% on
+rank 0) and VAE 2.68 s (device busy 86.0%). Headroom means savings that keep the output the same
+apart from bf16 rounding.
+
+| Area | Time now | Share | Running at | Floor | Realistic headroom | How |
+|---|---|---|---|---|---|---|
+| DiT linear layers | 2.47 s | 28% | 83% of peak | 2.05 s | ~0.2 s | Close to peak already; the FLOPs are fixed by the model at bf16 |
+| DiT attention (self + cross) | 1.77 s | 20% | 45% of peak (self), 17% (cross) | 0.73 s | 0.4-0.6 s | A faster flash-attention kernel, around 60-70% of peak; cross-attention has only 512 keys, which suits the kernel poorly |
+| VAE convolutions | 1.74 s | 20% | 79% on the main convs, 30% at 15x21 | 1.30 s (0.77 s with exact tiles) | 0.3-0.6 s | Overlapping tiles do 1.68x the needed work; exact tiles need a halo exchange cheaper than the 0.65 s measured. 4 frames per call runs at 88-94% of peak but runs out of HBM next to the resident DiT |
+| DiT collectives | 0.94-1.2 s | 11-14% | mostly serialized with compute | ~0 if hidden | 0.2-0.5 s | Overlap them with the matmuls. All-to-all moves fewer bytes (1.0 vs 4.0 ms per block) but needs the full weights on every core, which doesn't fit next to the VAE |
+| DiT pointwise (norms, modulation, gates, RoPE, QK-norm) | 0.76 s | 9% | memory / vector bound | small if fused | 0.3-0.5 s | Fuse norm + modulation into the QKV and FFN-up matmuls, gate + residual into O-proj and FFN-down, RoPE + QK-norm into attention |
+| VAE norms, copies, small graphs | 0.56 s | 6% | memory bound (norms at ~130 GB/s) | small if fused | 0.1-0.3 s | Fold the shortcut and interleave copies into the conv kernels, so fewer graphs run |
+| Host / idle time | 0.57 s | 6% | device waiting on the host | 0 | 0.25-0.45 s | Async per-frame VAE copies; find the 0.09 s VAE stall; UniPC step on the device (19 ms idle per step); fewer VAE graph launches (3,540 per tile) |
+| DiT head, embeddings | 0.04 s | <1% | | | ~0 | |
+| **Total** | **8.81 s** | | | **~3.6-4.1 s** | **~2-3 s** | ~6-7 s end to end if most of these land |
+
+Floor = the same work at 100% of the bf16 peak (83.4 TFLOP/s per core) with everything else
+hidden: a lower bound, not a target. The attention floor counts only the matmuls. The fusion
+headroom (DiT pointwise, VAE small graphs) is an estimate, and the ranges overlap, so they don't
+add exactly. The 88-94% for 4 frames per call is the nkilib conv on 4-frame shapes, measured per
+conv in the parallel conv-profiling session. Not counted, because they change the output: FP8
+(torch's `float8_e4m3fn` is rejected by neuronx-cc 2.28 on trn2; NKI's own fp8 types were not
+tried), fewer steps, step caching.
+
+The same profile, by bottleneck:
+
+| # | Bottleneck | Time per video | Share | Detail | Source |
+|---|---|---|---|---|---|
+| 1 | DiT linear layers (QKV, O-proj, FFN up/down, cross-attn q/o) | 2.47 s | 28% | 8.25 ms per block; 83% of bf16 peak (QKV alone 54%) | bench |
+| 2 | DiT self-attention (`attention_cte`) | 1.51 s | 17% | 5.0 ms per block; 45% of peak | ablation |
+| 3 | VAE 3x3x3 convs on nkilib (30x42 to 120x168) | 1.48 s | 17% | 8 graphs, 2.5-8.6 ms per call; 69-84% of peak | trace |
+| 4 | DiT collectives (2 all-gathers + 2 reduce-scatters per block) | 0.94-1.2 s | 11-14% | 3.1 ms per block in place, 4.0 ms standalone | ablation, bench |
+| 5 | DiT elementwise (norms, modulation, gates, residual adds) | ~0.43 s | ~5% | ~1.4 ms per block | derived |
+| 6 | VAE device idle | 0.38 s | 4% | gaps between 3,540 eager graph launches 0.15 s; wait at the end of the decode (last-frame assembly, slower tiles) 0.10 s; one host stall 0.09 s (cause not found); blocking per-frame copies to host 0.04 s | trace |
+| 7 | VAE other small graphs (~170) | 0.33 s | 4% | shortcut and interleave copies, 1x1 and time convs, head conv, attention; not split further | trace |
+| 8 | DiT cross-attention | 0.26 s | 3% | 0.9 ms per block | ablation |
+| 9 | VAE RMS_norm + SiLU (+ cache concat) graphs | 0.23 s | 3% | ~130 GB/s | trace |
+| 10 | DiT QK-norm | 0.19 s | 2% | 0.6 ms per block | ablation |
+| 11 | DiT device idle | 0.19 s | 2% | ~19 ms per step: UniPC step on the CPU plus copies after the head, and host work before the first block | trace |
+| 12 | VAE eager 3x3x3 convs at 15x21 (1 frame per call) | 0.15 s | 2% | 0.72 ms per call; 30% of peak | trace |
+| 13 | DiT RoPE | 0.14 s | 2% | 0.5 ms per block | ablation |
+| 14 | VAE sub-pixel upsample convs | 0.11 s | 1% | 12 graphs | trace |
+| 15 | DiT head (CFG combine), patch and time embedding | 0.04 s | <1% | head 3.3 ms per step | trace |
+
+Sources:
+- trace: rank 0's runtime system trace of one full pipeline run (`NUM_RUNS=3`; the pipeline run
+  under `scripts/prof/rank_env.sh` with `SYSTRACE_DIR=<dir> SYSTEM_RANKS=0 PROFILE_RANKS=none`),
+  exported with `scripts/prof/sys_to_parquet.sh` and split with
+  `scripts/prof/sys_phases.py <parquet> 3 300`. The trace names the VAE graphs only by hash; they
+  were identified by calls per decode and time per call, against the call sites and counts from
+  `scripts/validate/vae_op_profile.py` and the convs' FLOP counts. VAE rows are rank 0's tile.
+- ablation: `scripts/validate/block_bench.py sp_lx` with `CFG_PAR=1` and one of `SP_NOCOMM`,
+  `SP_NOQKN`, `SP_NOROPE`, `SP_NOSA`, `SP_NOXA` set to 1, ranks on interleaved cores
+  (`NEURON_RT_VISIBLE_CORES=c,c+2,c+4,c+6,c+1,c+3,c+5,c+7`), compared with the full block
+  (19.80 ms). With all five removed the block takes 10.0 ms.
+- bench: standalone graphs at the block's shapes: `scripts/validate/block_mm_bench.py` (the 8
+  matmuls in one graph, 8.25 ms) and `scripts/validate/sp_cc_bench.py` (per call: all-gather
+  0.83 ms, reduce-scatter 1.18 ms; the 4 all-to-alls of a block 1.01 ms).
+- derived: the block's in-place remainder after the five removals (9.7 ms) minus the matmul bench.
+
+DiT rows are per block x 30 blocks x 10 steps; the two CFG groups run at the same time, so time on
+one rank equals wall time.
 
 ## 704x544, 81 frames (7854 DiT tokens)
 
