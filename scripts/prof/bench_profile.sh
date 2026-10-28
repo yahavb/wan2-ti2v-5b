@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # 3-run Neuron benchmark for Wan2.2-TI2V-5B (run from the repo root inside the job pod).
 #
-#   [1+2] CLEAN   : torchrun, NUM_RUNS=$CLEAN_RUNS, NO profiler. Run 1 compiles/loads (not
-#                   timed); runs 2..N are the real latency.
-#   [3a]  PROFILED: torchrun, runtime inspector, NUM_STEPS=$PROFILE_STEPS. System profile
+#   [1+2] CLEAN   : torchrun, NUM_RUNS=$CLEAN_RUNS, NO profiler. Runs 1..$WARMUP_RUNS warm up
+#                   (run 1 compiles/loads; run 2 still pays NKI kernel traces on the current
+#                   image); the runs after them are the real latency.
+#   [3a]  PROFILED: torchrun, runtime inspector, NUM_RUNS=$PROFILE_RUNS x NUM_STEPS=$PROFILE_STEPS
+#                   (the last run is the steady state; earlier runs are warm-up). System profile
 #                   (trace_info.pb) on every rank; device profile (.ntff, DEVICE_PROFILE_MODE=
 #                   session) on PROFILE_RANKS only. Also the profiler-overhead delta.
 #   [3b]  system timeline -> perfetto
@@ -21,6 +23,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 TP="${TP_DEGREE:-4}"
 CLEAN_RUNS="${CLEAN_RUNS:-3}"
+WARMUP_RUNS="${WARMUP_RUNS:-2}"
+PROFILE_RUNS="${PROFILE_RUNS:-3}"
 PROFILE_STEPS="${PROFILE_STEPS:-2}"
 MAX_SUMMARY="${MAX_SUMMARY:-40}"
 MAX_PAIRS="${MAX_PAIRS:-3}"
@@ -81,8 +85,8 @@ for f in /tmp/neuron_mem_table_device_*_nc_*.log; do
 done
 echo "device OOM lines (Failed to allocate DEVICE): $(grep -c 'Failed to allocate DEVICE' "$RESULTS/clean.log")"
 mapfile -t CS < <(steps_of "$RESULTS/clean.log")
-T_CLEAN=$(printf '%s\n' "${CS[@]:1}" | sort -n | awk '{a[NR]=$1} END{if(NR) print a[int((NR+1)/2)]}')
-echo "CLEAN s/step per run: ${CS[*]:-none}  -> T_CLEAN (median of warm runs) = ${T_CLEAN:-N/A} s/step"
+T_CLEAN=$(printf '%s\n' "${CS[@]:$WARMUP_RUNS}" | sort -n | awk '{a[NR]=$1} END{if(NR) print a[int((NR+1)/2)]}')
+echo "CLEAN s/step per run: ${CS[*]:-none}  -> T_CLEAN (median of runs after the $WARMUP_RUNS warm-up) = ${T_CLEAN:-N/A} s/step"
 cp /tmp/wan2_ti2v_output.mp4 "$RESULTS/output_clean.mp4" 2>/dev/null \
   && echo "VALIDATE THE OUTPUT: $RESULTS/output_clean.mp4 ($GIT_BRANCH@${GIT_SHA:0:8})"
 
@@ -101,12 +105,14 @@ fi
 
 # ═══ [3a] PROFILED (runtime inspector on PROFILE_RANKS) ═══
 SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
-echo "=== [3a] PROFILED: NUM_RUNS=1 NUM_STEPS=$PROFILE_STEPS, inspector on ranks ${PROFILE_RANKS:-0} ==="
-SYSTRACE_DIR="$SYSTRACE" NUM_RUNS=1 NUM_STEPS="$PROFILE_STEPS" \
+echo "=== [3a] PROFILED: NUM_RUNS=$PROFILE_RUNS NUM_STEPS=$PROFILE_STEPS (last run = steady state), inspector on ranks ${PROFILE_RANKS:-0} ==="
+SYSTRACE_DIR="$SYSTRACE" NUM_RUNS="$PROFILE_RUNS" NUM_STEPS="$PROFILE_STEPS" \
   "${LAUNCH[@]}" --no-python bash scripts/prof/rank_env.sh python3 inference_neuron_ti2v.py \
   > "$RESULTS/profiled.log" 2>&1
 echo "profiled exit=$?"
-grep -E "denoising:|DONE:|Error|Traceback|Failed to allocate" "$RESULTS/profiled.log" | tail -10
+grep -E "denoising:|DONE:|Error|Traceback|Failed to allocate" "$RESULTS/profiled.log" | tail -12
+# Wall-clock of each profiled run, to cut the steady-state window out of the system trace.
+grep -E "═══ Run [0-9]+/[0-9]+ (\(|DONE)" "$RESULTS/profiled.log" | sed 's/ INFO.*═══ / /; s/ ═══//' | tee "$RESULTS/profiled_run_windows.txt"
 T_PROF=$(steps_of "$RESULTS/profiled.log" | tail -1)
 echo "  trace_info.pb count: $(find "$SYSTRACE" -name trace_info.pb | wc -l)"
 echo "  .ntff count        : $(find "$SYSTRACE" -name '*.ntff' | wc -l)   size $(du -sh "$SYSTRACE" | cut -f1)"
@@ -255,7 +261,8 @@ fi
 
 echo "════════ SUMMARY ════════"
 echo "  provenance : $GIT_BRANCH@${GIT_SHA:0:8}  TP=$TP LNC=${LNC_CONFIG:-?}"
-echo "  CLEAN      : ${T_CLEAN:-N/A} s/step  (median of warm runs; THE latency)"
+echo "  CLEAN      : ${T_CLEAN:-N/A} s/step  (median of runs after warm-up; THE latency)"
+echo "  CLEAN last : $(grep -oE "Run [0-9]+/[0-9]+ DONE: .*total=[0-9.]+s" "$RESULTS/clean.log" | tail -1)"
 echo "  PROFILED   : ${T_PROF:-N/A} s/step  (inspector on; overhead delta only)"
 echo "  video      : $RESULTS/output_clean.mp4  <- VALIDATE"
 echo "  ranking    : $RESULTS/neff_ranking.txt"
