@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Quality validation of the loop_engineering configuration against main, in one pod.
 #
-# Runs (each NUM_RUNS=2: compile + a warm run that is timed and dumped via DUMP_DIR):
+# Runs (each NUM_RUNS=$RUNS, default 3: compile + warm runs; the last is timed and dumped via DUMP_DIR):
 #   main_code   the main branch checkout, main env              -> mp4 only (main has no DUMP_DIR)
 #   off         this branch, every new flag off (= main env)    -> dump + mp4
 #   exact       as off but exact SDPA on all 30 layers          -> dump (bf16 reference trajectory)
@@ -20,6 +20,7 @@ OUT=/tmp/validate; rm -rf "$OUT"; mkdir -p "$OUT"; echo "$OUT" > /tmp/results_LA
 LAUNCH=(torchrun --nproc_per_node="${TP_DEGREE:-8}" --master_port=29500)
 export MODEL_PATH="${MODEL_PATH:-/tmp/Wan2.2-TI2V-5B}"
 THREADS="${THREADS:-$(nproc)}"
+RUNS="${VALIDATE_RUNS:-3}"  # run 2 can still pay NKI kernel traces; time the last run
 
 MAIN_ENV=(FAST_ATTN_IMPL=constmax FAST_CROSS_IMPL=sdpa CFG_PARALLEL=0 FAST_SP=0 FAST_LOCAL_CROSS=0
           CFG_GROUPS=contiguous VAE_FUSE_NORM=0 VAE_STREAM=0 NKI_CONV3D_SMALL_COUT=0 VAE_SUBPIXEL=0
@@ -31,13 +32,13 @@ LOOP_ENV=(FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte CFG_PARALLEL=1 FAST_SP=1 FAST_L
 VAE_OFF=(VAE_FUSE_NORM=0 NKI_CONV3D_SMALL_COUT=0 VAE_SUBPIXEL=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0)
 VAE_ON=(VAE_FUSE_NORM=1 NKI_CONV3D_SMALL_COUT=1 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1)
 
-run() {  # <name> <dir> <env...> : NUM_RUNS=2 inference in <dir>, dump to $OUT/<name>
+run() {  # <name> <dir> <env...> : NUM_RUNS=$RUNS inference in <dir>, dump to $OUT/<name>
   local name="$1" dir="$2"; shift 2
   echo "=== run $name ($*) ==="
   rm -f /tmp/wan2_ti2v_output.mp4
-  (cd "$dir" && env "$@" NUM_RUNS=2 DUMP_DIR="$OUT/$name" "${LAUNCH[@]}" inference_neuron_ti2v.py) \
+  (cd "$dir" && env "$@" NUM_RUNS="$RUNS" DUMP_DIR="$OUT/$name" "${LAUNCH[@]}" inference_neuron_ti2v.py) \
     > "$OUT/$name.log" 2>&1
-  echo "  exit=$?  $(grep -E 'Run 2/2 DONE' "$OUT/$name.log" | sed 's/.*═══ //; s/ ═══//')"
+  echo "  exit=$?"; grep -E "Run [0-9]+/$RUNS DONE" "$OUT/$name.log" | sed 's/.*═══ /    /; s/ ═══//'
   grep -m3 -E "Traceback|Error" "$OUT/$name.log" | cut -c1-200
   mkdir -p "$OUT/$name"; cp /tmp/wan2_ti2v_output.mp4 "$OUT/$name/output.mp4" 2>/dev/null || true
 }
@@ -75,8 +76,8 @@ python3 scripts/validate/compare.py "$OUT/off" "$OUT/loop" 2>&1 | tee "$OUT/comp
 echo "=== VAE isolated: same latent (loop's), tiled decode with VAE flags off vs on ==="
 for v in off on; do
   if [ "$v" = off ]; then E=("${VAE_OFF[@]}"); else E=("${VAE_ON[@]}"); fi
-  env "${E[@]}" REPS=2 "${LAUNCH[@]}" scripts/validate/vae_tiled_check.py "$OUT/loop" "$OUT/vae_$v" \
-    > "$OUT/vae_$v.log" 2>&1; echo "  vae_$v exit=$? $(grep 'rep 1' "$OUT/vae_$v.log")"
+  env "${E[@]}" REPS="$RUNS" "${LAUNCH[@]}" scripts/validate/vae_tiled_check.py "$OUT/loop" "$OUT/vae_$v" \
+    > "$OUT/vae_$v.log" 2>&1; echo "  vae_$v exit=$?"; grep -E 'rep [0-9]+:' "$OUT/vae_$v.log" | sed 's/^/    /'
 done
 echo "  VAE on vs off frames: $(python3 -c "import numpy as np,sys; a,b=(np.load(f'$OUT/vae_{x}/frames.npy') for x in ('off','on')); print('IDENTICAL' if np.array_equal(a,b) else 'DIFFERENT, max |diff| %d' % np.abs(a.astype(int)-b).max())" 2>&1)"
 echo "=== VAE vs exact fp32 CPU decode (untiled) ==="
@@ -101,8 +102,8 @@ P_LOOP=$(grep -E "^ *loop:" "$OUT/compare_vs_exact.txt" | grep -oE "video PSNR +
 W_LOOP=$(grep -E "^ *loop:" "$OUT/compare_vs_exact.txt" | grep -oE "worst frame +[0-9.]+" | grep -oE "[0-9.]+$")
 V_OFF=$(grep "vae_off/frames" "$OUT/vae_fp32.txt" | grep -oE "PSNR [0-9.]+" | grep -oE "[0-9.]+$")
 V_ON=$(grep "vae_on/frames" "$OUT/vae_fp32.txt" | grep -oE "PSNR [0-9.]+" | grep -oE "[0-9.]+$")
-T_OFF=$(grep -oE "Run 2/2 DONE.*total=[0-9.]+" "$OUT/off.log" | grep -oE "[0-9.]+$")
-T_LOOP=$(grep -oE "Run 2/2 DONE.*total=[0-9.]+" "$OUT/loop.log" | grep -oE "[0-9.]+$")
+T_OFF=$(grep -oE "Run $RUNS/$RUNS DONE.*total=[0-9.]+" "$OUT/off.log" | grep -oE "[0-9.]+$")
+T_LOOP=$(grep -oE "Run $RUNS/$RUNS DONE.*total=[0-9.]+" "$OUT/loop.log" | grep -oE "[0-9.]+$")
 python3 - "$S_OFF" "$S_EX" "$S_LOOP" "$P_OFF" "$P_LOOP" "$W_LOOP" "$V_OFF" "$V_ON" "$T_OFF" "$T_LOOP" "$B_MAIN" "$B_DET" <<'PY' | tee "$OUT/VERDICT.txt"
 import sys
 f = lambda s: float(s) if s not in ("", None) else None
