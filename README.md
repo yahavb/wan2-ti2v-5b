@@ -6,7 +6,18 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**Versus GPUs** (5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **8.7s** total
+(denoise 6.0s = 0.60 s/step, VAE 2.6s), down from 16.2s on `main` with the same image and SDK —
+**1.95x faster than A100** (16.92s), 1.08x slower than H100 (8.02s). DiT changes: nkilib
+`attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
+cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard,
+UniPC scheduler step on the device. VAE: RMS_norm + SiLU compiled as one graph together with the
+causal-cache concat; head conv on nkilib; upsample convs in sub-pixel form; tile blend and mp4
+encode streamed during the decode, encoder spawned with vfork.
+Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0487 (`main` const-max: 0.0474,
+exact SDPA: 0.0485). See RESULTS.md.
+
+**Versus GPUs** (`main`, 5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
 
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
 warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
@@ -135,7 +146,17 @@ FastAPI server on port 8000:
 | `TP_DEGREE` | 8 | DiT tensor parallelism degree (= torchrun ranks) |
 | `SP_DEGREE` | 1 | Sequence parallelism (original path only; must be 1 with `DIT_FAST=1`) |
 | `DIT_FAST` | 1 | Block-compiled DiT with in-graph all-reduces + batched CFG; 0 = original eager path |
-| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel), `nki` (this repo's kernels), or `constmax` (odyssey-trainium const-max self-attention, `kernels/attention_const_max.py`) |
+| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel), `nki` (this repo's kernels), `constmax` (odyssey-trainium const-max self-attention, `kernels/attention_const_max.py`), or `cte` (nkilib `attention_cte`: exact online-softmax flash attention, 3.5x faster than sdpa per call at 7854 tokens) |
+| `FAST_CROSS_IMPL` | sdpa | Cross-attention for the non-`nki` impls: `sdpa` or `cte` |
+| `CFG_PARALLEL` | 0 | 1 = two TP groups of world/2 ranks: ranks 0-3 run the cond branch, 4-7 the uncond branch, batch 1 each; the head combines them over rank pairs (i, i+4) |
+| `FAST_SP` | 0 | 1 = Megatron-style sequence parallelism inside the TP group (`_FastBlockSP`): token-sharded residual stream, all-gather before / reduce-scatter after the TP matmuls |
+| `FAST_LOCAL_CROSS` | 0 | 1 (needs `CFG_PARALLEL=1 FAST_SP=1`) = cross-attention on each rank's token shard with all heads and unsharded weights: no collectives, +2.3 GB HBM per rank |
+| `CFG_GROUPS` | contiguous | With `CFG_PARALLEL=1`: `contiguous` = cond ranks 0-3 / uncond 4-7; `interleave` = cond 0,2,4,6 / uncond 1,3,5,7 (each group spans every HBM stack; 4% faster DiT, same output) |
+| `VAE_FUSE_NORM` | 0 | 1 = every VAE RMS_norm + SiLU pair runs as one `torch.compile`d graph (VAE decode 3.7 -> 2.9 s per tile) |
+| `STEP_TIMING` | 0 | 1 = rank 0 logs per denoising step how long it waited for the DiT and how long the host-side scheduler round trip took |
+| `FAST_TIMING` | 0 | 1 = device-synced per-block timing log (diagnostic; adds syncs) |
+| `DUMP_DIR` | unset | Rank 0 saves the last run's final latent, uint8 frames and step-0 noise prediction (for comparing configurations; outside the timers) |
+| `RUN_HASH`, `RUN_HASH_KEEP` | 0, unset | Determinism probe: after each run's timers every rank logs an md5 of its final latent and rank 0 of the mp4; after the last run, md5s of the encoder outputs, cross-attention K/V and per-parameter weight sums. `RUN_HASH_KEEP=<prefix>` keeps each run's mp4 as `<prefix>_run<i>.mp4` |
 | `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |
 | `CONST_MAX_LAYERS`, `CONST_MAX_HARD_LIMIT` | auto, 70 | `auto`: const-max only on layers whose worst-case score (from QK-norm weights) stays under the kernel's clip; others use sdpa. Or `all`, or a comma list |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
@@ -144,13 +165,21 @@ FastAPI server on port 8000:
 | `FRAME_NUM` | 81 | Output frames (must be 4k+1) |
 | `MP4_PRESET`, `MP4_CRF` | veryfast, 20 | x264 settings for the output mp4 (imageio default medium/25 is ~8x slower) |
 | `NUM_STEPS` | 10 | Denoising steps |
-| `NUM_RUNS` | 2 | Iterations per process (run 1 compiles) |
+| `NUM_RUNS` | 2 | Iterations per process (run 1 compiles and loads; run 2 on is warm) |
 | `T5_RANK` | 2 | Rank hosting the T5 encoder (clamped to world size) |
 | `VAE_TP_DEGREE` | 1 | VAE channel parallelism |
 | `USE_NKI_KERNELS` | 1 | Load NKI kernels for DiT attention (used by `FAST_ATTN_IMPL=nki` and the original path) |
 | `USE_NKI_VAE` | 0 | NKI kernels for VAE (disabled pending SDK migration) |
 | `VAE_FULLGRAPH` | 0 | fullgraph=True for the VAE compile |
 | `VAE_TILED`, `VAE_TILE_OVERLAP` | 0, 8 (job: 4) | Decode overlapping spatial tiles on all ranks, blend on rank 0 (`models/vae_tiled.py`); overlap in latent units |
+| `NKI_CONV3D_SMALL_COUT` | 0 | 1 = the nkilib conv3d gate also takes convs with C_out < 96 (the VAE decoder head, 256 -> 12); rel-RMS 2.3e-5 vs eager |
+| `VAE_SUBPIXEL` | 0 | 1 (with `USE_NKI_CONV3D=1`) = each upsample conv (nearest-2x + 3x3) runs as four 2x2 nkilib convs on the low-res frames, one per output phase, plus one interleave copy (2.25x fewer MACs; 44.68 vs 44.69 dB against the exact fp32 decode) |
+| `VAE_FUSE_CAT` | 0 | 1 (with `VAE_FUSE_NORM=1`) = the compiled RMS_norm + SiLU in front of each nkilib causal conv also writes the 2 cached frames in front and returns the next cache, replacing the eager concat, clone and time pad (bit-identical) |
+| `DEVICE_SCHEDULER` | 0 | 1 (with `DIT_FAST=1`) = the UniPC step runs on the device tensors (`models/device_unipc.py`, coefficients on the CPU as upstream): no per-step device-host round trip; bit-identical to the CPU scheduler |
+| `MP4_VFORK` | 0 | 1 = start the mp4 encoder without imageio's `preexec_fn`, so Python spawns ffmpeg with vfork instead of forking the whole process (a fork stalled the device ~90 ms once per decode) |
+| `VAE_FUSE_RES` | 0 | 1 (with `VAE_FUSE_CAT=1`) = each ResidualBlock's last conv adds the shortcut inside the nkilib kernel (`residual_add_loc`, installed nkilib) instead of a separate eager add |
+| `VAE_FUSE_SHORTCUT` | 0 | 1 = in each upsample stage, the duplicate-upsample shortcut (repeat_interleave + permute) and its add run as one compiled graph, without cloning the stage input; bit-identical |
+| `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |
 | `CLEAN_RUNS`, `PROFILE_STEPS`, `PROFILE_RANKS`, `MAX_PAIRS` | 3, 2, 0, 3 | Benchmark/profiling harness (`scripts/prof/bench_profile.sh`) |

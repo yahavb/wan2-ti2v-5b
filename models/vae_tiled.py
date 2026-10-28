@@ -117,4 +117,103 @@ def decode_tiled(vae, z, cpu_group, overlap=8):
     return out
 
 
-__all__ = ["decode_tiled", "tile_grid"]
+def _wait_for(path, deadline):
+    while not os.path.exists(path):
+        if time.time() > deadline:
+            raise TimeoutError(f"tile chunk {path} never arrived")
+        time.sleep(0.001)
+
+
+def _assemble(tag, tiles, ys, xs, th, tw, s, h, w, n_chunks, writer, finish, done):
+    """Rank 0 helper thread: for each latent-frame chunk, sum the 8 weighted tile pieces into
+    place (same order and math as decode_tiled), convert to uint8 frames via finish(), and feed
+    them to the mp4 writer. done = dict that receives frames / timing / the first exception."""
+    try:
+        deadline = time.time() + 600
+        frames = []
+        for c in range(n_chunks):
+            acc = None
+            for k, (i, j) in enumerate(tiles):
+                path = f"{tag}_{k}_{c}.bin"
+                _wait_for(path, deadline)
+                part = torch.from_numpy(np.fromfile(path, dtype=np.int16)).view(torch.bfloat16)
+                part = part.view(3, -1, th * s, tw * s)
+                if acc is None:
+                    acc = torch.zeros(3, part.shape[1], h * s, w * s)
+                acc[:, :, ys[i] * s:ys[i] * s + th * s, xs[j] * s:xs[j] * s + tw * s] += part.float()
+                os.remove(path)
+            if c == n_chunks - 1:
+                done["t_last_chunk"] = time.time()
+            v = finish(acc.clamp_(-1, 1))  # [f, H, W, 3] uint8 numpy
+            for fr in v:
+                writer.append_data(fr)
+            frames.append(v)
+        t0 = time.time()
+        writer.close()
+        done["t_close"] = time.time() - t0
+        done["frames"] = np.concatenate(frames, 0)
+    except BaseException as ex:  # noqa: BLE001 - re-raised by the caller
+        done["error"] = ex
+
+
+def decode_tiled_stream(vae, z, cpu_group, overlap, make_writer, finish):
+    """decode_tiled() that streams: every rank ships each decoded latent-frame chunk of its tile
+    (weighted, bf16) to shared memory right away, and a rank-0 thread blends chunk by chunk and
+    feeds the frames to the mp4 encoder while the tiles are still decoding. The blend is the same
+    per-element math as decode_tiled, so the frames are identical.
+    make_writer(): returns an imageio-style writer (append_data / close), called on rank 0.
+    finish(acc): blended [3, f, H, W] float32 chunk -> uint8 numpy [f, H, W, 3].
+    Returns the uint8 video [F, H, W, 3] on rank 0 (already written by the writer), None elsewhere.
+    """
+    import threading
+    rank, world = dist.get_rank(), dist.get_world_size()
+    _, n_chunks, h, w = z.shape
+    th, tw, ys, xs = tile_grid(h, w, world, overlap)
+    tiles = [(i, j) for i in range(len(ys)) for j in range(len(xs))]
+    _CALL[0] += 1
+    tag = f"{SHM_DIR}/wan_vae_stream_{os.getppid()}_{_CALL[0]}"
+    done, thread = {}, None
+    if rank == 0:
+        thread = threading.Thread(
+            target=_assemble, args=(tag, tiles, ys, xs, th, tw, 16, h, w, n_chunks, make_writer(),
+                                    finish, done), daemon=True)
+        thread.start()
+    t0 = time.time()
+
+    def ship(k, c, part):
+        p = f"{tag}_{k}_{c}.bin"
+        part.cpu().view(torch.int16).numpy().tofile(p + ".tmp")
+        os.rename(p + ".tmp", p)  # atomic: the reader never sees a partial file
+
+    for k, (i, j) in enumerate(tiles):
+        if k % world != rank:
+            continue
+        zt = z[:, :, ys[i]:ys[i] + th, xs[j]:xs[j] + tw].contiguous()
+        wt, pending = None, None
+        for c, out in enumerate(vae.decode_chunks(zt)):  # [3, f, th*s, tw*s] on device
+            if wt is None:
+                s = out.shape[-1] // tw
+                assert s == 16, s
+                wt = _weights(tiles, ys, xs, th, tw, s, overlap * s, h * s, w * s)[k]
+                wt = wt.to(out.device, out.dtype)
+            part = (out * wt).to(torch.bfloat16)
+            if pending is not None:  # copy the previous chunk while this one is queued
+                ship(k, *pending)
+            pending = (c, part)
+        ship(k, *pending)
+    t_dec = time.time() - t0
+    gathered = [None] * world if rank == 0 else None
+    dist.gather_object(t_dec, gathered, dst=0, group=cpu_group)
+    if rank != 0:
+        return None
+    t1 = time.time()
+    thread.join()
+    if "error" in done:
+        raise done["error"]
+    print(f"[vae_tiled] stream tiles={len(tiles)} ({th}x{tw} latent, overlap {overlap}) decode "
+          f"max/min over ranks={max(gathered):.2f}/{min(gathered):.2f}s; tail after decode "
+          f"{time.time() - t1:.2f}s (writer close {done['t_close']:.2f}s)", flush=True)
+    return done["frames"]
+
+
+__all__ = ["decode_tiled", "decode_tiled_stream", "tile_grid"]
