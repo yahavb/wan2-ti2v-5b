@@ -139,12 +139,12 @@ spec:
             claims:
               - name: s-lnc1
             requests:
-              cpu: 88
-              memory: 880Gi
+              cpu: 24
+              memory: 300Gi
               ephemeral-storage: 120Gi
             limits:
-              cpu: 180
-              memory: 1800Gi
+              cpu: 32
+              memory: 400Gi
               ephemeral-storage: 200Gi
           volumeMounts:
             - name: dshm
