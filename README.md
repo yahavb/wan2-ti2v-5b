@@ -6,7 +6,14 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**Versus GPUs** (5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **10.8s** total
+(denoise 6.4s = 0.64 s/step, VAE 4.4s), down from 16.2s on `main` with the same image and SDK —
+**1.57x faster than A100** (16.92s), 1.35x slower than H100 (8.02s). DiT changes: nkilib
+`attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4), Megatron-style
+sequence parallelism, cross-attention local to each rank's token shard. Step-0 noise prediction vs
+an fp32 CPU reference: rel-RMS 0.0484 (`main` const-max: 0.0474, exact SDPA: 0.0485). See RESULTS.md.
+
+**Versus GPUs** (`main`, 5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
 
 All numbers: one trn2 NeuronDevice (8 physical NeuronCores), 10 denoising steps, CFG on,
 warm run (after compile). Same prompt/image/seed. Fast DiT rows measured 2026-10-10 on the `fast-dit` branch (now merged to `main`);
@@ -135,7 +142,13 @@ FastAPI server on port 8000:
 | `TP_DEGREE` | 8 | DiT tensor parallelism degree (= torchrun ranks) |
 | `SP_DEGREE` | 1 | Sequence parallelism (original path only; must be 1 with `DIT_FAST=1`) |
 | `DIT_FAST` | 1 | Block-compiled DiT with in-graph all-reduces + batched CFG; 0 = original eager path |
-| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel), `nki` (this repo's kernels), or `constmax` (odyssey-trainium const-max self-attention, `kernels/attention_const_max.py`) |
+| `FAST_ATTN_IMPL` | sdpa | `sdpa` (TorchNeuron flash kernel), `nki` (this repo's kernels), `constmax` (odyssey-trainium const-max self-attention, `kernels/attention_const_max.py`), or `cte` (nkilib `attention_cte`: exact online-softmax flash attention, 3.5x faster than sdpa per call at 7854 tokens) |
+| `FAST_CROSS_IMPL` | sdpa | Cross-attention for the non-`nki` impls: `sdpa` or `cte` |
+| `CFG_PARALLEL` | 0 | 1 = two TP groups of world/2 ranks: ranks 0-3 run the cond branch, 4-7 the uncond branch, batch 1 each; the head combines them over rank pairs (i, i+4) |
+| `FAST_SP` | 0 | 1 = Megatron-style sequence parallelism inside the TP group (`_FastBlockSP`): token-sharded residual stream, all-gather before / reduce-scatter after the TP matmuls |
+| `FAST_LOCAL_CROSS` | 0 | 1 (needs `CFG_PARALLEL=1 FAST_SP=1`) = cross-attention on each rank's token shard with all heads and unsharded weights: no collectives, +2.3 GB HBM per rank |
+| `FAST_TIMING` | 0 | 1 = device-synced per-block timing log (diagnostic; adds syncs) |
+| `DUMP_DIR` | unset | Rank 0 saves the last run's final latent, uint8 frames and step-0 noise prediction (for comparing configurations; outside the timers) |
 | `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |
 | `CONST_MAX_LAYERS`, `CONST_MAX_HARD_LIMIT` | auto, 70 | `auto`: const-max only on layers whose worst-case score (from QK-norm weights) stays under the kernel's clip; others use sdpa. Or `all`, or a comma list |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |

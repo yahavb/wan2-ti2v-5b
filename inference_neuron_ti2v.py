@@ -60,8 +60,21 @@ USE_NST_SELF_ATTN = os.environ.get("USE_NST_SELF_ATTN", "0") == "1"
 # DIT_FAST=1: block-compiled DiT with in-graph collectives + batched CFG (models/fast_dit.py).
 # DIT_FAST=0: original eager path (per-FFN NEFFs, eager all-reduces, 2 forwards/step).
 DIT_FAST = os.environ.get("DIT_FAST", "1") == "1"
+# CFG_PARALLEL=1 (DIT_FAST only): split the ranks into two TP groups of world/2; group 0 runs the
+# cond branch, group 1 the uncond branch, each at batch 1. Halves the bytes of every TP
+# all-reduce and shrinks the group; the two predictions are combined in the head.
+CFG_PARALLEL = os.environ.get("CFG_PARALLEL", "0") == "1"
 
 NEURON_DEVICE = torch.device("neuron")
+# DUMP_DIR: rank 0 saves the last run's final latent (latent.pt) and uint8 frames (frames.npy)
+# there, for comparing configurations numerically. Not timed (outside the convert timer).
+DUMP_DIR = os.environ.get("DUMP_DIR", "")
+
+
+def _dump_outputs(out_dir, latent, video_np):
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(latent.detach().float().cpu(), os.path.join(out_dir, "latent.pt"))
+    np.save(os.path.join(out_dir, "frames.npy"), video_np)
 
 
 def setup_distributed():
@@ -200,9 +213,29 @@ def main():
     model.eval().requires_grad_(False)
 
     # Initialize TP group and shard model
-    init_tp_group(tp_degree=TP_DEGREE, sp_degree=SP_DEGREE)
+    dit_tp = TP_DEGREE // 2 if CFG_PARALLEL else TP_DEGREE
+    init_tp_group(tp_degree=dit_tp, sp_degree=SP_DEGREE)
     tp_rank = get_tp_rank()
-    shard_model_tp(model, tp_rank, TP_DEGREE)
+    # FAST_LOCAL_CROSS=1 (with CFG_PARALLEL + FAST_SP): keep an unsharded copy of every block's
+    # cross-attention so it runs on the token shard with all heads, without collectives.
+    full_cross = None
+    if DIT_FAST and CFG_PARALLEL and os.environ.get("FAST_SP", "0") == "1" \
+            and os.environ.get("FAST_LOCAL_CROSS", "0") == "1":
+        import copy
+        full_cross = [copy.deepcopy(b.cross_attn).to(torch.bfloat16) for b in model.blocks]
+    shard_model_tp(model, tp_rank, dit_tp)
+    cfg_group, pair_group = None, None
+    if CFG_PARALLEL:
+        assert DIT_FAST and SP_DEGREE == 1 and world_size == TP_DEGREE and TP_DEGREE % 2 == 0, \
+            "CFG_PARALLEL needs DIT_FAST=1, SP_DEGREE=1 and an even world size"
+        cfg_group = rank // dit_tp
+        for i in range(dit_tp):  # every rank creates every pair group, same order
+            g = dist.new_group([i, i + dit_tp])
+            if rank % dit_tp == i:
+                pair_group = g
+        if rank == 0:
+            logger.info(f"CFG_PARALLEL=1: TP groups of {dit_tp} (cond ranks 0-{dit_tp - 1}, "
+                        f"uncond ranks {dit_tp}-{2 * dit_tp - 1})")
 
     # Patch self-attention for SP if enabled
     if SP_DEGREE > 1:
@@ -210,6 +243,11 @@ def main():
         patch_model_for_sp(model)
 
     # Cast to bf16 then move to Neuron (Conv3d requires matching weight/bias/input dtypes)
+    if full_cross is not None:
+        # The sharded cross-attention is unused in this mode; drop its weights before the move.
+        for b in model.blocks:
+            for lin_ in (b.cross_attn.q, b.cross_attn.k, b.cross_attn.v, b.cross_attn.o):
+                lin_.weight = torch.nn.Parameter(lin_.weight.new_empty(0), requires_grad=False)
     model = model.to(torch.bfloat16)
     model = model.to(NEURON_DEVICE)
     if rank == 0:
@@ -389,12 +427,16 @@ def main():
     arg_null = {'context': [context_null[0][0]], 'seq_len': seq_len}
 
     fast_dit = None
+    if full_cross is not None:
+        # Moved only now, after T5 was freed: rank T5_RANK shares an HBM stack with a neighbour.
+        full_cross = [fc.to(NEURON_DEVICE).eval().requires_grad_(False) for fc in full_cross]
     if DIT_FAST:
         from models.fast_dit import FastWanDiT
         grid = (T_latent, H_latent // patch_size[1], W_latent // patch_size[2])
         assert grid[0] * grid[1] * grid[2] == seq_len, f"grid {grid} != seq_len {seq_len}"
         fast_dit = FastWanDiT(model, grid=grid, guide_scale=config.sample_guide_scale,
-                              device=NEURON_DEVICE)
+                              device=NEURON_DEVICE, cfg_group=cfg_group, pair_group=pair_group,
+                              full_cross=full_cross)
         fast_dit.set_context(context[0], context_null[0])
 
     # Save original latent for re-use across runs
@@ -416,6 +458,7 @@ def main():
         sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
         timesteps = sample_scheduler.timesteps
 
+        dump_step0 = None
         run_start = time.time()
         denoise_start = time.time()
         for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
@@ -436,8 +479,11 @@ def main():
                 noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
 
             # Scheduler step on CPU
+            noise_pred_cpu = noise_pred.cpu()
+            if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
+                dump_step0 = (latent.cpu(), noise_pred_cpu, float(t))  # same input in every config
             temp_x0 = sample_scheduler.step(
-                noise_pred.cpu().unsqueeze(0), t,
+                noise_pred_cpu.unsqueeze(0), t,
                 latent.cpu().unsqueeze(0),
                 return_dict=False, generator=seed_g)[0]
             latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
@@ -450,6 +496,7 @@ def main():
                 fast_dit.log_graph_breaks()
 
         # ── Decode with VAE ──
+        dump_video = None
         vae_start = time.time()
         if VAE_TP_DEGREE > 1 and rank in VAE_TP_RANKS:
             # VAE TP decode: all VAE TP ranks decode together (sharded channels)
@@ -487,6 +534,7 @@ def main():
                 # ((v * 0.5 + 0.5) * 255).byte(), without the extra full-size temporaries.
                 video_np = crop_video(video).add_(1).mul_(127.5).to(torch.uint8)
                 video_np = video_np.permute(1, 2, 3, 0).contiguous().numpy()  # [F, H, W, C]
+                dump_video = video_np
                 t_c = time.time()
                 imageio.mimwrite(output_path, list(video_np), fps=24, codec='libx264', **MP4_KW)
                 logger.info(f"Video saved to {output_path} ({len(video_np)} frames); "
@@ -511,6 +559,12 @@ def main():
         vae_time = time.time() - vae_start
         run_time = time.time() - run_start
 
+        if rank == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1 and dump_video is not None:
+            _dump_outputs(DUMP_DIR, latent, dump_video)  # after the timers
+            torch.save({"latent_in": dump_step0[0].float(), "noise_pred": dump_step0[1].float(),
+                        "t": dump_step0[2], "ctx": context[0][0].float().cpu(),
+                        "ctx_null": context_null[0][0].float().cpu()},
+                       os.path.join(DUMP_DIR, "step0.pt"))
         if rank == 0:
             logger.info(f"═══ {run_label} DONE: denoise={denoise_time:.1f}s, vae={vae_time:.1f}s, total={run_time:.1f}s ═══")
             run_results.append({

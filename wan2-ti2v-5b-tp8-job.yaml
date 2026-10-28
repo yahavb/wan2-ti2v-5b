@@ -29,7 +29,7 @@ spec:
               set -euxo pipefail
 
               cd /tmp
-              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
+              git clone -b loop_engineering https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/wan2-ti2v-5b.git
               cd wan2-ti2v-5b
 
               # New SDK 2.31 DLC image does NOT auto-activate a venv -> `uv pip install`
@@ -199,7 +199,15 @@ spec:
             - name: DIT_FAST
               value: "1"
             - name: FAST_ATTN_IMPL
-              value: "constmax"
+              value: "cte"
+            - name: FAST_CROSS_IMPL
+              value: "cte"
+            - name: CFG_PARALLEL
+              value: "1"
+            - name: FAST_SP
+              value: "1"
+            - name: FAST_LOCAL_CROSS
+              value: "1"
             - name: CONST_MAX_SOFTMAX_MAX
               value: "15.0"
             - name: CONST_MAX_LAYERS

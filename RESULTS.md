@@ -3,6 +3,35 @@
 All runs: one trn2 NeuronDevice, 10 denoising steps, CFG on, same prompt/image/seed.
 Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 
+## `loop_engineering` branch (2026-10-28), 704x544, 81 frames, TP over 8 ranks LNC1
+
+Image `concourse-release-0461d3b:latest` pushed 2026-10-09 (torch 2.14.0, torch-neuronx 2.14.3,
+neuronx-cc 2.28.4568, nki 0.7.0), run in Docker on a trn2.48xlarge, one device. Warm run 3 of 3.
+"Accuracy" = rel-RMS of the step-0 CFG noise prediction against an fp32 CPU run of the same model on
+the same input (`scripts/validate/ref_fp32.py`, on a `DUMP_DIR` dump): every bf16 configuration lands at ~0.048, so this checks
+that a change adds no error beyond bf16. Videos checked visually on frames 20/50/80.
+
+| Change (cumulative) | s/step | Denoise | VAE | Total | Accuracy |
+|---|---|---|---|---|---|
+| `main@feb083d` (const-max 22/30 layers + sdpa, TP=8, batch-2 CFG) | 1.20 | 12.0s | 4.3s | 16.2s | 0.0474 |
+| exact SDPA on all 30 layers (reference) | 1.92 | 19.2s | — | — | 0.0485 |
+| nkilib `attention_cte` self-attention, all 30 layers | 0.94 | 9.4s | 4.4s | 13.7s | — |
+| + `attention_cte` cross-attention | 0.90 | 9.0s | 4.1s | 13.2s | 0.0482 |
+| + CFG-parallel: 2 groups x TP4, batch 1 each | 0.76 | 7.6s | 4.3s | 11.9s | 0.0483 |
+| + Megatron sequence parallelism (AG/RS around the TP matmuls) | 0.68 | 6.8s | 4.4s | 11.1s | 0.0477 |
+| + cross-attention local to the token shard (all heads, no collectives) | **0.64** | **6.4s** | 4.4s | **10.8s** | 0.0484 |
+
+Env for the last row: `CFG_PARALLEL=1 FAST_SP=1 FAST_LOCAL_CROSS=1 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte`.
+
+Per-call attention microbench (one core, 6 heads x 7854 tokens, d=128, layer-25 QK-norm gammas):
+sdpa 18.2 ms, const-max 5.8 ms, `attention_cte` 5.3 ms, all at bf16-level error (rel-RMS 0.0055
+vs fp32). Per-block (TP4, batch 1): 29.4 ms (TP8 batch 2) -> 24.5 (CFG-parallel) -> 21.9 (+SP) -> 20.6 ms (+local cross).
+
+Tried and rejected (block bench unless noted): chunking the in-graph all-reduces (29.4 -> 36.4 ms),
+`NEURON_COMPILER_OPT_LEVEL=-O3` (no change), frame-chunked sequence split inside the block
+(24.4 -> 24.8/27.1 ms), pre-transposed weights (25.7 ms), fused QKV projection and a [real|imag]
+RoPE layout (both within 0.1 ms), TP8 + SP instead of CFG-parallel (23.7 vs 21.9 ms).
+
 ## 704x544, 81 frames (7854 DiT tokens)
 
 | Commit | Change | Layout | s/step | Denoise | VAE | Total | Video |
