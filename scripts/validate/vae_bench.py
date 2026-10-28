@@ -3,7 +3,7 @@
 Decodes a [48, 21, TH, TW] latent (default 15x21 = the 8-rank tiled decode's tile) the same way
 models/vae_tiled.py does (vae.decode -> model.decode, 21 causal chunks), with device syncs
 around each top-level decoder stage, accumulated over the chunks.
-Usage: python3 vae_bench.py   Env: TH (15), TW (21), REPS (2), USE_NKI_CONV3D=1 ...
+Usage: python3 vae_bench.py   Env: TH (15), TW (21), REPS (2), UNTIMED_REPS (1), USE_NKI_CONV3D=1 ...
 """
 import os
 import sys
@@ -75,13 +75,14 @@ def main():
             for k, v in acc.items():
                 print(f"    {k:<28} {v * 1e3:8.1f} ms  ({counts[k]} calls, {100 * v / s:5.1f}%)", flush=True)
             print(f"    {'sum of stages':<28} {s * 1e3:8.1f} ms; untimed remainder {1e3 * (tot - s):.1f} ms", flush=True)
-    # untimed (no per-stage syncs) decode, the production number
-    sync()
-    t0 = time.perf_counter()
-    out = vae.decode([z])[0]
-    t_host = time.perf_counter() - t0  # host-side enqueue time (device runs async)
-    sync()
-    print(f"[vae_bench] untimed decode {time.perf_counter() - t0:.3f}s (host enqueue {t_host:.3f}s)", flush=True)
+    # untimed (no per-stage syncs) decodes, the production number (UNTIMED_REPS of them)
+    for _ in range(int(os.environ.get("UNTIMED_REPS", "1"))):
+        sync()
+        t0 = time.perf_counter()
+        out = vae.decode([z])[0]
+        t_host = time.perf_counter() - t0  # host-side enqueue time (device runs async)
+        sync()
+        print(f"[vae_bench] untimed decode {time.perf_counter() - t0:.3f}s (host enqueue {t_host:.3f}s)", flush=True)
     ref = os.environ.get("VAE_REF_OUT")
     if ref:  # compare against a saved output of another configuration (exactness check)
         o = out.float().cpu()

@@ -39,7 +39,7 @@ byte-identical mp4: the decode, blend and uint8 conversion do the same per-eleme
 chunk by chunk; what it removes is the 0.53 s that ran after the decode (collect+sum 0.16 s,
 convert 0.03 s, mp4 write 0.34 s), leaving a 0.07-0.12 s tail.
 
-VAE conv changes, one 15x21 tile on one core (one latent frame per decoder call, as in the
+VAE conv changes, one 15x21 tile on one core (`scripts/validate/vae_bench.py`, `UNTIMED_REPS=3`; one latent frame per decoder call, as in the
 pipeline; four jobs on one device): 2.72 s -> 2.61-2.67 s with the head conv on nkilib (eager was
 the only non-nkilib 3x3x3 conv at full tile resolution; rel-RMS 2.3e-5 vs eager) -> 2.47-2.53 s
 adding sub-pixel upsample convs -> 2.35 s adding `VAE_FUSE_CAT`. Sub-pixel: nearest-2x followed by a
@@ -55,7 +55,7 @@ Exact (seam-free) tiling, measured but not built: a non-overlapping 6x34 strip d
 on one core and an 11x17 tile in 1.62 s, vs 2.35 s for today's overlap-4 15x21 tile. Exactness
 needs a 1-px halo exchange before every 3x3 conv (~33 per latent frame, ~690 per decode) plus a K/V
 all-gather for the middle attention. In-graph exchange fused into the norm graph
-(`.remote/halo_bench.py`, 8 ranks) costs +0.34/+0.44/+0.75/+3.30 ms per conv for 4x2 tiles at
+(`scripts/validate/halo_bench.py`, 8 ranks; `MODE=strips` for the strips) costs +0.34/+0.44/+0.75/+3.30 ms per conv for 4x2 tiles at
 1x/2x/4x/8x resolution and +0.24/+0.54/+1.91/+1.76 ms for 8x1 strips: ~0.65 s per decode, which
 cancels the 0.7 s of saved compute. Wider halos exchanged every few convs could net ~0.3 s.
 
