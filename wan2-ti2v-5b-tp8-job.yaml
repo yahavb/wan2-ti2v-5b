@@ -232,6 +232,8 @@ spec:
               value: "1"
             - name: VAE_TCHUNK
               value: "2"
+            - name: VAE_STRIPS
+              value: "1"
             - name: DEVICE_SCHEDULER
               value: "1"
             - name: MP4_VFORK

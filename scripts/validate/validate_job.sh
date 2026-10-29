@@ -25,14 +25,14 @@ RUNS="${VALIDATE_RUNS:-3}"  # run 2 can still pay NKI kernel traces; time the la
 MAIN_ENV=(FAST_ATTN_IMPL=constmax FAST_CROSS_IMPL=sdpa CFG_PARALLEL=0 FAST_SP=0 FAST_LOCAL_CROSS=0
           FAST_A2A_O=0 FAST_NKI_MLP=0 FAST_MOD_SPLIT=0
           CFG_GROUPS=contiguous VAE_FUSE_NORM=0 VAE_STREAM=0 NKI_CONV3D_SMALL_COUT=0 VAE_SUBPIXEL=0
-          VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1 DEVICE_SCHEDULER=0 MP4_VFORK=0)
+          VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1 VAE_STRIPS=0 DEVICE_SCHEDULER=0 MP4_VFORK=0)
 EXACT_ENV=("${MAIN_ENV[@]}" FAST_ATTN_IMPL=sdpa)
 LOOP_ENV=(FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte CFG_PARALLEL=1 FAST_SP=1 FAST_LOCAL_CROSS=1
           FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1
           CFG_GROUPS=interleave VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1 VAE_SUBPIXEL=1
-          VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1)
-VAE_OFF=(VAE_FUSE_NORM=0 NKI_CONV3D_SMALL_COUT=0 VAE_SUBPIXEL=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1)
-VAE_ON=(VAE_FUSE_NORM=1 NKI_CONV3D_SMALL_COUT=1 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2)
+          VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 VAE_STRIPS=1 DEVICE_SCHEDULER=1 MP4_VFORK=1)
+VAE_OFF=(VAE_FUSE_NORM=0 NKI_CONV3D_SMALL_COUT=0 VAE_SUBPIXEL=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1 VAE_STRIPS=0)
+VAE_ON=(VAE_FUSE_NORM=1 NKI_CONV3D_SMALL_COUT=1 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 VAE_STRIPS=1)
 
 run() {  # <name> <dir> <env...> : NUM_RUNS=$RUNS inference in <dir>, dump to $OUT/<name>
   local name="$1" dir="$2"; shift 2
@@ -75,7 +75,7 @@ python3 scripts/validate/compare.py "$OUT/exact" "$OUT/off" "$OUT/loop" 2>&1 | t
 echo "=== full trajectory: loop vs off (= main) ==="
 python3 scripts/validate/compare.py "$OUT/off" "$OUT/loop" 2>&1 | tee "$OUT/compare_vs_off.txt"
 
-echo "=== VAE isolated: same latent (loop's), tiled decode with VAE flags off vs on ==="
+echo "=== VAE isolated: same latent (loop's), VAE flags off (tiles) vs on (strips) ==="
 for v in off on; do
   if [ "$v" = off ]; then E=("${VAE_OFF[@]}"); else E=("${VAE_ON[@]}"); fi
   env "${E[@]}" REPS="$RUNS" "${LAUNCH[@]}" scripts/validate/vae_tiled_check.py "$OUT/loop" "$OUT/vae_$v" \
@@ -83,7 +83,7 @@ for v in off on; do
 done
 echo "  VAE on vs off frames: $(python3 -c "import numpy as np,sys; a,b=(np.load(f'$OUT/vae_{x}/frames.npy') for x in ('off','on')); print('IDENTICAL' if np.array_equal(a,b) else 'DIFFERENT, max |diff| %d' % np.abs(a.astype(int)-b).max())" 2>&1)"
 echo "=== VAE vs exact fp32 CPU decode (untiled) ==="
-USE_NKI_VAE=0 USE_NKI_CONV3D=0 VAE_COMPILE=0 VAE_FUSE_NORM=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1 VAE_SUBPIXEL=0 VAE_STREAM=0 THREADS="$THREADS" python3 scripts/validate/vae_cpu_ref.py "$OUT/loop" "$OUT/vae_fp32" \
+USE_NKI_VAE=0 USE_NKI_CONV3D=0 VAE_COMPILE=0 VAE_FUSE_NORM=0 VAE_FUSE_CAT=0 VAE_FUSE_RES=0 VAE_FUSE_SHORTCUT=0 VAE_TCHUNK=1 VAE_STRIPS=0 VAE_SUBPIXEL=0 VAE_STREAM=0 THREADS="$THREADS" python3 scripts/validate/vae_cpu_ref.py "$OUT/loop" "$OUT/vae_fp32" \
   "$OUT/vae_off/frames.npy" "$OUT/vae_on/frames.npy" 2>&1 | grep -E "vae_cpu_ref|Error" | tee "$OUT/vae_fp32.txt"
 
 echo "=== step-0 noise prediction vs fp32 CPU DiT (each on its own input) ==="

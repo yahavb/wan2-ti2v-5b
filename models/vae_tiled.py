@@ -217,4 +217,154 @@ def decode_tiled_stream(vae, z, cpu_group, overlap, make_writer, finish):
     return done["frames"]
 
 
-__all__ = ["decode_tiled", "decode_tiled_stream", "tile_grid"]
+# ─── VAE_STRIPS: exact horizontal strips (no overlap, no blending) ─────────────────────────────
+# Rank r owns output rows [16 R r / 2 ...) as one strip of R rows at 2x the latent resolution
+# (R = 2h / world). Up to the first upsample it decodes a latent window of n rows that covers
+# those 2x rows (adjacent windows can share a row), then crops; every spatial conv gets its
+# neighbours' rows through wan.modules.vae2_2.StripCtx, so the strips equal an untiled decode up to
+# rounding. Overlapping tiles do 1.68x the work of the frame (15x21 per rank vs 44x34 / 8).
+
+def strip_layout(h, world):
+    """(R, windows, crops): R = 2x rows per rank; windows[r] = (a, n), the latent rows rank r
+    decodes before the first upsample (n is the same on every rank, so all ranks run the same
+    shapes); crops[r] = (first row, R) of rank r's 2x strip inside its window's 2x output."""
+    assert (2 * h) % world == 0, f"VAE_STRIPS: 2 x {h} latent rows do not split over {world} ranks"
+    R = 2 * h // world
+    wins = [[(R * r) // 2, -(-(R * (r + 1)) // 2) - (R * r) // 2] for r in range(world)]
+    n = max(k for _, k in wins)
+    for wv in wins:  # grow short windows downward (upward at the bottom edge)
+        while wv[1] < n:
+            if wv[0] + wv[1] < h:
+                wv[1] += 1
+            else:
+                wv[0] -= 1
+                wv[1] += 1
+    return R, [tuple(wv) for wv in wins], [(R * r - 2 * a, R) for r, (a, _) in enumerate(wins)]
+
+
+def strip_sources(wins, h, world, rank):
+    """Where this rank's halo rows come from, for StripCtx: (src_lo, src_hi), each (above, below)
+    with a source (rank, slot) or () at the image border (zero padding). src_lo: at the latent
+    resolution, where every rank sends rows 0, 1, n-2, n-1 of its window; src_hi: above it, where
+    every rank sends rows 0 and h-1 of its exact strip."""
+    n = wins[0][1]
+    sent = (0, 1, n - 2, n - 1)
+    a = wins[rank][0]
+    src_lo = []
+    for row, r2 in ((a - 1, rank - 1), (a + n, rank + 1)):
+        src_lo.append((r2, sent.index(row - wins[r2][0])) if 0 <= row < h else ())
+    src_hi = ((rank - 1, 1) if rank > 0 else (), (rank + 1, 0) if rank < world - 1 else ())
+    return tuple(src_lo), src_hi
+
+
+_STRIP_CTX = {}
+
+
+def _strip_ctx(z, group):
+    """This rank's StripCtx for a latent of z's height (cached: its compiled graphs are reused)."""
+    from wan.modules.vae2_2 import StripCtx
+    rank, world = dist.get_rank(), dist.get_world_size()
+    h = z.shape[2]
+    key = (h, world, rank, z.device)
+    if key not in _STRIP_CTX:
+        R, wins, crops = strip_layout(h, world)
+        src_lo, src_hi = strip_sources(wins, h, world, rank)
+        ctx = StripCtx(group if group is not None else dist.group.WORLD, rank, world, wins,
+                       src_lo, src_hi, crops[rank])
+        _STRIP_CTX[key] = (ctx, R, wins)
+    return _STRIP_CTX[key]
+
+
+def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done):
+    """Rank 0 helper thread: for each chunk, stack the ranks' strips (bf16, exact: the decoder's
+    clamped output is bf16-valued) into the frame, convert with finish() and feed the writer.
+    finish=None: keep the float32 chunks instead (done["video"] = [3, F, H, W])."""
+    try:
+        deadline = time.time() + 600
+        frames, chunks = [], []
+        for c in range(n_chunks):
+            parts = []
+            for r in range(world):
+                path = f"{tag}_{r}_{c}.bin"
+                _wait_for(path, deadline)
+                part = torch.from_numpy(np.fromfile(path, dtype=np.int16)).view(torch.bfloat16)
+                parts.append(part.view(3, -1, rows, width))
+                os.remove(path)
+            acc = torch.cat(parts, dim=2).float()  # [3, f, H, W]
+            if c == n_chunks - 1:
+                done["t_last_chunk"] = time.time()
+            if finish is None:
+                chunks.append(acc)
+                continue
+            v = finish(acc)  # [f, H, W, 3] uint8 numpy
+            for fr in v:
+                writer.append_data(fr)
+            frames.append(v)
+        if finish is None:
+            done["video"] = torch.cat(chunks, dim=1)
+            return
+        t0 = time.time()
+        writer.close()
+        done["t_close"] = time.time() - t0
+        done["frames"] = np.concatenate(frames, 0)
+    except BaseException as ex:  # noqa: BLE001 - re-raised by the caller
+        done["error"] = ex
+
+
+def _decode_strips(vae, z, cpu_group, make_writer, finish, group):
+    import threading
+    rank, world = dist.get_rank(), dist.get_world_size()
+    n_chunks = vae.num_decode_chunks(z.shape[1])
+    ctx, R, wins = _strip_ctx(z, group)
+    a, n = wins[rank]
+    _CALL[0] += 1
+    tag = f"{SHM_DIR}/wan_vae_strip_{os.getppid()}_{_CALL[0]}"
+    done, thread = {}, None
+    if rank == 0:
+        thread = threading.Thread(
+            target=_assemble_strips,
+            args=(tag, world, 8 * R, 16 * z.shape[3], n_chunks,
+                  make_writer() if finish is not None else None, finish, done),
+            daemon=True)
+        thread.start()
+    t0 = time.time()
+
+    def ship(c, part):
+        p = f"{tag}_{rank}_{c}.bin"
+        part.cpu().view(torch.int16).numpy().tofile(p + ".tmp")
+        os.rename(p + ".tmp", p)  # atomic: the reader never sees a partial file
+
+    pending = None
+    for c, out in enumerate(vae.decode_strip_chunks(z, ctx, a, n)):  # [3, f, 16 R / 2, W*16]
+        part = out.to(torch.bfloat16)
+        if pending is not None:  # copy the previous chunk while this one is queued
+            ship(*pending)
+        pending = (c, part)
+    ship(*pending)
+    t_dec = time.time() - t0
+    gathered = [None] * world if rank == 0 else None
+    dist.gather_object(t_dec, gathered, dst=0, group=cpu_group)
+    if rank != 0:
+        return None
+    t1 = time.time()
+    thread.join()
+    if "error" in done:
+        raise done["error"]
+    print(f"[vae_tiled] strips {world}x1 ({R} rows at 2x, latent windows of {n}) decode "
+          f"max/min over ranks={max(gathered):.2f}/{min(gathered):.2f}s; tail after decode "
+          f"{time.time() - t1:.2f}s", flush=True)
+    return done.get("frames") if finish is not None else done["video"]
+
+
+def decode_strips_stream(vae, z, cpu_group, make_writer, finish, group=None):
+    """decode_tiled_stream() with exact strips (VAE_STRIPS=1): same arguments and result."""
+    return _decode_strips(vae, z, cpu_group, make_writer, finish, group)
+
+
+def decode_strips(vae, z, cpu_group, group=None):
+    """decode_tiled() with exact strips: the float32 [3, F, H, W] video on rank 0, None elsewhere."""
+    return _decode_strips(vae, z, cpu_group, None, None, group)
+
+
+__all__ = ["decode_tiled", "decode_tiled_stream", "tile_grid", "decode_strips", "decode_strips_stream",
+           "strip_layout", "strip_sources"]

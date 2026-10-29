@@ -7,6 +7,8 @@ import torch
 import contextlib  # patched for Neuron
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.distributed._functional_collectives as funcol
 from einops import rearrange
 
 # ─── NKI Kernel Loading for Neuron ─────────────────────────────────────
@@ -177,8 +179,14 @@ class CausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._nki_filters = None  # packed lazily, after the model is on device
 
-    def forward(self, x, cache_x=None):
+    def forward(self, x, cache_x=None, hpad=True):
+        """hpad=False (VAE_STRIPS): x already carries one halo row above and below, so H is not
+        padded."""
         padding = list(self._padding)
+        if not hpad:
+            padding[2] = padding[3] = 0
+        elif _STRIP is not None and padding[2] > 0:
+            raise RuntimeError("VAE_STRIPS: a spatial conv ran without its halo rows")
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
             x = torch.cat([cache_x, x], dim=2)
@@ -188,24 +196,27 @@ class CausalConv3d(nn.Conv3d):
         if self._nki_filters is not None or (
                 _nki_conv3d is not None and x.shape[2] + padding[4] - 2 >= _nki_conv3d.MIN_D_OUT
                 and _nki_conv3d.eligible(self)):
-            return self._nki_forward(x, padding)
+            return self._nki_forward(x, padding, hpad=hpad)
         x = F.pad(x, padding)
 
         return super().forward(x)
 
-    def forward_time_padded(self, z, residual=None):
+    def forward_time_padded(self, z, residual=None, hpad=True):
         """forward() for an input that already carries the 2 causal frames in front
         (VAE_FUSE_CAT); same kernel choice and result. residual (VAE_FUSE_RES) is added to the
         output, inside the kernel on the nkilib path."""
+        if hpad and _STRIP is not None and self._padding[2] > 0:
+            raise RuntimeError("VAE_STRIPS: a spatial conv ran without its halo rows")
         if self._nki_filters is not None or (
                 _nki_conv3d is not None and z.shape[2] - 2 >= _nki_conv3d.MIN_D_OUT
                 and _nki_conv3d.eligible(self)):
-            return self._nki_forward(z, [0, 0, 0, 0, 0, 0], residual)
+            return self._nki_forward(z, [0, 0, 0, 0, 0, 0], residual, hpad=hpad)
         p = self._padding
-        out = super().forward(F.pad(z, (p[0], p[1], p[2], p[3], 0, 0)))
+        hp = (p[2], p[3]) if hpad else (0, 0)
+        out = super().forward(F.pad(z, (p[0], p[1], hp[0], hp[1], 0, 0)))
         return out if residual is None else out + residual
 
-    def _nki_forward(self, x, padding, residual=None):
+    def _nki_forward(self, x, padding, residual=None, hpad=True):
         if padding[4] > 0:  # fewer than 2 cached frames: zero-pad time, kernel pads H/W
             x = F.pad(x, (0, 0, 0, 0, padding[4], 0))
         if self._nki_filters is None:
@@ -213,12 +224,12 @@ class CausalConv3d(nn.Conv3d):
             if not _NKI_CONV3D_CHECK:  # drop the unpacked copy (~0.5 GB per rank in total)
                 self.weight = nn.Parameter(self.weight.new_empty(0), requires_grad=False)
         out = _nki_conv3d.conv3d_3x3x3(x.to(self._nki_filters.dtype), self._nki_filters, self.bias,
-                                       residual)
+                                       residual, hpad=hpad)
         if _NKI_CONV3D_CHECK:
             key = (tuple(x.shape), self.out_channels, residual is not None)
             if key not in _nki_conv3d_checked:
                 _nki_conv3d_checked.add(key)
-                ref = super().forward(F.pad(x, (1, 1, 1, 1, 0, 0)))
+                ref = super().forward(F.pad(x, (1, 1, 1, 1, 0, 0) if hpad else (1, 1, 0, 0, 0, 0)))
                 if residual is not None:
                     ref = ref + residual
                 err = (out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
@@ -255,6 +266,111 @@ if _VAE_FUSE_NORM:
     if _VAE_FUSE_CAT:
         _rms_silu_cat = torch.compile(_rms_silu_cat_impl, backend="neuron", dynamic=False)
         _rms_silu_pad = torch.compile(_rms_silu_pad_impl, backend="neuron", dynamic=False)
+
+
+# ─── VAE_STRIPS: exact horizontal strips with halo-row exchange (models/vae_tiled.decode_strips_*) ─
+# During a strip decode every rank holds a horizontal strip of the frame. Before each spatial conv
+# its input gets one row from each neighbour (zeros at the image border) and the conv pads W only;
+# the middle attention block runs on the all-gathered full frame. At the latent resolution every
+# rank decodes a 6-row window (adjacent windows can share a row) whose 2x output is cropped to the
+# rank's exact 2x rows; from there on the strips are exact (no shared rows). So the result equals
+# the untiled decode up to rounding. The exchange is three graphs: the edge rows (normed when the
+# conv input is), an all-gather alone in its graph (inside the norm graph the same all-gather ran
+# ~10x slower, .remote/halo2_bench.py), then the norm + cache-concat graph, which slices the two
+# neighbour rows out of the gathered edges (static per rank: each rank compiles its own graphs).
+_STRIP = None
+
+
+def _strip_edges_impl(x, rows: tuple):
+    """Rows `rows` of x [1, C, T, h, W] -> [1, C, T, k, W]."""
+    return torch.cat([x[:, :, :, i:i + 1] for i in rows], dim=3)
+
+
+def _strip_edges_norm_impl(x, gamma, rows: tuple):
+    return _rms_silu_impl(_strip_edges_impl(x, rows), gamma)
+
+
+def _strip_row(g, src: tuple):
+    """One row [1, C, T, 1, W] of the gathered edges g [world, C, T, k, W]: src = (rank, slot),
+    or () at the image border (zeros: the conv's zero padding)."""
+    if not src:
+        return g.new_zeros(1, g.shape[1], g.shape[2], 1, g.shape[4])
+    r, j = src
+    return g[r:r + 1, :, :, j:j + 1]
+
+
+def _strip_norm_cat_impl(x, gamma, prev, g, above: tuple, below: tuple):
+    """_rms_silu_cat_impl with the halo rows: (conv input [1, C, 2 + T, h + 2, W], cache)."""
+    y = torch.cat([_strip_row(g, above), _rms_silu_impl(x, gamma), _strip_row(g, below)], dim=3)
+    z = torch.cat([prev, y], dim=2)
+    return z, z[:, :, -CACHE_T:].clone()
+
+
+def _strip_norm_pad_impl(x, gamma, g, above: tuple, below: tuple):
+    y = torch.cat([_strip_row(g, above), _rms_silu_impl(x, gamma), _strip_row(g, below)], dim=3)
+    z = F.pad(y, (0, 0, 0, 0, CACHE_T, 0))
+    return z, z[:, :, -CACHE_T:].clone()
+
+
+def _strip_phase_rows_impl(x, g, above: tuple, below: tuple):
+    """Sub-pixel upsample input with the halo: (rows -1 .. h-1, rows 0 .. h) of x, the inputs of
+    the py = 0 and py = 1 output phases."""
+    return torch.cat([_strip_row(g, above), x], dim=3), torch.cat([x, _strip_row(g, below)], dim=3)
+
+
+class StripCtx:
+    """One rank's state for an exact strip decode. lo_all: every rank's latent-resolution window
+    (start row, rows); src_lo / src_hi: (above, below) sources of this rank's halo rows at the
+    latent resolution (every rank sends rows 0, 1, h-2, h-1 of its window) and above it (rows 0,
+    h-1 of its exact strip), each (rank, slot) or () at the image border; hi_crop: (first row,
+    rows) of the exact 2x strip inside the 2x output of the window; level: 0 at the latent
+    resolution, 1 above (set by the decoder after the first upsample)."""
+
+    def __init__(self, group, rank, world, lo_all, src_lo, src_hi, hi_crop):
+        self.group, self.rank, self.world = group, rank, world
+        self.lo_all, self.src_lo, self.src_hi, self.hi_crop = lo_all, src_lo, src_hi, hi_crop
+        self.level = 0
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 128)
+        kw = dict(backend="neuron", dynamic=False)
+
+        def all_gather(e):
+            return funcol.all_gather_tensor(e, 0, group)  # [world, C, T, k, W]
+        self._ag = torch.compile(all_gather, **kw)
+        self._edges = torch.compile(_strip_edges_impl, **kw)
+        self._edges_norm = torch.compile(_strip_edges_norm_impl, **kw)
+        self._norm_cat = torch.compile(_strip_norm_cat_impl, **kw)
+        self._norm_pad = torch.compile(_strip_norm_pad_impl, **kw)
+        self._phase_rows = torch.compile(_strip_phase_rows_impl, **kw)
+
+    def _rows(self, h):
+        return (0, 1, h - 2, h - 1) if self.level == 0 else (0, h - 1)
+
+    def _src(self):
+        return self.src_lo if self.level == 0 else self.src_hi
+
+    def phase_rows(self, x):
+        """Sub-pixel upsample: x [1, C, T, h, W] -> (rows -1 .. h-1, rows 0 .. h), halo'd."""
+        g = self._ag(self._edges(x, self._rows(x.shape[3])))
+        return self._phase_rows(x, g, *self._src())
+
+    def norm_halo(self, x, gamma, prev):
+        """RMS_norm + SiLU of x with the neighbours' (normed) rows above and below, behind the 2
+        cached frames prev (zeros if None): (conv input [1, C, 2 + T, h + 2, W], cache)."""
+        g = self._ag(self._edges_norm(x, gamma, self._rows(x.shape[3])))
+        if prev is None:
+            return self._norm_pad(x, gamma, g, *self._src())
+        return self._norm_cat(x, gamma, prev, g, *self._src())
+
+    def full_frame(self, x):
+        """[1, C, T, h, W] latent-resolution windows of all ranks -> the full frame (a row shared
+        by two windows is identical in both, so it is taken from the upper window)."""
+        parts = self._ag(x.contiguous())  # [world, C, T, h, W]
+        rows, end = [], 0
+        for r, (a, n) in enumerate(self.lo_all):
+            if a + n > end:
+                rows.append(parts[r:r + 1, :, :, end - a:])
+                end = a + n
+        return torch.cat(rows, dim=3)
 
 
 def _dupup_add_impl(main, x, out_channels: int, factor_t: int, factor_s: int, repeats: int,
@@ -294,6 +410,10 @@ def _norm_cat_conv(x, gamma, conv, feat_cache, idx, residual=None):
     cache keeps the last 2 frames of that (a zero frame stands in for a missing one).
     residual: added to the conv output (inside the nkilib kernel)."""
     prev = feat_cache[idx]
+    if _STRIP is not None:  # exact strips: the conv input also gets the neighbours' rows
+        z, cache = _STRIP.norm_halo(x, gamma, prev)
+        feat_cache[idx] = cache
+        return conv.forward_time_padded(z, residual, hpad=False)
     if prev is None:
         z, cache = _rms_silu_pad(x, gamma)
     else:
@@ -349,6 +469,8 @@ class NkiConv2d(nn.Conv2d):
     upsample convs; staging measured them paying off together with the 3D group)."""
 
     def forward(self, x):
+        if _STRIP is not None:
+            raise RuntimeError("VAE_STRIPS needs VAE_SUBPIXEL=1 (the upsample conv takes the halo there)")
         if _nki_conv3d is None or min(self.in_channels, self.out_channels) < _nki_conv3d.MIN_CHANNELS:
             return super().forward(x)
         if getattr(self, "_nki_filters", None) is None:
@@ -476,7 +598,11 @@ class Resample(nn.Module):
             self._phase_filters = _nki_conv3d.pack_phase_filters(conv.weight)
             if not _NKI_CONV3D_CHECK:
                 conv.weight = nn.Parameter(conv.weight.new_empty(0), requires_grad=False)
-        out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias)
+        if _STRIP is not None:  # exact strips: one low-res halo row above and below
+            out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias,
+                                                     halo_rows=_STRIP.phase_rows(x))
+        else:
+            out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias)
         if _NKI_CONV3D_CHECK and (tuple(x.shape), "subpix") not in _nki_conv3d_checked:
             _nki_conv3d_checked.add((tuple(x.shape), "subpix"))
             t = x.shape[2]
@@ -591,6 +717,15 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
+        if _STRIP is not None:  # global attention over the frame: run it on the gathered frame
+            ctx = _STRIP
+            a, n = ctx.lo_all[ctx.rank]
+            globals()['_STRIP'] = None
+            try:
+                out = self.forward(ctx.full_frame(x))
+            finally:
+                globals()['_STRIP'] = ctx
+            return out[:, :, :, a:a + n].contiguous()
         identity = x
         b, c, t, h, w = x.size()
         x = rearrange(x, "b c t h w -> (b t) c h w")
@@ -1084,6 +1219,8 @@ class Decoder3d(nn.Module):
             pack(self.middle)
         return n
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        if _STRIP is not None:  # x: this rank's latent-resolution window with its halo rows
+            _STRIP.level = 0
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -1096,7 +1233,7 @@ class Decoder3d(nn.Module):
                     ],
                     dim=2,
                 )
-            x = self.conv1(x, feat_cache[idx])
+            x = self.conv1(x, feat_cache[idx], hpad=_STRIP is None)
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
         else:
@@ -1109,11 +1246,15 @@ class Decoder3d(nn.Module):
                 x = layer(x)
 
         ## upsamples
-        for layer in self.upsamples:
+        for ui, layer in enumerate(self.upsamples):
             if feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx, first_chunk)
             else:
                 x = layer(x)
+            if _STRIP is not None and ui == 0:  # latent-res window -> exact 2x strip
+                c0, cn = _STRIP.hi_crop
+                x = x[:, :, :, c0:c0 + cn].contiguous()
+                _STRIP.level = 1
 
         ## head
         head_layers = list(self.head)
@@ -1290,6 +1431,35 @@ class WanVAE_(nn.Module):
                                 feat_idx=self._conv_idx, first_chunk=(i == 0))
             yield unpatchify(out_, patch_size=2)
         self.clear_cache()
+
+    def decode_strip_chunks(self, z, scale, ctx, a, n):
+        """decode_chunks() for one rank of an exact strip decode (models/vae_tiled.decode_strips*):
+        decodes latent rows [a, a + n) of the full latent z, with every spatial conv fed its halo
+        rows through ctx (StripCtx), and yields this rank's exact strip of each chunk
+        ([1, 3, f, rows, W], rows = 16 * ctx.hi_crop[1] / 2)."""
+        global _STRIP
+        self.clear_cache()
+        H = z.shape[3]
+        lo, hi = max(a - 1, 0), min(a + n + 1, H)
+        z = z[:, :, :, lo:hi]
+        if isinstance(scale[0], torch.Tensor):
+            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+                1, self.z_dim, 1, 1, 1)
+        else:
+            z = z / scale[1] + scale[0]
+        z = z.to(self.conv2.weight.dtype)
+        # conv1 zero-pads its input (conv2's output, which has a bias) at the image border
+        x = F.pad(self.conv2(z), (0, 0, int(a == 0), int(a + n == H)))
+        _STRIP = ctx
+        try:
+            for i, k in _decode_chunk_spans(z.shape[2]):
+                self._conv_idx = [0]
+                out_ = self.decoder(x[:, :, i:i + k, :, :], feat_cache=self._feat_map,
+                                    feat_idx=self._conv_idx, first_chunk=(i == 0))
+                yield unpatchify(out_, patch_size=2)
+        finally:
+            _STRIP = None
+            self.clear_cache()
 
     def _decode_compiled(self, z):
         """VAE_COMPILE path: static-cache decoder, compiled once (2 graphs)."""
@@ -1524,6 +1694,12 @@ class Wan2_2_VAE:
         """Streaming decode of one latent [C, T, H, W]: yields [3, f, H*16, W*16] float32
         clamped chunks (the same values decode([z])[0] has for those frames)."""
         for out in self.model.decode_chunks(z.unsqueeze(0), self.scale):
+            yield out.float().clamp_(-1, 1).squeeze(0)
+
+    def decode_strip_chunks(self, z, ctx, a, n):
+        """decode_chunks() of this rank's exact strip (WanVAE_.decode_strip_chunks): yields
+        [3, f, rows, W*16] float32 clamped chunks."""
+        for out in self.model.decode_strip_chunks(z.unsqueeze(0), self.scale, ctx, a, n):
             yield out.float().clamp_(-1, 1).squeeze(0)
 
     def decode(self, zs):

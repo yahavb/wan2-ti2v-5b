@@ -36,6 +36,13 @@ def _conv3d_3x3x3_kernel(x, filters, bias):
 
 
 _conv3d_3x3x3 = wrap_nki(_conv3d_3x3x3_kernel)
+# VAE_STRIPS (exact strips with halo rows): the input already carries the neighbours' rows, so
+# the kernel pads only W.
+PADDING_HP0 = (0, 0, 0, 0, 1, 1)
+@nki.jit
+def _conv3d_3x3x3_hp0_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=PADDING_HP0, dilation=(1, 1, 1))
+_conv3d_3x3x3_hp0 = wrap_nki(_conv3d_3x3x3_hp0_kernel)
 HAS_RESIDUAL = ResidualAddLoc is not None
 
 
@@ -46,6 +53,11 @@ def _conv3d_3x3x3_res_kernel(x, filters, bias, residual):
 
 
 _conv3d_3x3x3_res = wrap_nki(_conv3d_3x3x3_res_kernel) if HAS_RESIDUAL else None
+@nki.jit
+def _conv3d_3x3x3_res_hp0_kernel(x, filters, bias, residual):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=PADDING_HP0, dilation=(1, 1, 1),
+                  residual_add_loc=ResidualAddLoc.POST_ACT, residuals_in=residual)
+_conv3d_3x3x3_res_hp0 = wrap_nki(_conv3d_3x3x3_res_hp0_kernel) if HAS_RESIDUAL else None
 
 
 def eligible(conv):
@@ -81,6 +93,15 @@ def _phase11_kernel(x, filters, bias):
 
 
 _PHASES = [wrap_nki(k) for k in (_phase00_kernel, _phase01_kernel, _phase10_kernel, _phase11_kernel)]
+# Halo'd input (one extra low-res row above and below): every phase pads W only; phase py reads
+# input rows [py, py + h + 1) of the h + 2.
+@nki.jit
+def _phase_w10_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 0, 0, 1, 0), dilation=(1, 1, 1))
+@nki.jit
+def _phase_w01_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=(0, 0, 0, 0, 0, 1), dilation=(1, 1, 1))
+_PHASES_HP0 = [wrap_nki(k) for k in (_phase_w10_kernel, _phase_w01_kernel)]  # by px
 # rows of the 3 taps folded into each of the 2 taps of a phase (index [phase][tap2][tap3])
 _FOLD = ([[1.0, 0.0, 0.0], [0.0, 1.0, 1.0]], [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
@@ -98,13 +119,18 @@ def pack_phase_filters(weight):
     return out
 
 
-def upsample_conv_subpixel(x, phase_filters, bias):
+def upsample_conv_subpixel(x, phase_filters, bias, halo_rows=None):
     """x [B, C_in, T, h, w] -> nearest-2x + 3x3 conv output [B, C_out, T, 2h, 2w]: one 2x2 conv
     per phase on the low-res frames (2.25x fewer MACs, no 4x upsampled input), then one
-    interleave copy."""
+    interleave copy. halo_rows (VAE_STRIPS): (rows -1 .. h-1, rows 0 .. h) of x with the
+    neighbours' rows, [B, C_in, T, h + 1, w] each; the phases then pad W only."""
     B, _, T, h, w = x.shape
-    x = x.to(phase_filters[0].dtype).contiguous()
-    ys = [_PHASES[p](x, phase_filters[p], bias) for p in range(4)]  # 4 x [B, C_out, T, h, w]
+    if halo_rows is None:
+        x = x.to(phase_filters[0].dtype).contiguous()
+        ys = [_PHASES[p](x, phase_filters[p], bias) for p in range(4)]  # 4 x [B, C_out, T, h, w]
+    else:
+        rows = [r.to(phase_filters[0].dtype).contiguous() for r in halo_rows]  # by py
+        ys = [_PHASES_HP0[p % 2](rows[p // 2], phase_filters[p], bias) for p in range(4)]
     c_out = ys[0].shape[1]
     y = torch.stack(ys, dim=2).view(B, c_out, 2, 2, T, h, w)       # [B, C, py, px, T, h, w]
     return y.permute(0, 1, 4, 5, 2, 6, 3).reshape(B, c_out, T, 2 * h, 2 * w)
@@ -116,9 +142,11 @@ def pack_filters(weight):
     return weight.detach().cpu().permute(2, 3, 4, 1, 0).contiguous().to(weight.device)
 
 
-def conv3d_3x3x3(x, filters, bias, residual=None):
+def conv3d_3x3x3(x, filters, bias, residual=None, hpad=True):
     """x: [B, C_in, D, H, W] with the causal time padding already applied. residual (optional,
-    [B, C_out, D - 2, H, W], same dtype): added to the output inside the kernel."""
+    [B, C_out, D - 2, H, W], same dtype): added to the output inside the kernel. hpad=False: x
+    already carries one halo row above and below (output H = input H - 2)."""
     if residual is not None:
-        return _conv3d_3x3x3_res(x.contiguous(), filters, bias, residual.to(x.dtype).contiguous())
-    return _conv3d_3x3x3(x.contiguous(), filters, bias)
+        k = _conv3d_3x3x3_res if hpad else _conv3d_3x3x3_res_hp0
+        return k(x.contiguous(), filters, bias, residual.to(x.dtype).contiguous())
+    return (_conv3d_3x3x3 if hpad else _conv3d_3x3x3_hp0)(x.contiguous(), filters, bias)

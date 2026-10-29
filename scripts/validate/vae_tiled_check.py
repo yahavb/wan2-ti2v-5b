@@ -2,7 +2,8 @@
 
 Isolates VAE changes from the DiT: every configuration decodes the SAME latent.
 torchrun --nproc_per_node=8 vae_tiled_check.py <dump_with_latent.pt> <out_dir> [<ref_frames.npy> ...]
-Env: VAE flags as in the pipeline (VAE_FUSE_NORM, VAE_TCHUNK, VAE_TILE_OVERLAP, ...), REPS (2).
+Env: VAE flags as in the pipeline (VAE_FUSE_NORM, VAE_TCHUNK, VAE_TILE_OVERLAP, VAE_STRIPS, ...),
+REPS (2).
 Rank 0 writes <out_dir>/frames.npy (uint8 [F, H, W, 3]) and prints the warm decode time and the
 PSNR against each reference frames.npy given.
 """
@@ -33,7 +34,8 @@ def main():
     if rank == 0:
         torch.set_num_threads(16)
     dev = torch.device("neuron")
-    from models.vae_tiled import decode_tiled
+    from models.vae_tiled import decode_tiled, decode_strips
+    strips = os.environ.get("VAE_STRIPS", "0") == "1"
     from wan.modules.vae2_2 import Wan2_2_VAE
     cpu_group = dist.new_group(backend="gloo")
     vae = Wan2_2_VAE(vae_pth=os.path.join(MODEL_PATH, "Wan2.2_VAE.pth"), device=torch.device("cpu"))
@@ -45,10 +47,11 @@ def main():
     for rep in range(int(os.environ.get("REPS", "2"))):
         dist.barrier()
         t0 = time.time()
-        video = decode_tiled(vae, z, cpu_group, overlap)
+        video = decode_strips(vae, z, cpu_group) if strips else decode_tiled(vae, z, cpu_group, overlap)
         dt = time.time() - t0
         if rank == 0:
-            print(f"[vae_tiled_check] rep {rep}: decode_tiled {dt:.2f}s", flush=True)
+            print(f"[vae_tiled_check] rep {rep}: {'decode_strips' if strips else 'decode_tiled'} "
+                  f"{dt:.2f}s", flush=True)
     if rank == 0:
         fr = video.add_(1).mul_(127.5).to(torch.uint8).permute(1, 2, 3, 0).contiguous().numpy()
         os.makedirs(out_dir, exist_ok=True)

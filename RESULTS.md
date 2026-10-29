@@ -29,12 +29,13 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
 | + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
 | + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | 0.60 | 6.0s | 2.5s | 8.6s | 0.0487* |
-| + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | **0.58** | **5.8s** | **2.5s** | **8.4s** | 0.0484* |
+| + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | 0.58 | 5.8s | 2.5s | 8.4s | 0.0484* |
+| + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | **0.58** | **5.8s** | **2.0s** | **7.9s** | 0.0484* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1
-FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1`. The `VAE_FUSE_CAT` and
+FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
@@ -73,6 +74,22 @@ device (4 warm runs each): denoise 6.03-6.10 -> 5.85-5.94 s with the first two, 
 8.34-8.45 s. The output is not bit-identical (different accumulation in the mlp kernel and the
 modulation products); the step-0 noise prediction scores 0.0484 vs fp32 (0.0487 before), and
 every run of a process writes the same mp4.
+
+`VAE_STRIPS=1` decodes the frame as 8 exact horizontal strips, one per rank, instead of 8
+overlap-4 tiles of 15x21 latent pixels that together cover 1.68x the frame. Up to the first
+upsample each rank runs a 6-row latent window (neighbouring windows share a row, since 44 rows
+do not split into 8), then crops to its exact 11 rows at 2x; before every spatial conv each rank
+gets the row above and the row below from its neighbours (zeros at the image border), and the
+middle attention block runs on the all-gathered full frame. So the strips compute what an untiled
+decode computes, up to bf16 rounding. The exchange is three graphs per conv: the strip's edge rows,
+an all-gather alone in its graph, then the norm + cache-concat graph with the neighbours' rows
+sliced in. Inside the norm graph the same all-gather cost ~10x more (3.3 ms instead of 0.36 ms
+at the 8x level, `.remote/halo2_bench.py`), which is what made the in-graph version a wash before.
+Same final latent, all 8 ranks, no DiT resident (`scripts/validate/vae_tiled_check.py`): decode
+2.50 -> 1.96 s, and against the exact fp32 decode 44.71 -> 52.96 dB (worst frame 42.93 -> 51.94
+dB). In the pipeline, alternating runs on one device (3 warm runs each): VAE 2.50-2.54 -> 2.02-2.08 s,
+total 8.32-8.40 -> 7.78-7.93 s; device memory during the VAE ~9.9 -> ~9.5 GB per core (neuron-monitor).
+Every run writes the same mp4. Run 1 of a process traces the strip kernel shapes (VAE ~145 s).
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next
