@@ -279,11 +279,17 @@ if _VAE_FUSE_NORM:
 # ~10x slower, .remote/halo2_bench.py), then the norm + cache-concat graph, which slices the two
 # neighbour rows out of the gathered edges (static per rank: each rank compiles its own graphs).
 _STRIP = None
+# VAE_STRIP_NKI_NORM=1: the norm + halo + cache-concat step is one NKI kernel
+# (kernels/vae_strip_norm.py) instead of the compiled graph: 1.9 -> 0.58 ms at the 8x level
+# (C=256), 3.6 -> 1.15 ms for C=512, on one core.
+_STRIP_NKI_NORM = os.environ.get("VAE_STRIP_NKI_NORM", "0") == "1"
 
 
 def _strip_edges_impl(x, rows: tuple):
-    """Rows `rows` of x [1, C, T, h, W] -> [1, C, T, k, W]."""
-    return torch.cat([x[:, :, :, i:i + 1] for i in rows], dim=3)
+    """Rows `rows` of x [1, C, T, h, W] -> [k, C, T, 1, W], row-major so that every gathered row
+    is one contiguous block (a row sliced out of an interleaved [.., k, W] layout made the norm
+    graph 2.4x slower at the 8x level with all 8 ranks busy)."""
+    return torch.cat([x[:, :, :, i:i + 1] for i in rows], dim=0)
 
 
 def _strip_edges_norm_impl(x, gamma, rows: tuple):
@@ -291,12 +297,12 @@ def _strip_edges_norm_impl(x, gamma, rows: tuple):
 
 
 def _strip_row(g, src: tuple):
-    """One row [1, C, T, 1, W] of the gathered edges g [world, C, T, k, W]: src = (rank, slot),
-    or () at the image border (zeros: the conv's zero padding)."""
+    """One row [1, C, T, 1, W] of the gathered edges g [world * k, C, T, 1, W]: src = (index,) of
+    the row (sending rank * k + slot), or () at the image border (zeros: the conv's padding)."""
     if not src:
         return g.new_zeros(1, g.shape[1], g.shape[2], 1, g.shape[4])
-    r, j = src
-    return g[r:r + 1, :, :, j:j + 1]
+    i, = src
+    return g[i:i + 1]
 
 
 def _strip_norm_cat_impl(x, gamma, prev, g, above: tuple, below: tuple):
@@ -322,7 +328,7 @@ class StripCtx:
     """One rank's state for an exact strip decode. lo_all: every rank's latent-resolution window
     (start row, rows); src_lo / src_hi: (above, below) sources of this rank's halo rows at the
     latent resolution (every rank sends rows 0, 1, h-2, h-1 of its window) and above it (rows 0,
-    h-1 of its exact strip), each (rank, slot) or () at the image border; hi_crop: (first row,
+    h-1 of its exact strip), each (rank * k + slot,) or () at the image border; hi_crop: (first row,
     rows) of the exact 2x strip inside the 2x output of the window; level: 0 at the latent
     resolution, 1 above (set by the decoder after the first upsample)."""
 
@@ -334,13 +340,14 @@ class StripCtx:
         kw = dict(backend="neuron", dynamic=False)
 
         def all_gather(e):
-            return funcol.all_gather_tensor(e, 0, group)  # [world, C, T, k, W]
+            return funcol.all_gather_tensor(e, 0, group)  # [world * k, C, T, 1, W]
         self._ag = torch.compile(all_gather, **kw)
         self._edges = torch.compile(_strip_edges_impl, **kw)
         self._edges_norm = torch.compile(_strip_edges_norm_impl, **kw)
         self._norm_cat = torch.compile(_strip_norm_cat_impl, **kw)
         self._norm_pad = torch.compile(_strip_norm_pad_impl, **kw)
         self._phase_rows = torch.compile(_strip_phase_rows_impl, **kw)
+        self._zeros = {}
 
     def _rows(self, h):
         return (0, 1, h - 2, h - 1) if self.level == 0 else (0, h - 1)
@@ -357,9 +364,25 @@ class StripCtx:
         """RMS_norm + SiLU of x with the neighbours' (normed) rows above and below, behind the 2
         cached frames prev (zeros if None): (conv input [1, C, 2 + T, h + 2, W], cache)."""
         g = self._ag(self._edges_norm(x, gamma, self._rows(x.shape[3])))
+        if _STRIP_NKI_NORM:
+            return self._norm_halo_nki(x, gamma, prev, g)
         if prev is None:
             return self._norm_pad(x, gamma, g, *self._src())
         return self._norm_cat(x, gamma, prev, g, *self._src())
+
+    def _norm_halo_nki(self, x, gamma, prev, g):
+        from kernels.vae_strip_norm import strip_norm_cat
+        _, C, T, h, W = x.shape
+        if prev is None:  # chunk 0: the causal padding is zero frames
+            key = (C, h, W, x.dtype)
+            if key not in self._zeros:
+                self._zeros[key] = x.new_zeros(1, C, CACHE_T, h + 2, W)
+            prev = self._zeros[key]
+        above, below = self._src()
+        kern = strip_norm_cat(T, h, W, above[0] if above else -1, below[0] if below else -1)
+        z, cache = kern(x.reshape(C, T * h * W), gamma.reshape(C, 1).to(x.dtype),
+                        prev.reshape(C, CACHE_T * (h + 2) * W), g.reshape(-1, T * W))
+        return z.view(1, C, T + CACHE_T, h + 2, W), cache.view(1, C, CACHE_T, h + 2, W)
 
     def full_frame(self, x):
         """[1, C, T, h, W] latent-resolution windows of all ranks -> the full frame (a row shared

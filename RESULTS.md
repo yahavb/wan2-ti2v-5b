@@ -30,12 +30,13 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
 | + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | 0.60 | 6.0s | 2.5s | 8.6s | 0.0487* |
 | + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | 0.58 | 5.8s | 2.5s | 8.4s | 0.0484* |
-| + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | **0.58** | **5.8s** | **2.0s** | **7.9s** | 0.0484* |
+| + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | 0.58 | 5.8s | 2.0s | 7.9s | 0.0484* |
+| + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | **0.58** | **5.8s** | **1.8s** | **7.6s** | 0.0484* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1
-FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1`. The `VAE_FUSE_CAT` and
+FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1 VAE_STRIP_NKI_NORM=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
@@ -90,6 +91,23 @@ Same final latent, all 8 ranks, no DiT resident (`scripts/validate/vae_tiled_che
 dB). In the pipeline, alternating runs on one device (3 warm runs each): VAE 2.50-2.54 -> 2.02-2.08 s,
 total 8.32-8.40 -> 7.78-7.93 s; device memory during the VAE ~9.9 -> ~9.5 GB per core (neuron-monitor).
 Every run writes the same mp4. Run 1 of a process traces the strip kernel shapes (VAE ~145 s).
+
+`VAE_STRIP_NKI_NORM=1`: rank 0's system trace of the strip decode (`.remote/vae_seq.py` lists one
+decoder call's executions in order) put the norm + halo + cache-concat graph first: 3.21 ms per call
+for C=256 and 7.8 ms for C=512 at the 8x level, against 1.3 ms for the same norm without halo rows,
+27 ms of the call's 170 ms. `kernels/vae_strip_norm.py` streams each frame through SBUF in
+2048-pixel blocks with channels on the partitions, sums the squares over channels with a
+ones-matrix matmul (which also broadcasts the sum to every partition) and writes the normed rows,
+the neighbours' halo rows and the cached frames straight into the conv input and the next chunk's
+cache. One core (`scripts/validate/strip_norm_check.py`), compiled graph -> kernel: 1.88 -> 0.58 ms
+(C=256, 8 frames, 44x272), 3.62 -> 1.15 ms (C=512), 0.63 -> 0.34 ms (C=512, 22x136), equal at the
+two lowest levels; values within one bf16 step of the graph's (rel-RMS <= 2.7e-3), halo rows and
+cached frames identical. The gathered edge rows are now laid out one contiguous block per row, as
+the kernel reads them. NKI's cross-process trace cache keys a kernel by its qualified name and
+argument shapes, not closure values, so each (shape, halo source) kernel gets its own name: with one
+name, ranks with equal shapes and other halo sources reused each other's traces (32 dB). Same
+latent, 8 ranks: decode 1.94 -> 1.74 s, 52.95 -> 53.01 dB vs the exact fp32 decode. Pipeline,
+alternating runs (2 warm runs each): VAE 2.01-2.03 -> 1.78-1.81 s, total 7.83-7.84 -> 7.56-7.61 s.
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

@@ -244,16 +244,17 @@ def strip_layout(h, world):
 
 def strip_sources(wins, h, world, rank):
     """Where this rank's halo rows come from, for StripCtx: (src_lo, src_hi), each (above, below)
-    with a source (rank, slot) or () at the image border (zero padding). src_lo: at the latent
-    resolution, where every rank sends rows 0, 1, n-2, n-1 of its window; src_hi: above it, where
-    every rank sends rows 0 and h-1 of its exact strip."""
+    with a source (index,) into the gathered edge rows (sending rank * rows sent + slot), or () at
+    the image border (zero padding). src_lo: at the latent resolution, where every rank sends rows
+    0, 1, n-2, n-1 of its window; src_hi: above it, where every rank sends rows 0 and h-1 of its
+    exact strip."""
     n = wins[0][1]
     sent = (0, 1, n - 2, n - 1)
     a = wins[rank][0]
     src_lo = []
     for row, r2 in ((a - 1, rank - 1), (a + n, rank + 1)):
-        src_lo.append((r2, sent.index(row - wins[r2][0])) if 0 <= row < h else ())
-    src_hi = ((rank - 1, 1) if rank > 0 else (), (rank + 1, 0) if rank < world - 1 else ())
+        src_lo.append((r2 * len(sent) + sent.index(row - wins[r2][0]),) if 0 <= row < h else ())
+    src_hi = (((rank - 1) * 2 + 1,) if rank > 0 else (), ((rank + 1) * 2,) if rank < world - 1 else ())
     return tuple(src_lo), src_hi
 
 
