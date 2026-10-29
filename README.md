@@ -151,6 +151,9 @@ FastAPI server on port 8000:
 | `CFG_PARALLEL` | 0 | 1 = two TP groups of world/2 ranks: ranks 0-3 run the cond branch, 4-7 the uncond branch, batch 1 each; the head combines them over rank pairs (i, i+4) |
 | `FAST_SP` | 0 | 1 = Megatron-style sequence parallelism inside the TP group (`_FastBlockSP`): token-sharded residual stream, all-gather before / reduce-scatter after the TP matmuls |
 | `FAST_LOCAL_CROSS` | 0 | 1 (needs `CFG_PARALLEL=1 FAST_SP=1`) = cross-attention on each rank's token shard with all heads and unsharded weights: no collectives, +2.3 GB HBM per rank |
+| `FAST_A2A_O` | 0 (job: 1) | 1 (with `FAST_LOCAL_CROSS=1`) = the self-attention output goes from head shards to token shards by one all-to-all and the O-projection runs there with the unsharded weight, instead of a row-parallel matmul + reduce-scatter (9 MB moved per rank instead of 36 MB); +0.43 GB HBM per rank |
+| `FAST_NKI_MLP` | 0 (job: 1) | 1 (with `FAST_SP=1`) = the FFN (up + bias, GELU-tanh, down) runs as one nkilib `mlp` kernel call instead of two compiler matmuls with the GELU decomposed into ~5 ScalarE passes; the block keeps pre-transposed weights (transposed once on the CPU, originals freed) |
+| `FAST_MOD_SPLIT` | 0 (job: 1) | 1 (with `FAST_SP=1`) = the per-token modulation is 6 one-hot matmuls, one where each vector is used, instead of one product materialized as a [tokens, 6, C] tensor (72 MB per block) |
 | `CFG_GROUPS` | contiguous | With `CFG_PARALLEL=1`: `contiguous` = cond ranks 0-3 / uncond 4-7; `interleave` = cond 0,2,4,6 / uncond 1,3,5,7 (each group spans every HBM stack; 4% faster DiT, same output) |
 | `VAE_FUSE_NORM` | 0 | 1 = every VAE RMS_norm + SiLU pair runs as one `torch.compile`d graph (VAE decode 3.7 -> 2.9 s per tile) |
 | `STEP_TIMING` | 0 | 1 = rank 0 logs per denoising step how long it waited for the DiT and how long the host-side scheduler round trip took |

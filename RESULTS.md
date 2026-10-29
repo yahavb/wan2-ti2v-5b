@@ -28,11 +28,13 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + ResidualBlock shortcut added inside the nkilib conv (`VAE_FUSE_RES=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
 | + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
 | + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
-| + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | **0.60** | **6.0s** | **2.5s** | **8.6s** | 0.0487* |
+| + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | 0.60 | 6.0s | 2.5s | 8.6s | 0.0487* |
+| + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | **0.58** | **5.8s** | **2.5s** | **8.4s** | 0.0484* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
-VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
+VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1
+FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
@@ -57,6 +59,20 @@ trace the kernel at the 1-frame shapes: its VAE took 11-20 s instead of 2.6 s, w
 chunk 0 under `VAE_FUSE_RES` (rel-RMS 1.7e-3). Now run 2's VAE takes 2.5-2.6 s, every run writes
 the same mp4, and the steady-state output is unchanged (bit-identical decode with the loop flags on
 and off).
+
+The last row's three DiT changes, per block on the block bench (`scripts/validate/block_bench.py`,
+`CFG_PAR=1`, interleaved cores, 30 reps; 19.71 ms before): `FAST_A2A_O` 19.45 ms, `FAST_NKI_MLP`
+19.44 ms, both 19.03-19.11 ms, all three 18.82-18.84 ms; block output rel-RMS vs the fp32 block
+0.0046 in every case, as before. `FAST_A2A_O` turns the O-projection's reduce-scatter (36 MB
+per rank) into one all-to-all of the attention output (9 MB) and keeps an unsharded copy of each
+O weight (+0.43 GB per rank). `FAST_NKI_MLP` replaces the FFN's two matmuls and the GELU-tanh, which
+the compiler decomposes into ~5 ScalarE passes, with one nkilib `mlp` call. `FAST_MOD_SPLIT` drops
+the [tokens, 6, C] modulation tensor (72 MB per block). In the pipeline, alternating runs on one
+device (4 warm runs each): denoise 6.03-6.10 -> 5.85-5.94 s with the first two, total 8.53-8.62 ->
+8.38-8.47 s; adding `FAST_MOD_SPLIT`, denoise 5.85-5.96 -> 5.81-5.90 s, total 8.35-8.49 ->
+8.34-8.45 s. The output is not bit-identical (different accumulation in the mlp kernel and the
+modulation products); the step-0 noise prediction scores 0.0484 vs fp32 (0.0487 before), and
+every run of a process writes the same mp4.
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

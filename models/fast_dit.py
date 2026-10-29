@@ -47,6 +47,19 @@ FAST_FULLGRAPH = os.environ.get("FAST_FULLGRAPH", "0") == "1"
 # FAST_SP=1: Megatron-style sequence parallelism inside the TP group (_FastBlockSP): token-
 # sharded residual stream, all-gather before / reduce-scatter after the TP matmuls.
 FAST_SP = os.environ.get("FAST_SP", "0") == "1"
+# FAST_A2A_O=1 (with FAST_SP + local cross-attention): the self-attention output goes head -> token
+# shard by one all-to-all, and the O-projection runs there with the unsharded weight, instead of a
+# row-parallel matmul + reduce-scatter (9 MB moved per rank instead of 36 MB). The unsharded O
+# copies are made by inference_neuron_ti2v.py (+0.43 GB per rank).
+FAST_A2A_O = os.environ.get("FAST_A2A_O", "0") == "1"
+# FAST_NKI_MLP=1 (with FAST_SP): the FFN (up + bias, GELU-tanh, down) runs as one nkilib mlp kernel
+# call instead of two compiler matmuls with the GELU decomposed into ~5 ScalarE passes. The kernel
+# takes [H, I] / [I, H] weights, so the block keeps pre-transposed copies (made once).
+FAST_NKI_MLP = os.environ.get("FAST_NKI_MLP", "0") == "1"
+# FAST_MOD_SPLIT=1 (FAST_SP): the per-token modulation is 6 one-hot matmuls [S, F] @ [F, C], one
+# where each vector is used, instead of one [S, F] @ [F, 6C] product materialized as a [S, 6, C]
+# tensor (72 MB per block). Same values (a one-hot row selects one row exactly).
+FAST_MOD_SPLIT = os.environ.get("FAST_MOD_SPLIT", "0") == "1"
 # FAST_TIMING=1: device-sync around each compiled unit and log per-block ms (diagnostic only;
 # the syncs serialize host and device, so the total is a little above the untimed step).
 FAST_TIMING = os.environ.get("FAST_TIMING", "0") == "1"
@@ -123,6 +136,13 @@ def _rs(x):
     return funcol.reduce_scatter_tensor(x, "sum", 0, get_tp_group())
 
 
+def _head2seq(x):
+    """All tokens, this rank's heads [T*S, C/T] -> this rank's token shard, all heads [S, C]
+    (heads in TP-rank order, as in the unsharded projection), by one all-to-all."""
+    T = get_tp_world_size()
+    y = funcol.all_to_all_single(x.contiguous(), None, None, get_tp_group())  # [T (head group), S, C/T]
+    S = x.shape[0] // T
+    return y.view(T, S, x.shape[1]).transpose(0, 1).reshape(S, T * x.shape[1])
 def _row_linear(layer, x):
     """RowParallelLinear: local matmul, in-graph all-reduce, then the (full) bias."""
     out = _all_reduce(_mm(x, layer))
@@ -326,7 +346,8 @@ class _FastBlockSP(nn.Module):
     reach a real token: they are dropped before attention, and every other op is token-wise.
     """
 
-    def __init__(self, block, attn_impl, batch, seq_len, n_pad, full_cross=None):
+    def __init__(self, block, attn_impl, batch, seq_len, n_pad, full_cross=None, full_o=None,
+                 free_unused=False):
         """full_cross: an unsharded WanCrossAttention (bf16, on device). When given (batch 1 only),
         cross-attention runs on this rank's token shard with all heads and the precomputed
         all-head K/V -- no collectives."""
@@ -338,6 +359,17 @@ class _FastBlockSP(nn.Module):
         self.Np = n_pad
         assert full_cross is None or batch == 1, "local cross-attention needs batch 1 (CFG-parallel)"
         self.xca = full_cross
+        self.full_o = full_o  # unsharded self-attention O-projection (FAST_A2A_O), or None
+        self.mlp_w = None
+        if FAST_NKI_MLP:  # nkilib mlp layouts: up [H, I] (+ bias [1, I]), down [I, H]
+            f0, f2 = block.ffn[0], block.ffn[2]
+            t = lambda w: w.detach().cpu().t().contiguous().to(w.device)  # noqa: E731 (transpose on CPU)
+            self.mlp_w = (t(f0.weight), f0.bias.detach().view(1, -1).contiguous(), t(f2.weight))
+            if free_unused:  # the FFN now reads only the transposed copies (and ffn[2].bias)
+                f0.weight = nn.Parameter(f0.weight.new_empty(0), requires_grad=False)
+                f2.weight = nn.Parameter(f2.weight.new_empty(0), requires_grad=False)
+        if full_o is not None and free_unused:  # the sharded O-projection is unused then
+            block.self_attn.o.weight = nn.Parameter(block.self_attn.o.weight.new_empty(0), requires_grad=False)
 
     def _self_attn(self, q, k, v):
         if self.attn_impl == "constmax":
@@ -354,10 +386,16 @@ class _FastBlockSP(nn.Module):
         C = xs.shape[-1]
         nf = e.shape[1]
         em = blk.modulation.unsqueeze(0) + e  # [1, F, 6, C], as in WanAttentionBlock
-        et = torch.matmul(oh, em.reshape(nf, 6 * C)).view(-1, 6, C)  # [S, 6, C]
+        if FAST_MOD_SPLIT:
+            emf = em[0]  # [F, 6, C]
+            mods = [torch.matmul(oh, emf[:, j]) for j in range(6)]  # 6 x [S, C]
+            et = None
+        else:
+            et = torch.matmul(oh, em.reshape(nf, 6 * C)).view(-1, 6, C)  # [S, 6, C]
+            mods = [et[:, j] for j in range(6)]
 
         # self-attention
-        h = blk.norm1(xs).to(torch.bfloat16) * (1 + et[:, 1]) + et[:, 0]
+        h = blk.norm1(xs).to(torch.bfloat16) * (1 + mods[1]) + mods[0]
         hf = _ag(h)  # [Np, C]
         q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
         q, k = _tp_rms_qk(q.unsqueeze(0), k.unsqueeze(0), sa.norm_q, sa.norm_k)
@@ -365,8 +403,11 @@ class _FastBlockSP(nn.Module):
         k = _rope(k[:, :N].reshape(1, N, n, d), cos, sin).view(B, L, n, d)
         v = v[:N].reshape(B, L, n, d)
         y = F.pad(self._self_attn(q, k, v).reshape(N, n * d), (0, 0, 0, Np - N))
-        y = _rs(_mm(y, sa.o)) + sa.o.bias
-        xs = xs + y * et[:, 2]
+        if self.full_o is not None:
+            y = _lin(_head2seq(y), self.full_o)  # [S, C]: my tokens, all heads, unsharded O
+        else:
+            y = _rs(_mm(y, sa.o)) + sa.o.bias
+        xs = xs + y * mods[2]
 
         # cross-attention; ck/cv precomputed once per prompt (_FastCrossKV / _LocalCrossKV)
         if self.xca is not None:
@@ -383,10 +424,19 @@ class _FastBlockSP(nn.Module):
             xs = xs + (_rs(_mm(y, ca.o)) + ca.o.bias)
 
         # FFN
-        h = blk.norm2(xs).to(torch.bfloat16) * (1 + et[:, 4]) + et[:, 3]
+        h = blk.norm2(xs).to(torch.bfloat16) * (1 + mods[4]) + mods[3]
         hf = _ag(h)
-        y = _rs(_mm(blk.ffn[1](_lin(hf, blk.ffn[0])), blk.ffn[2])) + blk.ffn[2].bias
-        return xs + y * et[:, 5]
+        if self.mlp_w is not None:
+            from nkilib.core.mlp.mlp import mlp
+            from nkilib.core.utils.common_types import ActFnType
+            w_up, b_up, w_down = self.mlp_w
+            y = mlp(hf.unsqueeze(0), w_up, w_up, w_down, up_proj_bias_tensor=b_up,
+                    activation_fn=ActFnType.GELU_Tanh_Approx, skip_gate_proj=True)
+            y = y[0] if isinstance(y, (list, tuple)) else y
+            y = _rs(y.reshape(Np, C)) + blk.ffn[2].bias
+        else:
+            y = _rs(_mm(blk.ffn[1](_lin(hf, blk.ffn[0])), blk.ffn[2])) + blk.ffn[2].bias
+        return xs + y * mods[5]
 
 
 class _FastPatchSP(nn.Module):
@@ -567,7 +617,8 @@ class FastWanDiT:
         noise_pred = fast(latent, t)            # latent [C, F, H, W], t scalar tensor
     """
 
-    def __init__(self, model, grid, guide_scale, device, cfg_group=None, pair_group=None, full_cross=None):
+    def __init__(self, model, grid, guide_scale, device, cfg_group=None, pair_group=None, full_cross=None,
+                 full_o=None):
         """cfg_group=None: batched CFG (batch 2 = [cond, uncond]) over one TP group.
         cfg_group=0/1 (CFG-parallel): this rank's TP group runs only the cond (0) or uncond (1)
         branch at batch 1; pair_group links it to the same TP rank of the other group, and the
@@ -629,8 +680,15 @@ class FastWanDiT:
             local_x = full_cross is not None and batch == 1
             self.blocks = [
                 torch.compile(_FastBlockSP(b, impl, batch, self.seq_len, n_pad,
-                                           full_cross=full_cross[i] if local_x else None), **kw)
+                                           full_cross=full_cross[i] if local_x else None,
+                                           full_o=full_o[i] if (full_o is not None and batch == 1) else None,
+                                           free_unused=True),
+                              **kw)
                 for i, (b, impl) in enumerate(zip(model.blocks, impls))]
+            if full_o is not None and batch == 1:
+                logger.info("[fast_dit] self-attention output: all-to-all + unsharded O-projection")
+            if FAST_NKI_MLP:
+                logger.info("[fast_dit] FFN: nkilib mlp kernel (up + GELU-tanh + down in one call)")
             if local_x:
                 self.cross_kv = [torch.compile(_LocalCrossKV(fc), **kw) for fc in full_cross]
                 logger.info("[fast_dit] cross-attention: local on the token shard, all heads (no collectives)")

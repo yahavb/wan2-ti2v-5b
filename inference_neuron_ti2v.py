@@ -254,6 +254,11 @@ def main():
             and os.environ.get("FAST_LOCAL_CROSS", "0") == "1":
         import copy
         full_cross = [copy.deepcopy(b.cross_attn).to(torch.bfloat16) for b in model.blocks]
+    # FAST_A2A_O=1 (on top of FAST_LOCAL_CROSS): keep an unsharded copy of every block's
+    # self-attention O-projection; the attention output reaches it by all-to-all (models/fast_dit.py).
+    full_o = None
+    if full_cross is not None and os.environ.get("FAST_A2A_O", "0") == "1":
+        full_o = [copy.deepcopy(b.self_attn.o).to(torch.bfloat16) for b in model.blocks]
     shard_model_tp(model, tp_rank, dit_tp)
     cfg_group, pair_group = None, None
     if CFG_PARALLEL:
@@ -468,13 +473,15 @@ def main():
     if full_cross is not None:
         # Moved only now, after T5 was freed: rank T5_RANK shares an HBM stack with a neighbour.
         full_cross = [fc.to(NEURON_DEVICE).eval().requires_grad_(False) for fc in full_cross]
+    if full_o is not None:
+        full_o = [fo.to(NEURON_DEVICE).eval().requires_grad_(False) for fo in full_o]
     if DIT_FAST:
         from models.fast_dit import FastWanDiT
         grid = (T_latent, H_latent // patch_size[1], W_latent // patch_size[2])
         assert grid[0] * grid[1] * grid[2] == seq_len, f"grid {grid} != seq_len {seq_len}"
         fast_dit = FastWanDiT(model, grid=grid, guide_scale=config.sample_guide_scale,
                               device=NEURON_DEVICE, cfg_group=cfg_group, pair_group=pair_group,
-                              full_cross=full_cross)
+                              full_cross=full_cross, full_o=full_o)
         fast_dit.set_context(context[0], context_null[0])
 
     # Save original latent for re-use across runs

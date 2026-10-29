@@ -208,6 +208,12 @@ spec:
               value: "1"
             - name: FAST_LOCAL_CROSS
               value: "1"
+            - name: FAST_A2A_O
+              value: "1"
+            - name: FAST_NKI_MLP
+              value: "1"
+            - name: FAST_MOD_SPLIT
+              value: "1"
             - name: CFG_GROUPS
               value: "interleave"
             - name: VAE_FUSE_NORM

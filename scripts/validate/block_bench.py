@@ -12,6 +12,7 @@ torchrun --nproc_per_node=8 block_bench.py [variant ...]
   ar_only  3 all-reduces of a [B, L, C] bf16 tensor
   sp       _FastBlockSP (Megatron SP); output rows checked against ref
   sp_lx    _FastBlockSP with local all-head cross-attention (CFG_PAR=1 only)
+  sp_a2o   sp_lx + all-to-all output + unsharded O-projection (FAST_A2A_O; CFG_PAR=1 only)
            SP timing probes: SP_NOCOMM, SP_NOQKN, SP_NOROPE, SP_NOSA, SP_NOXA (=1 each)
 The ablations change the math; they are timing probes only.
 Env: LAYER (0), REPS (20), SELF_IMPL (cte|constmax|sdpa), FAST_CROSS_IMPL,
@@ -154,6 +155,7 @@ def main():
     bsz = 1 if cfg_par else B
     import copy
     full_cross = copy.deepcopy(blk.cross_attn).to(torch.bfloat16).to(dev)
+    full_o = copy.deepcopy(blk.self_attn.o).to(torch.bfloat16).to(dev)
     init_tp_group(tp_degree=tp)
     shard_model_tp(m, rank % tp, tp)
     blk = blk.to(torch.bfloat16).to(dev)
@@ -189,12 +191,13 @@ def main():
             xflat = F.pad(x.reshape(N, DIM), (0, 0, 0, Np - N))
             xs = xflat[shard * S:(shard + 1) * S].contiguous()
             oh = fd._sp_onehot(bsz, L, GRID[1] * GRID[2], GRID[0], Np, shard, tpw).to(dev)
-            lx = var == "sp_lx"
+            lx = var in ("sp_lx", "sp_a2o")
             kk, vv = ck, cv
             if lx:
                 kk, vv = torch.compile(fd._LocalCrossKV(full_cross), backend="neuron", dynamic=False)(ctx)
             args = (xs, e0, oh, cos.repeat(1, bsz, 1, 1), sin.repeat(1, bsz, 1, 1), kk, vv)
-            unit = fd._FastBlockSP(blk, SELF_IMPL, bsz, L, Np, full_cross=full_cross if lx else None)
+            unit = fd._FastBlockSP(blk, SELF_IMPL, bsz, L, Np, full_cross=full_cross if lx else None,
+                                   full_o=full_o if var == "sp_a2o" else None)
             yr = F.pad(yr.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S].float().cpu()
             n_valid = max(0, min(S, N - shard * S))
             sp_ref = (yr, n_valid)
