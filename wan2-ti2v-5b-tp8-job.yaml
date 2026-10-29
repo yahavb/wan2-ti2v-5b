@@ -231,7 +231,7 @@ spec:
             - name: VAE_FUSE_SHORTCUT
               value: "1"
             - name: VAE_TCHUNK
-              value: "2"
+              value: "4"
             - name: VAE_STRIPS
               value: "1"
             - name: VAE_STRIP_NKI_NORM

@@ -45,6 +45,12 @@ TP_DEGREE = int(os.environ.get("TP_DEGREE", "8"))
 SP_DEGREE = int(os.environ.get("SP_DEGREE", "1"))
 T5_RANK = int(os.environ.get("T5_RANK", "8"))
 VAE_RANK = 0
+PROMPT = (
+    "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
+    "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
+    "Blurred beach scenery forms the background featuring crystal-clear waters, "
+    "distant green hills, and a blue sky dotted with white clouds."
+)
 VAE_TP_DEGREE = int(os.environ.get("VAE_TP_DEGREE", "1"))  # 1=single rank (existing), 2=channel-parallel TP
 VAE_TP_RANKS = list(range(VAE_TP_DEGREE))  # e.g. [0] for TP=1, [0,1] for TP=2
 # VAE_TILED=1: every rank loads the VAE and decodes a share of overlapping spatial tiles
@@ -199,8 +205,15 @@ def main():
         # Move T5 model to Neuron and compile
         text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
         logger.info(f"T5 loaded on Neuron eager (rank {T5_RANK})")
-    else:
-        text_encoder = None
+        # Encode both prompts now and free T5 before the VAE and DiT weights land on this rank.
+        # Freed after them, T5's ~11 GB left ~1.9 GB of cached fragments here for the whole run,
+        # which the HBM-stack neighbour then ran short of during the VAE.
+        t5_out = [text_encoder([p], NEURON_DEVICE)[0].to(torch.bfloat16).cpu()
+                  for p in (PROMPT, config.sample_neg_prompt)]
+        del text_encoder
+        gc.collect()
+        torch.neuron.empty_cache()
+    text_encoder = None
 
     # ── Load VAE ──
     # VAE_TP_DEGREE=1 (default): single rank, NKI kernels, existing path
@@ -322,41 +335,24 @@ def main():
     if rank == 0:
         logger.info("All models loaded!")
 
-    # ── Encode prompt (T5 on T5_RANK, broadcast to all) ──
-    prompt = (
-        "Summer beach vacation style, a white cat wearing sunglasses sits on a surfboard. "
-        "The fluffy-furred feline gazes directly at the camera with a relaxed expression. "
-        "Blurred beach scenery forms the background featuring crystal-clear waters, "
-        "distant green hills, and a blue sky dotted with white clouds."
-    )
-    n_prompt = config.sample_neg_prompt
+    # ── Prompt (encoded on T5_RANK at load time), broadcast to all ──
 
     # All ranks: allocate buffers on device (same operation everywhere)
     ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
     ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
 
     if rank == T5_RANK:
-        # T5 inference on Neuron — IDs go to device, model runs on device, output on device
-        context = text_encoder([prompt], NEURON_DEVICE)
-        context_null = text_encoder([n_prompt], NEURON_DEVICE)
         # Pad to fixed size [1, 512, 4096] for broadcast
-        ctx_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
-        ctx_tensor[0, :context[0].shape[0]] = context[0].to(torch.bfloat16)
-        ctx_null_tensor = torch.zeros(1, 512, 4096, dtype=torch.bfloat16, device=NEURON_DEVICE)
-        ctx_null_tensor[0, :context_null[0].shape[0]] = context_null[0].to(torch.bfloat16)
+        for buf, c in zip((ctx_tensor, ctx_null_tensor), t5_out):
+            padded = torch.zeros(1, 512, 4096, dtype=torch.bfloat16)
+            padded[0, :c.shape[0]] = c
+            buf.copy_(padded.to(NEURON_DEVICE))
+        del t5_out
 
     dist.broadcast(ctx_tensor, src=T5_RANK)
     dist.broadcast(ctx_null_tensor, src=T5_RANK)
     context = [ctx_tensor]
     context_null = [ctx_null_tensor]
-
-    # Free T5 after encoding to reclaim memory
-    if rank == T5_RANK:
-        del text_encoder
-        gc.collect()
-        # Return T5's ~11 GB of cached blocks to the runtime: rank 2 shares an HBM stack with
-        # rank 3, which otherwise runs out during the VAE (reserved stayed at 13.9 GB).
-        torch.neuron.empty_cache()
 
     if rank == 0:
         logger.info("Prompt encoded and broadcast to all ranks")

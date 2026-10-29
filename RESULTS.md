@@ -31,11 +31,12 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | 0.60 | 6.0s | 2.5s | 8.6s | 0.0487* |
 | + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | 0.58 | 5.8s | 2.5s | 8.4s | 0.0484* |
 | + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | 0.58 | 5.8s | 2.0s | 7.9s | 0.0484* |
-| + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | **0.58** | **5.8s** | **1.8s** | **7.6s** | 0.0484* |
+| + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | 0.58 | 5.8s | 1.8s | 7.6s | 0.0484* |
+| + T5 freed before the other models load; 4 latent frames per VAE decoder call (`VAE_TCHUNK=4`) | **0.58** | **5.8s** | **1.7s** | **7.5s** | 0.0484* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
-VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1
+VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=4 DEVICE_SCHEDULER=1 MP4_VFORK=1
 FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1 VAE_STRIP_NKI_NORM=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
@@ -108,6 +109,19 @@ argument shapes, not closure values, so each (shape, halo source) kernel gets it
 name, ranks with equal shapes and other halo sources reused each other's traces (32 dB). Same
 latent, 8 ranks: decode 1.94 -> 1.74 s, 52.95 -> 53.01 dB vs the exact fp32 decode. Pipeline,
 alternating runs (2 warm runs each): VAE 2.01-2.03 -> 1.78-1.81 s, total 7.83-7.84 -> 7.56-7.61 s.
+
+T5 is now freed before the VAE and DiT weights are moved to its rank: it encodes both prompts
+right after it loads, the outputs go to the CPU, and its ~11 GB are freed before anything else
+lands on the device. Freed after them (as before), T5 left ~1.9 GB of cached fragments on its
+rank for the whole run (reserved after the VAE 9.9 GB vs 7.8 GB on the other ranks; returning the
+cache before the VAE did not help, the fragments re-formed), and its HBM-stack neighbour ran out
+of memory in the VAE with 4 latent frames per call. Latent and mp4 are byte-identical to before.
+With the strips, `VAE_TCHUNK=4` now fits: alternating runs on one device, VAE 1.79-1.80 ->
+1.67-1.70 s and total 7.56 -> 7.44-7.52 s over 5 processes without an allocation failure; device
+memory at the VAE peak 10.55-10.75 GB per core (neuron-monitor; the two cores of an HBM stack
+together at most 21.5 of 24 GB). 53.00 dB vs the exact fp32 decode (53.01 with 2 frames per call),
+57.3 dB vs the 2-frame decode; one mp4 hash over 4 runs. Most of the gain is per-call overhead:
+6 decoder calls instead of 11, so half the halo all-gathers and graph launches.
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

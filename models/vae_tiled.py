@@ -291,16 +291,20 @@ def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done):
                 part = torch.from_numpy(np.fromfile(path, dtype=np.int16)).view(torch.bfloat16)
                 parts.append(part.view(3, -1, rows, width))
                 os.remove(path)
+            t_in = time.time()  # every rank's part of this chunk has arrived
             acc = torch.cat(parts, dim=2).float()  # [3, f, H, W]
             if c == n_chunks - 1:
-                done["t_last_chunk"] = time.time()
+                done["t_last_chunk"] = t_in
             if finish is None:
                 chunks.append(acc)
                 continue
+            t_cat = time.time()
             v = finish(acc)  # [f, H, W, 3] uint8 numpy
+            t_fin = time.time()
             for fr in v:
                 writer.append_data(fr)
             frames.append(v)
+            done["last"] = (len(v), t_cat - t_in, t_fin - t_cat, time.time() - t_fin)
         if finish is None:
             done["video"] = torch.cat(chunks, dim=1)
             return
@@ -351,9 +355,14 @@ def _decode_strips(vae, z, cpu_group, make_writer, finish, group):
     thread.join()
     if "error" in done:
         raise done["error"]
+    tail = ""
+    if "last" in done:  # the last chunk's frames, from arrival to the closed mp4
+        nf, a, b, w = done["last"]
+        tail = (f" (last chunk {nf} frames: arrived {done['t_last_chunk'] - t1:+.3f}s, cat {a * 1e3:.0f} ms, "
+                f"convert {b * 1e3:.0f} ms, write {w * 1e3:.0f} ms, close {done['t_close'] * 1e3:.0f} ms)")
     print(f"[vae_tiled] strips {world}x1 ({R} rows at 2x, latent windows of {n}) decode "
           f"max/min over ranks={max(gathered):.2f}/{min(gathered):.2f}s; tail after decode "
-          f"{time.time() - t1:.2f}s", flush=True)
+          f"{time.time() - t1:.2f}s{tail}", flush=True)
     return done.get("frames") if finish is not None else done["video"]
 
 
