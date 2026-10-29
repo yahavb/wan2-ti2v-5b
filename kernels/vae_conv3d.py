@@ -119,11 +119,12 @@ def pack_phase_filters(weight):
     return out
 
 
-def upsample_conv_subpixel(x, phase_filters, bias, halo_rows=None):
+def upsample_conv_subpixel(x, phase_filters, bias, halo_rows=None, phases_only=False):
     """x [B, C_in, T, h, w] -> nearest-2x + 3x3 conv output [B, C_out, T, 2h, 2w]: one 2x2 conv
     per phase on the low-res frames (2.25x fewer MACs, no 4x upsampled input), then one
     interleave copy. halo_rows (VAE_STRIPS): (rows -1 .. h-1, rows 0 .. h) of x with the
-    neighbours' rows, [B, C_in, T, h + 1, w] each; the phases then pad W only."""
+    neighbours' rows, [B, C_in, T, h + 1, w] each; the phases then pad W only. phases_only: return
+    the 4 phase outputs [B, C_out, T, h, w] (index 2*py + px) without interleaving them."""
     B, _, T, h, w = x.shape
     if halo_rows is None:
         x = x.to(phase_filters[0].dtype).contiguous()
@@ -131,6 +132,8 @@ def upsample_conv_subpixel(x, phase_filters, bias, halo_rows=None):
     else:
         rows = [r.to(phase_filters[0].dtype).contiguous() for r in halo_rows]  # by py
         ys = [_PHASES_HP0[p % 2](rows[p // 2], phase_filters[p], bias) for p in range(4)]
+    if phases_only:
+        return ys
     c_out = ys[0].shape[1]
     y = torch.stack(ys, dim=2).view(B, c_out, 2, 2, T, h, w)       # [B, C, py, px, T, h, w]
     return y.permute(0, 1, 4, 5, 2, 6, 3).reshape(B, c_out, T, 2 * h, 2 * w)

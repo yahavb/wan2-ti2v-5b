@@ -32,12 +32,14 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + self-attention output by all-to-all into an unsharded O-projection (`FAST_A2A_O=1`), FFN as one nkilib mlp kernel (`FAST_NKI_MLP=1`), modulation as 6 one-hot matmuls (`FAST_MOD_SPLIT=1`) | 0.58 | 5.8s | 2.5s | 8.4s | 0.0484* |
 | + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | 0.58 | 5.8s | 2.0s | 7.9s | 0.0484* |
 | + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | 0.58 | 5.8s | 1.8s | 7.6s | 0.0484* |
-| + T5 freed before the other models load; 4 latent frames per VAE decoder call (`VAE_TCHUNK=4`) | **0.58** | **5.8s** | **1.7s** | **7.5s** | 0.0484* |
+| + T5 freed before the other models load; 4 latent frames per VAE decoder call (`VAE_TCHUNK=4`) | 0.58 | 5.8s | 1.7s | 7.5s | 0.0484* |
+| + cross-attention over the real context tokens plus weighted copies of the identical pad key (`FAST_CROSS_MERGE=1`); VAE: sub-pixel interleave + shortcut as one NKI kernel (`VAE_SUBPIXEL_MERGE=1`), compiled own-rows middle attention (`VAE_STRIP_ATTN=1`), 1x1 shortcuts as one matmul (`VAE_CONV1X1_MM=1`) | **0.57** | **5.7s** | **1.6s** | **7.3s** | 0.0485* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=4 DEVICE_SCHEDULER=1 MP4_VFORK=1
-FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1 VAE_STRIP_NKI_NORM=1`. The `VAE_FUSE_CAT` and
+FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1 VAE_STRIP_NKI_NORM=1 FAST_CROSS_MERGE=1
+VAE_SUBPIXEL_MERGE=1 VAE_STRIP_ATTN=1 VAE_CONV1X1_MM=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
@@ -122,6 +124,30 @@ memory at the VAE peak 10.55-10.75 GB per core (neuron-monitor; the two cores of
 together at most 21.5 of 24 GB). 53.00 dB vs the exact fp32 decode (53.01 with 2 frames per call),
 57.3 dB vs the 2-frame decode; one mp4 hash over 4 runs. Most of the gain is per-call overhead:
 6 decoder calls instead of 11, so half the halo all-gathers and graph launches.
+
+`FAST_CROSS_MERGE=1`: the T5 context is zero-padded to 512 tokens and the model has no context mask,
+so all padded positions have the same text embedding and therefore the same K and V in every block.
+Attention over m identical keys equals attention over c copies of that key with log(m / c) added to
+their scores, so the 512 keys become the n real ones (70 for the prompt, 126 for the negative
+prompt) plus copies of the pad key, 128 in all for both CFG groups; exact up to rounding (1e-8
+rel-RMS in fp64, `scripts/validate/cross_merge_bench.py`). The cross-attention then runs as SDPA
+with the log-weights as an fp32 additive mask: 0.39 ms per block against 1.11 ms for
+`attention_cte` on 512 keys (attention_cte itself got slower at 128 keys, 2.6 ms). The premise is
+checked on the context at run time (its nonzero rows must be a prefix), else all 512 keys are used.
+VAE (one 4-frame decoder call in rank 0's trace: 268 graph executions, 274 ms busy): the end of each
+upsample stage was an eager stack + permute of the 4 sub-pixel phases and the compiled shortcut +
+add graph (~4-8 ms per call at the 2x->4x and 4x->8x stages); `kernels/vae_subpixel_merge.py` does
+the interleave and the DupUp3D shortcut add in one pass, bit-identical (4x->8x stage, 16 frames, one
+core: 3.87 -> 1.20 ms; `scripts/validate/subpix_merge_check.py`). The middle attention block ran as
+~90 eager executions per call (a per-frame NKI loop on the gathered full frame); `VAE_STRIP_ATTN`
+computes only the rank's own rows against the gathered frame in one compiled graph (fp32 scores
+and softmax; 57.2 dB vs the NKI-loop decode). The two 1x1x1 ResidualBlock shortcuts ran as an eager
+zero `F.pad` copy plus the compiler's conv; `VAE_CONV1X1_MM` makes them one matmul graph,
+bit-identical. Same latent, 8 ranks: decode 1.60 -> 1.54 s with the first and third, 53.00 dB vs the
+exact fp32 decode. Pipeline, alternating runs on one device with everything in this row (2 warm runs
+each, the dump run excluded): denoise 5.76-5.84 -> 5.65-5.74 s, VAE 1.675-1.678 -> 1.61-1.62 s
+(decode 1.52 -> 1.45-1.46 s), total 7.43-7.51 -> 7.27-7.36 s; step-0 noise prediction 0.0485 vs fp32;
+VAE-phase device memory 10.2-10.4 GB per core (was 10.6-10.8); one mp4 hash over 4 runs.
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

@@ -197,6 +197,11 @@ class CausalConv3d(nn.Conv3d):
                 _nki_conv3d is not None and x.shape[2] + padding[4] - 2 >= _nki_conv3d.MIN_D_OUT
                 and _nki_conv3d.eligible(self)):
             return self._nki_forward(x, padding, hpad=hpad)
+        if (_conv1x1 is not None and _STRIP is not None  # the strip decode's 1x1 shortcuts only
+                and tuple(self.kernel_size) == (1, 1, 1) and not any(padding)
+                and tuple(self.stride) == (1, 1, 1) and self.groups == 1 and self.bias is not None
+                and x.shape[0] == 1 and _is_neuron_tensor(x)):
+            return _conv1x1(x, self.weight, self.bias)
         x = F.pad(x, padding)
 
         return super().forward(x)
@@ -283,6 +288,55 @@ _STRIP = None
 # (kernels/vae_strip_norm.py) instead of the compiled graph: 1.9 -> 0.58 ms at the 8x level
 # (C=256), 3.6 -> 1.15 ms for C=512, on one core.
 _STRIP_NKI_NORM = os.environ.get("VAE_STRIP_NKI_NORM", "0") == "1"
+# VAE_STRIP_ATTN=1: the middle attention block runs as one compiled graph per decoder call that
+# computes only this rank's rows (queries) against the gathered full frame (keys and values),
+# instead of the eager per-frame NKI loop on the full frame (~35 graph launches per call).
+_STRIP_ATTN = os.environ.get("VAE_STRIP_ATTN", "0") == "1"
+# VAE_SUBPIXEL_MERGE=1 (with VAE_SUBPIXEL + VAE_FUSE_SHORTCUT): each upsample stage ends with one NKI
+# kernel (kernels/vae_subpixel_merge.py) that interleaves the 4 sub-pixel phases and adds the DupUp3D
+# shortcut, instead of an eager stack + permute and the compiled shortcut + add graph.
+_VAE_SUBPIXEL_MERGE = os.environ.get("VAE_SUBPIXEL_MERGE", "0") == "1"
+# VAE_CONV1X1_MM=1 (with VAE_STRIPS): in the strip decode, the ResidualBlock shortcut 1x1x1 convs
+# (1024->512, 512->256) run as one compiled channel matmul instead of an eager zero F.pad copy and
+# the compiler's conv (~2-4 ms per decoder call at the 4x/8x levels).
+_VAE_CONV1X1_MM = os.environ.get("VAE_CONV1X1_MM", "0") == "1"
+
+
+def _conv1x1_impl(x, w, b):
+    """[1, C_in, T, H, W] x Conv3d weight [C_out, C_in, 1, 1, 1] + bias -> [1, C_out, T, H, W]."""
+    _, C, T, H, W = x.shape
+    y = torch.matmul(w.view(w.shape[0], C), x.reshape(C, T * H * W)) + b.view(-1, 1)
+    return y.view(1, -1, T, H, W)
+
+
+_conv1x1 = torch.compile(_conv1x1_impl, backend="neuron", dynamic=False) if _VAE_CONV1X1_MM else None
+
+
+def _strip_attn_impl(parts, gamma, w_qkv, b_qkv, w_p, b_p, lo_all: tuple, rank: int):
+    """AttentionBlock.forward for one rank of a strip decode. parts [world, C, T, h, W]: every
+    rank's latent-resolution window (all-gathered); returns this rank's window of the block output
+    [1, C, T, h, W]. Same math as the block: RMS_norm, 1x1 QKV, single-head softmax attention over
+    the frame (scores and softmax in fp32), 1x1 projection, residual."""
+    _, C, T, h, W = parts.shape
+    rows, end = [], 0
+    for r, (a, n) in enumerate(lo_all):  # the frame's rows, a shared row taken from the upper window
+        if a + n > end:
+            rows.append(parts[r, :, :, end - a:])
+            end = a + n
+    x = torch.cat(rows, dim=2).permute(1, 0, 2, 3).reshape(T, C, -1)  # [T, C, H*W]
+    a0, n0 = lo_all[rank]
+    rms = x.float().pow(2).mean(1, keepdim=True).clamp(min=1e-8).rsqrt()
+    xn = (x * rms).to(gamma.dtype) * gamma.view(1, C, 1)
+    wq, wk, wv = w_qkv.view(3, C, C).unbind(0)
+    bq, bk, bv = b_qkv.view(3, C, 1).unbind(0)
+    q = torch.matmul(wq, xn[:, :, a0 * W:(a0 + n0) * W]) + bq  # [T, C, n0*W]
+    k = torch.matmul(wk, xn) + bk  # [T, C, H*W]
+    v = torch.matmul(wv, xn) + bv
+    s = torch.bmm(q.transpose(1, 2), k, out_dtype=torch.float32) * C ** -0.5  # [T, n0*W, H*W]
+    pr = torch.softmax(s, dim=-1).to(v.dtype)
+    o = torch.bmm(v, pr.transpose(1, 2))  # [T, C, n0*W]
+    y = torch.matmul(w_p.view(C, C), o) + b_p.view(C, 1)
+    return y.view(T, C, n0, W).permute(1, 0, 2, 3).unsqueeze(0) + parts[rank:rank + 1]
 
 
 def _strip_edges_impl(x, rows: tuple):
@@ -383,6 +437,14 @@ class StripCtx:
         z, cache = kern(x.reshape(C, T * h * W), gamma.reshape(C, 1).to(x.dtype),
                         prev.reshape(C, CACHE_T * (h + 2) * W), g.reshape(-1, T * W))
         return z.view(1, C, T + CACHE_T, h + 2, W), cache.view(1, C, CACHE_T, h + 2, W)
+
+    def attention(self, blk, x):
+        """AttentionBlock blk on this rank's window x [1, C, T, h, W] (VAE_STRIP_ATTN)."""
+        if getattr(self, "_attn", None) is None:
+            self._attn = torch.compile(_strip_attn_impl, backend="neuron", dynamic=False)
+        parts = self._ag(x.contiguous())  # [world, C, T, h, W]
+        return self._attn(parts, blk.norm.gamma, blk.to_qkv.weight, blk.to_qkv.bias, blk.proj.weight,
+                          blk.proj.bias, tuple(tuple(w) for w in self.lo_all), self.rank)
 
     def full_frame(self, x):
         """[1, C, T, h, W] latent-resolution windows of all ranks -> the full frame (a row shared
@@ -551,7 +613,9 @@ class Resample(nn.Module):
         else:
             self.resample = nn.Identity()
 
-    def forward(self, x, feat_cache=None, feat_idx=[0]):
+    def forward(self, x, feat_cache=None, feat_idx=[0], phases=False):
+        """phases (VAE_SUBPIXEL_MERGE): return the sub-pixel conv's 4 phase outputs, not
+        interleaved, when the sub-pixel path runs (the caller interleaves them)."""
         b, c, t, h, w = x.size()
         if self.mode == "upsample3d":
             if feat_cache is not None:
@@ -593,7 +657,7 @@ class Resample(nn.Module):
                     x = x.reshape(b, c, t * 2, h, w)
         if (_VAE_SUBPIXEL and self.mode in ("upsample2d", "upsample3d") and _nki_conv3d is not None
                 and _is_neuron_tensor(x) and self.dim >= _nki_conv3d.MIN_CHANNELS):
-            return self._subpixel(x)
+            return self._subpixel(x, phases)
         t = x.shape[2]
         x = rearrange(x, "b c t h w -> (b t) c h w")
         x = self.resample(x)
@@ -613,7 +677,7 @@ class Resample(nn.Module):
                     feat_idx[0] += 1
         return x
 
-    def _subpixel(self, x):
+    def _subpixel(self, x, phases=False):
         """VAE_SUBPIXEL: nearest-2x + 3x3 conv on [b, c, t, h, w] as 4 phase 2x2 convs on the
         low-res frames (kernels/vae_conv3d.upsample_conv_subpixel); no (b t) rearranges."""
         conv = self.resample[1]
@@ -621,11 +685,11 @@ class Resample(nn.Module):
             self._phase_filters = _nki_conv3d.pack_phase_filters(conv.weight)
             if not _NKI_CONV3D_CHECK:
                 conv.weight = nn.Parameter(conv.weight.new_empty(0), requires_grad=False)
-        if _STRIP is not None:  # exact strips: one low-res halo row above and below
-            out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias,
-                                                     halo_rows=_STRIP.phase_rows(x))
-        else:
-            out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias)
+        halo = _STRIP.phase_rows(x) if _STRIP is not None else None  # exact strips: halo rows
+        out = _nki_conv3d.upsample_conv_subpixel(x, self._phase_filters, conv.bias, halo_rows=halo,
+                                                 phases_only=phases)
+        if phases:
+            return out
         if _NKI_CONV3D_CHECK and (tuple(x.shape), "subpix") not in _nki_conv3d_checked:
             _nki_conv3d_checked.add((tuple(x.shape), "subpix"))
             t = x.shape[2]
@@ -740,6 +804,8 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
+        if _STRIP is not None and _STRIP_ATTN:  # own rows against the gathered frame, one graph
+            return _STRIP.attention(self, x)
         if _STRIP is not None:  # global attention over the frame: run it on the gathered frame
             ctx = _STRIP
             a, n = ctx.lo_all[ctx.rank]
@@ -1025,8 +1091,18 @@ class Up_ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         x_main = x if _dupup_add is not None else x.clone()
-        for module in self.upsamples:
-            x_main = module(x_main, feat_cache, feat_idx)
+        last = len(self.upsamples) - 1
+        merge = (_VAE_SUBPIXEL_MERGE and self.avg_shortcut is not None and _is_neuron_tensor(x)
+                 and isinstance(self.upsamples[last], Resample))
+        for mi, module in enumerate(self.upsamples):
+            if merge and mi == last:
+                x_main = module(x_main, feat_cache, feat_idx, phases=True)
+            else:
+                x_main = module(x_main, feat_cache, feat_idx)
+        if merge and isinstance(x_main, list):  # interleave + shortcut in one NKI kernel
+            from kernels.vae_subpixel_merge import merge_call
+            sc = self.avg_shortcut
+            return merge_call(x_main, x, sc.factor_t, sc.repeats, first_chunk)
         if self.avg_shortcut is not None:
             if _dupup_add is not None and _is_neuron_tensor(x):
                 sc = self.avg_shortcut

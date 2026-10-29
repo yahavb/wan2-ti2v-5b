@@ -214,6 +214,8 @@ spec:
               value: "1"
             - name: FAST_MOD_SPLIT
               value: "1"
+            - name: FAST_CROSS_MERGE
+              value: "1"
             - name: CFG_GROUPS
               value: "interleave"
             - name: VAE_FUSE_NORM
@@ -235,6 +237,12 @@ spec:
             - name: VAE_STRIPS
               value: "1"
             - name: VAE_STRIP_NKI_NORM
+              value: "1"
+            - name: VAE_SUBPIXEL_MERGE
+              value: "1"
+            - name: VAE_STRIP_ATTN
+              value: "1"
+            - name: VAE_CONV1X1_MM
               value: "1"
             - name: DEVICE_SCHEDULER
               value: "1"

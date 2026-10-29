@@ -60,6 +60,14 @@ FAST_NKI_MLP = os.environ.get("FAST_NKI_MLP", "0") == "1"
 # where each vector is used, instead of one [S, F] @ [F, 6C] product materialized as a [S, 6, C]
 # tensor (72 MB per block). Same values (a one-hot row selects one row exactly).
 FAST_MOD_SPLIT = os.environ.get("FAST_MOD_SPLIT", "0") == "1"
+# FAST_CROSS_MERGE=1 (with local cross-attention): the text context is zero-padded to 512 tokens
+# and the model has no context mask, so every padded position gets the same embedding and the same
+# K and V in every block. Attention over m identical keys equals attention over c copies of the key
+# with log(m / c) added to their scores, so the 512 keys become the n real ones plus copies of the
+# pad key, 128 in all (multiple of 128 >= n + 1): exact up to rounding. Cross-attention then runs
+# as SDPA with the log-weights as an fp32 additive mask (1.11 -> 0.39 ms per block vs attention_cte
+# on 512 keys, scripts/validate/cross_merge_bench.py).
+FAST_CROSS_MERGE = os.environ.get("FAST_CROSS_MERGE", "0") == "1"
 # FAST_TIMING=1: device-sync around each compiled unit and log per-block ms (diagnostic only;
 # the syncs serialize host and device, so the total is a little above the untimed step).
 FAST_TIMING = os.environ.get("FAST_TIMING", "0") == "1"
@@ -134,6 +142,24 @@ def _rs(x):
     if get_tp_world_size() <= 1:
         return x
     return funcol.reduce_scatter_tensor(x, "sum", 0, get_tp_group())
+
+
+def _sdpa_attn_bias(q, k, v, w):
+    """q [1, Lq, H, d], k/v [1, Lk, H, d], w [Lk] fp32 additive score bias -> [1, Lq, H, d]:
+    softmax(q k^T / sqrt(d) + w) v (FAST_CROSS_MERGE)."""
+    out = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                         attn_mask=w.view(1, 1, 1, -1))
+    return out.transpose(1, 2)
+
+
+def _real_len(ctx):
+    """Number of real tokens of a zero-padded context [1, L, D] (its nonzero rows must be a
+    prefix), or None if the context is not of that form."""
+    nz = ctx[0].float().abs().amax(-1).ne(0).cpu()
+    n = int(nz.sum())
+    if n == 0 or n >= nz.numel() or not bool(nz[:n].all()):
+        return None
+    return n
 
 
 def _head2seq(x):
@@ -378,7 +404,8 @@ class _FastBlockSP(nn.Module):
             return _cte(q, k, v)
         return _sdpa(q, k, v)
 
-    def forward(self, xs, e, oh, cos, sin, ck, cv):
+    def forward(self, xs, e, oh, cos, sin, ck, cv, cb=None):
+        """cb: [Lk] fp32 score bias of merged cross-attention keys (FAST_CROSS_MERGE), or None."""
         blk = self.block
         sa, ca = blk.self_attn, blk.cross_attn
         n, d = sa.num_heads, sa.head_dim
@@ -414,7 +441,10 @@ class _FastBlockSP(nn.Module):
             xa = self.xca
             nh, hd = xa.num_heads, xa.head_dim
             q = _local_rms(_lin(blk.norm3(xs), xa.q), xa.norm_q).view(1, -1, nh, hd)  # [1, S, H, d]
-            y = _cte(q, ck, cv) if FAST_CROSS_IMPL == "cte" else _sdpa(q, ck, cv)
+            if cb is not None:
+                y = _sdpa_attn_bias(q, ck, cv, cb)
+            else:
+                y = _cte(q, ck, cv) if FAST_CROSS_IMPL == "cte" else _sdpa(q, ck, cv)
             xs = xs + _lin(y.reshape(-1, nh * hd), xa.o)
         else:
             hf = _ag(blk.norm3(xs))
@@ -678,6 +708,7 @@ class FastWanDiT:
             self.sin = self.sin.repeat(1, batch, 1, 1)
             self.patch = torch.compile(_FastPatchSP(model.patch_embedding, batch, n_pad, shard, tp), **kw)
             local_x = full_cross is not None and batch == 1
+            self.local_cross = local_x
             self.blocks = [
                 torch.compile(_FastBlockSP(b, impl, batch, self.seq_len, n_pad,
                                            full_cross=full_cross[i] if local_x else None,
@@ -708,6 +739,7 @@ class FastWanDiT:
                     _FastHeadCfgPar(model.head, self.grid, model.patch_size, model.out_dim, guide_scale,
                                     pair_group=pair_group), **kw)
         self.context = None
+        self.cross_bias = None
         cfg = "batch2" if cfg_group is None else f"parallel(group {cfg_group})"
         logger.info(f"[fast_dit] grid={self.grid} L={self.seq_len} attn={FAST_ATTN_IMPL} "
                     f"cross={FAST_CROSS_IMPL} fullgraph={FAST_FULLGRAPH} blocks={len(self.blocks)} "
@@ -719,7 +751,32 @@ class FastWanDiT:
         else:
             ctx = ctx_cond if self.cfg_group == 0 else ctx_null  # [1, 512, 4096]
         context = self.text(ctx.to(torch.bfloat16))
+        self.cross_bias = None
+        if FAST_CROSS_MERGE and getattr(self, "local_cross", False):
+            context = self._merge_pad_keys(context, ctx_cond, ctx_null)
         self.context = [kv(context) for kv in self.cross_kv]  # per block (k, v)
+
+    def _merge_pad_keys(self, context, ctx_cond, ctx_null):
+        """FAST_CROSS_MERGE: the text embeddings [1, 512, C] -> the n real rows plus copies of a
+        pad row, LK rows in all; sets self.cross_bias (log-weights of the copies). LK is the same
+        for both CFG groups (from the longer prompt), so every rank compiles the same shapes."""
+        import math
+        lens = [_real_len(c) for c in (ctx_cond, ctx_null)]
+        Lc = context.shape[1]
+        if None in lens:
+            logger.warning(f"[fast_dit] FAST_CROSS_MERGE: context not zero-padded ({lens}); all {Lc} keys")
+            return context
+        lk = 128 * -(-(max(lens) + 1) // 128)
+        if lk >= Lc:
+            return context
+        n = lens[0] if self.cfg_group == 0 else lens[1]
+        idx = torch.tensor(list(range(n)) + [n] * (lk - n), device=context.device)
+        w = torch.zeros(lk, dtype=torch.float32)
+        w[n:] = math.log((Lc - n) / (lk - n))
+        self.cross_bias = w.to(context.device)
+        logger.info(f"[fast_dit] cross-attention: {n} real + {Lc - n} pad keys -> {lk} keys "
+                    f"(pad copies weighted x{(Lc - n) / (lk - n):.2f}; tokens per group {lens})")
+        return context.index_select(1, idx)
 
     def _head(self, x, e):
         if self.sp:
@@ -729,6 +786,8 @@ class FastWanDiT:
     def _block(self, i, x, e0):
         ck, cv = self.context[i]
         if self.sp:
+            if self.cross_bias is not None:
+                return self.blocks[i](x, e0, self.oh, self.cos, self.sin, ck, cv, self.cross_bias)
             return self.blocks[i](x, e0, self.oh, self.cos, self.sin, ck, cv)
         return self.blocks[i](x, e0, self.cos, self.sin, ck, cv)
 
