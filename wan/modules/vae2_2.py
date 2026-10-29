@@ -34,6 +34,10 @@ _VAE_FUSE_RES = os.environ.get("VAE_FUSE_RES", "0") == "1"
 # permute, two full-resolution copies) and the final add run as one compiled graph, and the input
 # is no longer cloned (nothing writes to it). Pure data movement plus the same add: bit-identical.
 _VAE_FUSE_SHORTCUT = os.environ.get("VAE_FUSE_SHORTCUT", "0") == "1"
+# VAE_TCHUNK=n: after the first latent frame, the decoder takes n latent frames per call instead
+# of 1 (the causal caches make it the same computation): fewer, larger kernel calls. Every
+# eligible conv then sees 2+ frames, so all of them are pre-packed for the nkilib kernel.
+_VAE_TCHUNK = max(1, int(os.environ.get("VAE_TCHUNK", "1")))
 # VAE_FULLGRAPH=1: fullgraph=True, so any graph break fails loudly instead of silently
 # splitting the decoder into fragments.
 _VAE_FULLGRAPH = os.environ.get("VAE_FULLGRAPH", "0") == "1"
@@ -1066,7 +1070,7 @@ class Decoder3d(nn.Module):
                     if not _NKI_CONV3D_CHECK:
                         m.weight = nn.Parameter(m.weight.new_empty(0), requires_grad=False)
                     n += 1
-        multi_frame = False  # past a temporal upsample: chunks after the first have 2+ frames
+        multi_frame = _VAE_TCHUNK >= 2  # every stage sees 2+ frames after the first chunk
         for up in self.upsamples:
             for sub in up.upsamples:
                 if multi_frame:
@@ -1075,6 +1079,9 @@ class Decoder3d(nn.Module):
                     multi_frame = True
         if multi_frame:
             pack(self.head)
+        if _VAE_TCHUNK >= 2:
+            pack(self.conv1)
+            pack(self.middle)
         return n
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
@@ -1152,6 +1159,15 @@ def count_conv3d(model):
     return count
 
 
+def _decode_chunk_spans(t):
+    """(start, length) of each decoder call over t latent frames: frame 0 alone (first_chunk),
+    then VAE_TCHUNK frames per call."""
+    spans, i = [], 0
+    while i < t:
+        n = 1 if i == 0 else min(_VAE_TCHUNK, t - i)
+        spans.append((i, n))
+        i += n
+    return spans
 class WanVAE_(nn.Module):
 
     def __init__(
@@ -1241,24 +1257,17 @@ class WanVAE_(nn.Module):
         z = z.to(self.conv2.weight.dtype)
         if _VAE_COMPILE:
             return self._decode_compiled(z)
-        iter_ = z.shape[2]
         x = self.conv2(z)
-        for i in range(iter_):
+        out = None
+        for i, n in _decode_chunk_spans(z.shape[2]):
             self._conv_idx = [0]
-            if i == 0:
-                out = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                    first_chunk=True,
-                )
-            else:
-                out_ = self.decoder(
-                    x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
-                    feat_idx=self._conv_idx,
-                )
-                out = torch.cat([out, out_], 2)
+            out_ = self.decoder(
+                x[:, :, i:i + n, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx,
+                first_chunk=(i == 0),
+            )
+            out = out_ if out is None else torch.cat([out, out_], 2)
         out = unpatchify(out, patch_size=2)
         self.clear_cache()
         return out
@@ -1275,9 +1284,9 @@ class WanVAE_(nn.Module):
             z = z / scale[1] + scale[0]
         z = z.to(self.conv2.weight.dtype)
         x = self.conv2(z)
-        for i in range(z.shape[2]):
+        for i, n in _decode_chunk_spans(z.shape[2]):
             self._conv_idx = [0]
-            out_ = self.decoder(x[:, :, i:i + 1, :, :], feat_cache=self._feat_map,
+            out_ = self.decoder(x[:, :, i:i + n, :, :], feat_cache=self._feat_map,
                                 feat_idx=self._conv_idx, first_chunk=(i == 0))
             yield unpatchify(out_, patch_size=2)
         self.clear_cache()
@@ -1507,6 +1516,10 @@ class Wan2_2_VAE:
     def prepack_nki_filters(self):
         """See Decoder3d.prepack_nki_filters; call once the model is on the device."""
         return self.model.decoder.prepack_nki_filters()
+    @staticmethod
+    def num_decode_chunks(t):
+        """Number of chunks decode_chunks() yields for t latent frames."""
+        return len(_decode_chunk_spans(t))
     def decode_chunks(self, z):
         """Streaming decode of one latent [C, T, H, W]: yields [3, f, H*16, W*16] float32
         clamped chunks (the same values decode([z])[0] has for those frames)."""

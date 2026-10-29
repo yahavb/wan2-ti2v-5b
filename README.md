@@ -157,6 +157,7 @@ FastAPI server on port 8000:
 | `FAST_TIMING` | 0 | 1 = device-synced per-block timing log (diagnostic; adds syncs) |
 | `DUMP_DIR` | unset | Rank 0 saves the last run's final latent, uint8 frames and step-0 noise prediction (for comparing configurations; outside the timers) |
 | `RUN_HASH`, `RUN_HASH_KEEP` | 0, unset | Determinism probe: after each run's timers every rank logs an md5 of its final latent and rank 0 of the mp4; after the last run, md5s of the encoder outputs, cross-attention K/V and per-parameter weight sums. `RUN_HASH_KEEP=<prefix>` keeps each run's mp4 as `<prefix>_run<i>.mp4` |
+| `MEM_LOG` | 0 | 1 = every rank prints its device memory (torch allocator: allocated, reserved, peak) before and after each VAE decode |
 | `CONST_MAX_SOFTMAX_MAX` | 15.0 | Constant softmax max for `constmax` (scaled-score units) |
 | `CONST_MAX_LAYERS`, `CONST_MAX_HARD_LIMIT` | auto, 70 | `auto`: const-max only on layers whose worst-case score (from QK-norm weights) stays under the kernel's clip; others use sdpa. Or `all`, or a comma list |
 | `FAST_FULLGRAPH` | 0 | 1 = fail on any graph break inside a block |
@@ -179,6 +180,7 @@ FastAPI server on port 8000:
 | `MP4_VFORK` | 0 | 1 = start the mp4 encoder without imageio's `preexec_fn`, so Python spawns ffmpeg with vfork instead of forking the whole process (a fork stalled the device ~90 ms once per decode) |
 | `VAE_FUSE_RES` | 0 | 1 (with `VAE_FUSE_CAT=1`) = each ResidualBlock's last conv adds the shortcut inside the nkilib kernel (`residual_add_loc`, installed nkilib) instead of a separate eager add |
 | `VAE_FUSE_SHORTCUT` | 0 | 1 = in each upsample stage, the duplicate-upsample shortcut (repeat_interleave + permute) and its add run as one compiled graph, without cloning the stage input; bit-identical |
+| `VAE_TCHUNK` | 1 (job: 2) | After the first latent frame, decode this many latent frames per decoder call (the causal caches make it the same computation; all eligible convs then take the nkilib kernel). 2: VAE 2.60 -> 2.51 s, +2.2 GB device memory per core at the VAE peak (10.6 of 12 GB), 44.71 dB vs the exact decode (was 44.69). Run 1 of a process traces the extra kernel shapes (VAE ~80 s instead of ~7 s); run 2 is warm. 4 runs out of device memory next to the resident DiT |
 | `VAE_STREAM` | 0 | 1 (with `VAE_TILED=1`) = every rank ships each decoded latent frame of its tile to /dev/shm at once; a rank-0 thread blends it and feeds the mp4 encoder while the decode continues (byte-identical mp4, VAE 3.5 -> 3.0 s) |
 | `VAE_COMPILE` | 0 | Compile the VAE decode via `models/vae_static.py` (fixed-shape causal cache, 2 graphs; ported from vllm-omni-neuron). An earlier per-chunk compile of the original decoder **measured slower**: 11.5s warm vs 2.4s eager at 368x480x21, 58 min compile. Keep 0 |
 | `USE_NST_SELF_ATTN` | 1 | NST self-attention kernel (original path) |

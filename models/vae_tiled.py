@@ -167,7 +167,8 @@ def decode_tiled_stream(vae, z, cpu_group, overlap, make_writer, finish):
     """
     import threading
     rank, world = dist.get_rank(), dist.get_world_size()
-    _, n_chunks, h, w = z.shape
+    _, n_lat, h, w = z.shape
+    n_chunks = vae.num_decode_chunks(n_lat) if hasattr(vae, "num_decode_chunks") else n_lat
     th, tw, ys, xs = tile_grid(h, w, world, overlap)
     tiles = [(i, j) for i in range(len(ys)) for j in range(len(xs))]
     _CALL[0] += 1

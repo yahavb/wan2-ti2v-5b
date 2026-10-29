@@ -78,6 +78,8 @@ DUMP_DIR = os.environ.get("DUMP_DIR", "")
 # K/V and per-parameter weight sums. All copies run outside the timed region.
 # RUN_HASH_KEEP=<prefix>: also keep each run's mp4 as <prefix>_run<i>.mp4.
 RUN_HASH = os.environ.get("RUN_HASH", "0") == "1"
+# MEM_LOG=1: every rank prints its device memory (torch allocator) before and after each VAE decode.
+MEM_LOG = os.environ.get("MEM_LOG", "0") == "1"
 # STEP_TIMING=1: rank 0 logs, per denoising step, how long the host waited for the DiT and how
 # long the host-side scheduler round trip took (no extra device syncs).
 STEP_TIMING = os.environ.get("STEP_TIMING", "0") == "1"
@@ -562,6 +564,8 @@ def main():
 
         # ── Decode with VAE ──
         dump_video = None
+        if MEM_LOG:
+            print(f"[mem] rank {rank} run {run_idx + 1} before VAE: {device_mem_str()}", flush=True)
         vae_start = time.time()
         if VAE_TP_DEGREE > 1 and rank in VAE_TP_RANKS:
             # VAE TP decode: all VAE TP ranks decode together (sharded channels)
@@ -638,6 +642,8 @@ def main():
 
         dist.barrier()
         vae_time = time.time() - vae_start
+        if MEM_LOG:
+            print(f"[mem] rank {rank} run {run_idx + 1} after VAE: {device_mem_str()}", flush=True)
         run_time = time.time() - run_start
 
         if rank == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1 and dump_video is not None:

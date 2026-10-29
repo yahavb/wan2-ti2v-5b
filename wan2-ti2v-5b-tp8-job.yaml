@@ -224,6 +224,8 @@ spec:
               value: "1"
             - name: VAE_FUSE_SHORTCUT
               value: "1"
+            - name: VAE_TCHUNK
+              value: "2"
             - name: DEVICE_SCHEDULER
               value: "1"
             - name: MP4_VFORK

@@ -27,17 +27,27 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + norm and causal-cache concat in one compiled graph (`VAE_FUSE_CAT=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
 | + ResidualBlock shortcut added inside the nkilib conv (`VAE_FUSE_RES=1`) | 0.61 | 6.1s | 2.7s | 8.8s | 0.0487* |
 | + UniPC step on the device (`DEVICE_SCHEDULER=1`), mp4 encoder spawned with vfork (`MP4_VFORK=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
-| + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | **0.60** | **6.0s** | **2.6s** | **8.7s** | 0.0487* |
+| + upsample shortcut and its add in one compiled graph (`VAE_FUSE_SHORTCUT=1`) | 0.60 | 6.0s | 2.6s | 8.7s | 0.0487* |
+| + 2 latent frames per VAE decoder call (`VAE_TCHUNK=2`) | **0.60** | **6.0s** | **2.5s** | **8.6s** | 0.0487* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
-VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
+VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=2 DEVICE_SCHEDULER=1 MP4_VFORK=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
 the add as one graph and drops a clone of the stage input that nothing writes to. One 15x21 tile
 on one core 2.298 -> 2.238 s; in the pipeline, 8 warm runs each with the two devices swapped,
 VAE 2.659 -> 2.610 s and total 8.702 -> 8.657 s (both round to 8.7).
+`VAE_TCHUNK=2` decodes latent frames 1-20 two per decoder call (frame 0 alone, as before), so every
+kernel call does twice the work and the 1024-channel convs at the latent resolution, which saw one
+frame per call, now take the nkilib kernel too. Four runs alternating the setting on one device
+(4 warm runs each): VAE 2.59-2.62 -> 2.47-2.54 s, total 8.59-8.69 -> 8.48-8.63 s. One tile on one
+core 2.15 -> 2.01 s. The tiled decode scores 44.71 dB against the exact fp32 decode (44.69 dB with
+one frame per call) and 56.1 dB against the one-frame decode. Device memory at the VAE peak goes
+from ~8.4 to ~10.6 GB per core (neuron-monitor), within the 12 GB per core; 4 frames per call
+(11-18% faster per tile earlier) still runs out next to the resident DiT. Run 1 of a process
+traces the new kernel shapes, so its VAE takes ~80 s instead of ~7 s; run 2 is warm.
 Run 2 is warm. The nkilib conv filters are now packed when the model loads
 (`Decoder3d.prepack_nki_filters`). Before, each conv after the first temporal upsample packed them
 on its first call with 2+ output frames, in chunk 1 of the first decode. Chunk 0 of that decode
@@ -116,7 +126,7 @@ collective-algorithm knobs `NEURON_RT_DBG_{MESH,RDH,KANGARING}_CC` and friends (
 20.62 ms), nkilib `allgather_compute_matmul` (fails at our 1964-row shard; 3.95 vs 3.73 ms at 2048
 rows). The compiler does not overlap an in-graph all-gather with independent compute
 (`scripts/validate/overlap_bench.py`: 2.95 + 3.65 -> 6.53 ms together). VAE decoding 2 or 4 latent
-frames per decoder call is 11-18% faster per tile on an empty core (`VAE_TCHUNK`, removed) but
+frames per decoder call was 11-18% faster per tile on an empty core (`VAE_TCHUNK`; 2 frames is now on, see above) but
 runs out of HBM next to the resident DiT (drain-and-retry stalls, then OOM) and compiles 7-25 min.
 
 ## Where the 8.8 s goes (`loop_engineering`, profiled 2026-10-28)
