@@ -1,221 +1,199 @@
-# A skeleton for inference optimization, worked end to end on Wan2.2-TI2V-5B
+# Serving world models on AWS Trainium with native PyTorch
 
-re:Invent code talk: talking points and slide plan. Every number comes from
+re:Invent code talk: outline, talking points and code to show.
+
+> The next major leap in AI is predicting and interacting with the physical world. World models
+> bridge digital reasoning with real-world execution, introducing new infrastructure demands for
+> video generation, robotics, and gaming workloads. We'll explore the emerging architecture of
+> world models and why AWS Trainium, purpose-built for better price-performance, is well suited
+> to serve them. Learn how native PyTorch support with torch.compile fuses operations into
+> optimized device graphs, and how NKI custom kernels accelerate critical operators like
+> attention. You'll leave able to move world model inference from eager prototyping to compiled
+> deployment using familiar PyTorch workflows.
+
+**Worked example:** Wan2.2-TI2V-5B, a text + image to video model. One 704x544, 81-frame video,
+10 denoising steps, on one Trainium2 device (8 NeuronCores). Numbers are from
 [RESULTS.md](../../RESULTS.md). Code links are pinned to commit `788674b`.
 
-Spec for every run: 704x544, 81 frames, 10 denoising steps, CFG on, the same prompt, image
-and seed, one trn2 NeuronDevice exposed as 8 logical cores (LNC1). Times are warm runs.
-
-**The story in one line:** a repeatable loop (measure, validate, profile, pick a lever,
-change one thing, record) took one video from 76.6 s to 8.7 s on the same hardware. The talk
-teaches the loop. The model is the worked example.
+**The arc:** eager prototype (76.6 s) → torch.compile (36.8 s) → NKI kernels → scale across
+cores → serve it (8.7 s). Each stage uses PyTorch the way the audience already knows it.
 
 ---
 
-## Part 1. The skeleton
+## 1. World models and what they ask of the hardware (~8 min)
 
-### Slide 1. Where we started and where we ended
+### Slide: what a world model is
+- A model that predicts how a scene evolves: the next frames, given what it has seen and an
+  instruction or action.
+- Today the most visible form is video generation. Robotics and games use the same idea with
+  actions as the condition.
 
-- Start: the reference model ported as is, eager PyTorch, 76.6 s per video.
-- End: 8.7 s, 8.8x faster, same hardware, same output quality.
-- Baseline for context: the same video on an A100 with torch.compile takes 16.92 s. This is the
-  only time the talk mentions it.
-
-**Talking point:** none of the steps were exotic. What made it work was the order and the
-discipline.
-
-**Animation:** one bar shrinking from 76.6 s to 8.7 s, with each milestone appearing as a tick.
-
-### Slide 2. The loop
-
+### Slide: the architecture, using Wan2.2 as the concrete case
 ```
-        ┌──────────────────────────────────────────────┐
-        ▼                                              │
-  0. trustworthy measurement + quality gates          │
-  1. profile: where does the time go?                 │
-  2. pick the lever for the biggest bucket            │
-  3. change one thing behind a flag                   │
-  4. validate: still the same output?                 │
-  5. record it (commit + one row in RESULTS.md) ──────┘
+ text ──► T5 encoder ──────────────┐
+                                   ▼
+ image ─► VAE encoder ─► latent ─► Diffusion Transformer (DiT) × 10 steps ─► VAE decoder ─► video
+                                   ▲  30 blocks, 7,854 video tokens
+                                   └─ CFG: conditional + unconditional pass every step
 ```
+- **Text encoder:** runs once per request.
+- **DiT:** the core. Full attention over every video token (space and time). It runs 30 blocks
+  x 10 steps x 2 CFG passes = 600 block calls per video.
+- **VAE decoder:** a causal 3D conv net. It turns 21 latent frames into 81 frames of video.
 
-**Talking point:** set steps 0 and 4 up before the first optimization, not after. Every
-later decision depends on trusting the numbers and the output.
+### Slide: what this means for serving
+1. **Long sequences.** Attention over thousands of tokens dominates compute.
+2. **Many repeated calls.** The same block graph runs hundreds of times, so per-call overhead
+   matters.
+3. **Two very different halves.** The DiT is a regular, matmul-heavy transformer. The VAE is
+   a long chain of convolutions whose shapes change from chunk to chunk.
+4. **Latency per request.** Users wait for a whole video, so the time to the last frame is
+   what counts.
 
-**Animation:** the loop drawn once, then highlighted each time a later slide goes around it.
-
-### Slide 3. Step 0: make the numbers trustworthy
-
-What the harness does (`inference_neuron_ti2v.py`, `scripts/prof/bench_profile.sh`):
-1. Same spec, seed and inputs for every run.
-2. Several runs in one process. Time only the runs after warm-up, and print every run.
-3. Split the time into phases (denoise, VAE, output) so you know which part moved.
-4. Record the commit, the image and the flags next to every number.
-
-A story from the week of this talk:
-- A validation job showed the new code at 31.4 s against 29.5 s for the old one. That looked
-  like a regression.
-- But run 2 was not warm. On this image, the NKI kernel cache still traces kernels during
-  run 2. The VAE went 186 s, then 21 s, then 3.6 s.
-- Timing run 3 instead showed 11.8 s and 7.1 s, the opposite conclusion.
-
-Other traps:
-- A floating `:latest` image changes the runtime under you.
-- A container CPU limit throttles host-side work.
-- A probe that removes "just the collective" can let the compiler skip real work too.
-
-**Animation:** three bars per config (runs 1, 2, 3). Run 2 is still hot.
-
-### Slide 4. Step 0: quality gates before any speedup
-
-Build the references once and reuse them for every change
-(`scripts/validate/validate_job.sh`):
-
-| Gate | Why |
-|---|---|
-| Every new flag off: mp4 bytes identical to main | the refactor alone changed nothing |
-| Same config twice: identical latent and frames | the run is deterministic, so diffs mean something |
-| Step-0 noise prediction vs an fp32 CPU DiT | each change adds nothing beyond the bf16 floor (~0.048 rel-RMS) |
-| VAE vs an exact fp32 CPU decode | tiling and fusion error in dB (44.6 dB) |
-| Whole video vs an exact-attention run, plus a contact sheet | catches drift a single step can't show |
-
-**Talking point:** every optimization ships behind an env flag, defaulting to off. Then "flag
-off equals main" is a byte compare, and A/B testing is one env var.
-
-### Slide 5. Step 1: map the model before you profile it
-
-- Three models in a pipeline: T5 text encoder, a 30-block DiT (7,854 tokens, dim 3072), and a
-  causal 3D VAE decoder.
-- Count the work: 30 blocks x 10 steps x 2 CFG passes = 600 block calls per video. The VAE
-  decodes 21 latent frames into 81 video frames.
-- The first split already tells you where to look: DiT 44.3 s and VAE 32.3 s out of 76.6 s.
-
-**Talking point:** different components need different levers. The DiT is a large, regular,
-repeated graph. The VAE is a long chain of convolutions whose shapes change from chunk to chunk.
-
-### Slide 6. Step 1: profile, top down
-
-1. **System trace on every rank** (cheap). It shows device busy vs idle, launches, host gaps
-   and stalls. Start here.
-2. **Device trace on one rank.** SPMD means one rank stands for all of them. It shows engine
-   time inside each graph.
-3. **Single-graph captures** (`capture --single-io`) for per-graph engine utilization.
-4. **Neuron Explorer** with source roots, so an instruction links back to the torch line or
-   the NKI kernel line.
-
-Scripts: [`bench_profile.sh`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/scripts/prof/bench_profile.sh),
-[`rank_env.sh`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/scripts/prof/rank_env.sh),
-[`explorer_ingest.sh`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/scripts/prof/explorer_ingest.sh).
-
-_To add: Explorer screenshots, system and device._
-
-### Slide 7. Step 2: from symptom to lever
-
-| What the trace shows | Lever |
-|---|---|
-| Many short graphs, gaps between them | **Compile scope**: put more into one graph |
-| Compile explodes (many graphs, OOM) or compiled code is slow | **Hand-written kernels** in an eager model |
-| One op dominates (attention, conv) at low engine utilization | **A better kernel** for that op |
-| Cores idle, or collectives everywhere | **Parallel layout**: what each core does |
-| Memory-bound pointwise ops between big ops | **Fusion** |
-| Device idle while the host works | **Host work**: threads, async, move work to the device |
-
-**Talking point:** this table is the skeleton. The rest of the talk walks through it once for
-each lever, in the order the profile asked for them.
+Talking point: these four demands drive every decision in the rest of the talk.
 
 ---
 
-## Part 2. Going around the loop
+## 2. Why Trainium for this workload (~5 min)
 
-### Slide 8. Lever: compile scope (DiT, 76.6 s to 36.8 s)
+- One Trainium2 device exposes 8 NeuronCores in LNC1 mode. Each core has Tensor, Vector,
+  Scalar and GpSimd engines, and the cores share fast in-device collectives.
+- Every number in this talk uses one device and fits in its HBM: the 5B DiT, the T5 encoder
+  and the VAE together.
+- **Native PyTorch (TorchNeuron):** `neuron` is a regular torch device. Eager mode works, and
+  `torch.compile(backend="neuron")` compiles to device graphs (NEFFs). NKI kernels are
+  callable from PyTorch.
+- Kubernetes on EKS: the pod requests NeuronCores with a resource claim, the same way it would
+  request any other accelerator.
 
-**Symptom:** each block ran as many small graphs. Every TP all-reduce forced a graph break on
-purpose, and Python ran in between.
+_Price-performance: quote only the official AWS figures here. This talk doesn't measure
+cost._
 
+---
+
+## 3. Step 1: the eager prototype (~7 min)
+
+**Message:** start in eager mode. It runs the reference model with very few changes, and it
+gives you a correct baseline.
+
+Live code: move the model to the device.
+[`inference_neuron_ti2v.py#L72`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L72),
+[`#L194-L213`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L194-L213)
+
+```python
+NEURON_DEVICE = torch.device("neuron")
+torch.neuron.set_device(local_rank)
+text_encoder.model = text_encoder.model.to(NEURON_DEVICE)
+vae.model = vae.model.to(device=NEURON_DEVICE, dtype=torch.bfloat16)
+```
+
+What we had to change in the reference code (keep this short; it is the honest list):
+- No complex dtypes on the device. RoPE is rewritten with real cos and sin tables
+  ([`rope_neuron.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/rope_neuron.py)).
+- No float64 on the device.
+
+Baseline: **76.6 s** per video (DiT 44.3 s, VAE 32.3 s). The output is correct, and it is the
+reference that every later step is checked against.
+
+Talking point: get it correct in eager mode first, and save that output. Every later
+optimization must reproduce it.
+
+---
+
+## 4. Step 2: torch.compile fuses the model into device graphs (~12 min)
+
+**Message:** torch.compile is where most of the speed comes from. What you put inside one
+compiled graph matters as much as compiling at all.
+
+### Slide: the first attempt, compiling pieces
+The prototype compiled only small modules. The all-reduce after each tensor-parallel matmul was
+kept outside the graph on purpose, so each block became many small graphs with Python in between.
 [`models/tp_utils.py#L119-L128`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/tp_utils.py#L119-L128)
 
 ```python
-@torch.compiler.disable
-def all_reduce_sum(x):  # graph break: compiled NEFF does the matmuls, all-reduce runs eager
+block.ffn = torch.compile(block.ffn, backend="neuron", dynamic=False)
+
+@torch.compiler.disable          # forces a graph break around every collective
+def all_reduce_sum(x): ...
 ```
 
-**Change (`DIT_FAST=1`):** one graph per transformer block, collectives traced inside it, and
-both CFG passes in one batch.
-
-[`models/fast_dit.py#L90-L100`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L90-L100),
-[`#L260-L311`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L260-L311)
+### Slide: one graph per transformer block
+[`models/fast_dit.py#L260-L311`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L260-L311),
+[`#L586-L645`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L586-L645)
 
 ```python
-def _all_reduce(x):
-    return funcol.all_reduce(x, "sum", get_tp_group())      # stays inside the NEFF
+import torch.distributed._functional_collectives as funcol
 
-kw = dict(backend="neuron", dynamic=False, fullgraph=FAST_FULLGRAPH)
+def _all_reduce(x):
+    return funcol.all_reduce(x, "sum", get_tp_group())   # traced: lives inside the graph
+
+class _FastBlock(nn.Module):
+    def forward(self, x, e, cos, sin, ck, cv):
+        # norm + modulation, QKV, QK-norm, RoPE, attention, O-proj + all-reduce,
+        # cross-attention, FFN + all-reduce, gated residuals: all in one graph
+        ...
+
+kw = dict(backend="neuron", dynamic=False, fullgraph=True)
 self.blocks = [torch.compile(_FastBlock(b, ...), **kw) for b in model.blocks]
 ```
 
-**Why it helps:** one launch per block, fusion across neighbouring ops, collectives scheduled
-next to their matmuls, and one NEFF shared by all 30 blocks (the weights are inputs).
+What the compiler does with that:
+1. **Fusion.** Norms, modulation, RoPE and residual adds are fused with their neighbours,
+   instead of a round trip to HBM for each op.
+2. **One launch per block** instead of many, with no Python in between.
+3. **Collectives scheduled by the compiler**, next to the matmul that produces them.
+4. **One NEFF for all 30 blocks.** The weights are graph inputs, so one compile serves all
+   600 block calls.
+5. **`fullgraph=True` fails loudly** if anything would split the block.
 
-**Result:** 4.4 to 1.91 s/step.
+Also: batch the two CFG passes into one call.
 
-**Animation:** one block as a timeline. Many short boxes with gaps collapse into one long box.
+Result: DiT 4.4 → 1.91 s/step. Total **76.6 s → 36.8 s**.
 
-### Slide 9. Lever: compile scope fails; switch to kernels (VAE)
+**Demo idea:** the same block, eager vs compiled, in the Neuron Explorer system trace. Many
+short executions with gaps become one long execution.
 
-**Symptom:** the VAE was now the biggest bucket. The same lever made it worse.
-
-| Attempt | VAE | Compile |
+### Slide: compile is not always the answer (the VAE)
+| Attempt | VAE time | Compile time |
 |---|---|---|
-| `torch.compile` across the whole VAE | 400+ NEFFs, out of memory | — |
-| `torch.compile` of the original decoder | 11.5-12.9 s | 58 min |
-| Static-cache decoder, 2 graphs | 12.8-14.2 s | 20.6 min |
-| **Eager + NKI kernels, tiled** | **1.7 s** | none |
+| torch.compile across the whole VAE | 400+ graphs, out of memory | — |
+| torch.compile of the decoder | 11.5-12.9 s | 58 min |
+| Static-shape decoder, 2 graphs | 12.8-14.2 s | 20.6 min |
+| Eager + NKI kernels | **1.7 s** | none |
 
-(Measured at 368x480x21, where the VAE dominated.)
+(At 368x480x21.) The causal cache changes shapes from chunk to chunk, and the compiler's 3D
+convolutions were slow. That sets up the next section.
 
-**Change:** keep the VAE eager, and call hand-written kernels from it: conv2d as shifted
-matmuls, VAE attention, then nkilib `conv3d` for the causal 3x3x3 convs.
-
-[`kernels/vae_conv3d.py#L33-L58`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/kernels/vae_conv3d.py#L33-L58)
+Use small compiled graphs where they help: the VAE's RMS_norm + SiLU is one tiny compiled
+function inside the eager model.
+[`wan/modules/vae2_2.py#L226-L228`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/wan/modules/vae2_2.py#L226-L228)
 
 ```python
-@nki.jit
-def _conv3d_3x3x3_kernel(x, filters, bias):
-    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=PADDING, dilation=(1, 1, 1))
-
-_conv3d_3x3x3 = wrap_nki(_conv3d_3x3x3_kernel)   # callable from eager PyTorch
+_rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
 ```
 
-**Lesson:** a kernel needs a gate. This one is used only when C_in and C_out >= 96 and there
-are at least 2 output frames. Below that, the eager conv was faster, and 1-frame convs regressed
-the decode by 25%.
+---
 
-**Animation:** a compile-time bar (58 min) next to a latency bar (12.9 s vs 1.7 s).
+## 5. Step 3: NKI custom kernels for the critical operators (~12 min)
 
-### Slide 10. Lever: parallel layout (VAE tiles, 9.0 to 6.0 s)
+**Message:** when one operator dominates and the compiler's version is not good enough, write
+or reuse an NKI kernel and call it from PyTorch. This works in eager mode and inside a
+compiled graph.
 
-**Symptom:** the VAE ran on rank 0 while 7 cores sat idle.
+### Slide: what NKI is, in one slide
+- Neuron Kernel Interface: Python kernels that control the tiling, the on-chip memory (SBUF)
+  and which engine does what.
+- nkilib ships production kernels, such as `attention_cte` and `conv3d`, that you can use
+  directly.
+- `wrap_nki` makes a kernel a regular torch call.
 
-**Change:** every rank decodes an overlapping spatial tile. It applies a blend weight that is
-already normalized, on the device, then writes to `/dev/shm`. Rank 0 only adds.
-[`models/vae_tiled.py#L58-L118`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/vae_tiled.py#L58-L118)
+### Slide: attention, the operator that dominates
+At 7,854 tokens, self-attention through the default SDPA path took 18.2 ms per call.
 
-**Trade-off, measured:** overlap 4 gives 44.67 dB against the exact decode. Overlaps 3 and 2
-were faster but cost 1-2.5 dB, so they were not taken.
-
-**Animation:** the frame splits into 8 tiles, one per core, and blends back.
-
-### Slide 11. Lever: a better kernel, used where it is safe (attention, 1.92 to 1.19 s/step)
-
-**Symptom:** self-attention dominated the DiT. SDPA took 18.2 ms per call.
-
-**Change:** a const-max softmax kernel that subtracts a known bound instead of tracking a
-running max (5.8 ms per call).
-
-**What went wrong:** on all layers, the video broke after frame 0.
-
-**Fix:** bound each layer's worst-case score from its QK-norm weights, and use the kernel only
-where the bound is <= 70. That is 22 of 30 layers.
+**Kernel 1, const-max softmax (5.8 ms per call).** It subtracts a known bound instead of
+tracking a running max. That is only exact when scores stay under the bound, and on all layers
+the video broke after frame 0. The fix was to compute each layer's worst-case score from its
+QK-norm weights and use the kernel only where it is safe (22 of 30 layers).
 [`models/fast_dit.py#L77-L84`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L77-L84)
 
 ```python
@@ -225,135 +203,153 @@ def const_max_layer_ok(block):
     hard = float((d ** 0.5) * (gq * gk).max())   # worst-case scaled score
     return hard <= CONST_MAX_HARD_LIMIT, hard
 ```
+DiT 1.92 → 1.19 s/step.
 
-**Two more lessons:**
-- Calling the kernel on all heads at once overflowed SBUF and crashed the compiler. The fix
-  was to call it on as many heads as fit
-  ([`#L210-L225`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L210-L225)).
-- Take the layer choice as a max over ranks. If ranks pick different layers, they compile
-  different graphs and their collectives deadlock.
+**Kernel 2, nkilib `attention_cte` (5.3 ms per call).** It is exact flash attention with no
+bound, so it is safe on every layer. It runs inside the compiled block graph.
+[`models/fast_dit.py#L228-L241`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L228-L241)
 
-**Then go around the loop again:** nkilib `attention_cte` is exact, needs no bound, and runs
-at 5.3 ms. It replaced const-max on every layer (16.2 to 13.2 s with cross-attention too).
-[`#L228-L241`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L228-L241)
+```python
+from nkilib.core.attention.attention_cte import attention_cte
 
-### Slide 12. Lever: parallel layout (DiT, 13.2 to 9.6 s)
+def _cte(q, k, v):
+    qn = q.permute(0, 2, 1, 3).reshape(B * n, Lq, d)
+    kn = k.permute(0, 2, 3, 1).reshape(B * n, d, Lk)
+    vn = v.permute(0, 2, 1, 3).reshape(B * n, Lk, d)
+    return attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)
+```
+Self- and cross-attention: total 16.2 → 13.2 s.
 
-**Symptom:** with attention fixed, the collectives and the work repeated on every core showed
-up in the profile.
+Talking points:
+- Validate a numerical shortcut on real activations, not on random inputs.
+- Kernel limits are real. Calling const-max on all heads at once overflowed SBUF and crashed
+  the compiler, so it is called on as many heads as fit.
 
-| Change | Per block | Total |
+### Slide: the same approach for the VAE convolutions
+nkilib `conv3d`, called from the eager VAE, with a gate that decides when it beats the
+default.
+[`kernels/vae_conv3d.py#L33-L58`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/kernels/vae_conv3d.py#L33-L58)
+
+```python
+@nki.jit
+def _conv3d_3x3x3_kernel(x, filters, bias):
+    return conv3d(x, filters, bias, stride=(1, 1, 1), padding=PADDING, dilation=(1, 1, 1))
+
+_conv3d_3x3x3 = wrap_nki(_conv3d_3x3x3_kernel)
+```
+Then fuse into the kernel: the residual add (`residual_add_loc=POST_ACT`), and an upsample
+followed by a conv done as four 2x2 convs on the low-res input (2.25x fewer MACs). VAE 6.0 →
+2.6 s.
+
+---
+
+## 6. Step 4: scale across the cores with torch.distributed (~6 min)
+
+**Message:** the parallelism is plain `torch.distributed` and functional collectives, traced
+into the compiled graphs.
+
+| Layout | Per DiT block | Total |
 |---|---|---|
-| TP=8, CFG as a batch of 2 | 29.4 ms | 13.2 s |
-| CFG-parallel: 2 groups x TP4, batch 1 each | 24.5 ms | 11.9 s |
-| + Megatron sequence parallelism | 21.9 ms | 11.1 s |
-| + cross-attention local to the token shard | 20.6 ms | 10.8 s |
-| + CFG groups on alternating cores | 19.8 ms | 9.6 s |
+| Tensor parallel over 8 cores, CFG as a batch of 2 | 29.4 ms | 13.2 s |
+| CFG-parallel: two groups of 4, one per CFG pass | 24.5 ms | 11.9 s |
+| + sequence parallelism (all-gather / reduce-scatter around the matmuls) | 21.9 ms | 11.1 s |
+| + cross-attention local to each core's tokens | 20.6 ms | 10.8 s |
 
-- **CFG-parallel:** the conditional and unconditional passes run at the same time on half the
-  cores each. Smaller TP means cheaper collectives.
-  [`inference_neuron_ti2v.py#L241-L246`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L241-L246)
-- **Sequence parallelism:** an all-gather before each column-parallel matmul and a
-  reduce-scatter after each row-parallel matmul. That moves the same bytes as the all-reduce,
-  and the norms and residuals run on 1/4 of the tokens.
-  [`models/fast_dit.py#L314-L390`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L314-L390)
-  ```python
-  hf = _ag(h)                          # token shard -> all tokens
-  q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
-  y = _rs(_mm(y, sa.o)) + sa.o.bias    # all tokens -> token shard
-  ```
-- **Local cross-attention:** there are only 512 text keys, so each rank runs all heads on its own
-  tokens, with no collectives.
+[`models/fast_dit.py#L314-L390`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L314-L390)
 
-(The VAE fused-norm step, slide 13, lands between rows 4 and 5.)
+```python
+hf = _ag(h)                          # funcol.all_gather_tensor: token shard -> all tokens
+q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
+...
+y = _rs(_mm(y, sa.o)) + sa.o.bias    # funcol.reduce_scatter_tensor: back to the shard
+```
 
-**Animation:** 8 cores. First one batch, then two colours (cond / uncond), then token shards.
+The VAE is split the same way: each core decodes one spatial tile and rank 0 blends them (VAE
+9.0 → 6.0 s).
+[`models/vae_tiled.py#L58-L118`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/vae_tiled.py#L58-L118)
 
-### Slide 13. Lever: fusion (VAE, 4.2 to 2.6 s)
+---
 
-**Symptom:** between the big convs, the trace showed many small memory-bound graphs.
+## 7. Step 5: from benchmark to serving (~8 min)
 
-1. **A small compiled graph inside an eager model.** RMS_norm + SiLU becomes one pass over memory.
-   [`wan/modules/vae2_2.py#L226-L228`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/wan/modules/vae2_2.py#L226-L228)
-   ```python
-   _rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
-   ```
-2. **Change the math, not just the code.** A nearest-2x upsample followed by a 3x3 conv equals
-   four 2x2 convs on the low-res input. That is 2.25x fewer MACs, and the upsampled tensor is
-   never built.
-   [`kernels/vae_conv3d.py#L60-L117`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/kernels/vae_conv3d.py#L60-L117)
-3. **Fold neighbours into the kernel.** The ResidualBlock shortcut is added inside the conv
-   (`residual_add_loc=POST_ACT`), and the causal-cache concat is fused into the norm graph.
-   [`kernels/vae_conv3d.py#L44-L49`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/kernels/vae_conv3d.py#L44-L49)
+**Message:** the compiled model is only useful if the server starts warm, keeps the device
+fed, and is deployed like any other pod.
 
-**Validation:** 44.60 dB with the fusions on and 44.59 dB with them off, against the exact
-fp32 decode.
+### Slide: the server
+[`serve_ti2v.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/serve_ti2v.py):
+FastAPI on rank 0 (`POST /generate`, `/health`, `/readiness`), with all 8 ranks in one
+torchrun.
+- Collectives must run on the thread that compiled them. HTTP requests go on a queue, and the
+  main thread runs them.
+- Requests use the warm-up shape, so no request triggers a compile.
+- `/readiness` turns true only after warm-up, so Kubernetes sends no traffic to a cold pod.
 
-**Animation:** the sub-pixel fold. A 2x grid becomes four coloured 2x2 kernels.
+### Slide: warm-up is part of deployment
+A lesson from this week: one warm-up run was not enough. On the current image, the second run
+still traced NKI kernels. The VAE took 186 s, then 21 s, then 3.6 s. Warm up until the
+timing settles before reporting ready.
 
-### Slide 14. Lever: host work
+### Slide: keep the device fed
+Fixes found as gaps in the system trace:
+- UniPC scheduler step on the device instead of a round trip to the CPU each step (device busy
+  96.9% → 99.5%)
+  ([`device_unipc.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/device_unipc.py)).
+- Encode the mp4 while the VAE is still decoding, instead of after it.
+- Start ffmpeg with vfork: forking a process with tens of GB of memory stalled the runtime for
+  90 ms.
 
-**Symptom:** the device sat idle while the host worked. Each of these was found as a gap in
-the system trace.
+### Slide: deploy on EKS
+[`wan2-ti2v-5b-deploy.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/wan2-ti2v-5b-deploy.yaml):
+a resource claim for the NeuronCores, model weights cached on a PVC, and readiness and
+liveness probes.
 
-| Gap in the trace | Fix |
+---
+
+## 8. Did it stay correct, and where did the time go (~5 min)
+
+**Validate every step against the eager reference**
+([`scripts/validate/validate_job.sh`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/scripts/validate/validate_job.sh)):
+- Byte-identical output with the new flags off, and identical output across repeated runs.
+- Step-0 noise prediction against an fp32 CPU run: within the bf16 floor.
+- VAE against an exact fp32 decode: 44.6 dB.
+
+**Profile with Neuron Explorer:** a system trace on every rank shows host gaps, and a device
+trace on one rank shows the engines, linked back to the source.
+
+The journey:
+
+| Stage | Total |
 |---|---|
-| Slow CPU tile sum and convert on rank 0 (torchrun sets 1 thread) | 16 threads on rank 0. VAE 5.2 to 4.2 s |
-| 0.53 s after the decode for blend + mp4 | stream both per latent frame during the decode |
-| ~19 ms per step: D2H, CPU scheduler step, H2D, waiting for the slowest rank | UniPC step on the device ([`device_unipc.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/device_unipc.py)). Busy 96.9% to 99.5% |
-| One 90 ms stall per decode | `fork()` of a tens-of-GB process to start ffmpeg; spawn it with vfork ([`#L84-L88`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/inference_neuron_ti2v.py#L84-L88)) |
+| Eager prototype | 76.6 s |
+| + torch.compile, one graph per block | 36.8 s |
+| + VAE tiled over 8 cores, NKI conv kernels | 16.1 s |
+| + NKI attention, CFG-parallel, sequence parallel | 10.8 s |
+| + VAE fusion, host fixes | **8.7 s** |
 
-**Talking point:** the host is part of the model. These fixes are small, but they matter more
-the faster the device gets.
-
----
-
-## Part 3. Knowing when to stop
-
-### Slide 15. Where the time goes now, and what is left
-
-From the profile of the current build (RESULTS.md):
-
-| Area | Time | Running at |
-|---|---|---|
-| DiT linear layers | 2.47 s | 83% of bf16 peak |
-| DiT attention | 1.77 s | 45% of peak (self) |
-| VAE convolutions | 1.74 s | 79% on the main convs |
-| DiT collectives | 0.94-1.2 s | mostly serialized with compute |
-| DiT pointwise | 0.76 s | memory bound |
-| VAE norms, small graphs | 0.56 s | memory bound |
-| Host / idle | 0.57 s | |
-
-**Talking point:** compare each bucket with its floor (the same work at 100% of peak). The
-matmuls are near their floor, so stop there. Attention, collective overlap and fusion still
-have about 2-3 s of headroom. The loop tells you where to go next, and also when a lever
-is used up.
-
-### Slide 16. Also record what didn't work
-
-From RESULTS.md: chunked all-reduces, `-O3`, pre-transposed weights, fused QKV, runtime
-collective knobs, 4 frames per VAE call (out of HBM), exact seam-free tiling (the halo exchange
-cost as much as it saved).
-
-**Talking point:** a negative result is still a row in the ledger. It stops the next person
-from trying it again.
-
-### Slide 17. The skeleton, to take home
-
-1. Fix the spec, then build a harness that times only warm runs and records provenance.
-2. Build quality gates first: byte-identical with flags off, deterministic, fp32 references.
-3. Map the model: components, call counts, the first time split.
-4. Profile top down: system trace first, then the device trace.
-5. Map the symptom to a lever: compile scope, kernels, parallel layout, fusion, host.
-6. Change one thing behind a flag, validate, and record a row. Then repeat.
-7. Stop on a lever when it reaches its floor, and move to the next bucket.
+For reference, an A100 with torch.compile takes 16.92 s for the same video.
 
 ---
 
-## Open items before the talk
+## 9. Takeaways (~2 min)
 
-- Confirm which node the 7.1 s / 11.8 s validation ran on (trn2 or trn3-dev1). Use only
-  trn2 numbers until then.
-- Add Explorer screenshots from the tp8 profiling job (`788674b`) to slides 6, 8 and 14.
-- Set slide timing for a ~60 min code talk.
-- Then build the HTML deck with the animations.
+1. Start in eager mode on the `neuron` device. It gives you a correct baseline with minimal
+   changes.
+2. Compile with `torch.compile(backend="neuron")`, and choose the scope: one graph per repeated
+   block, with the collectives inside it.
+3. Where one operator dominates, use an NKI kernel from PyTorch. Check its numerics on real
+   data.
+4. Scale with plain `torch.distributed` and functional collectives.
+5. Serve warm: warm up until the timing settles, gate readiness on it, and keep the host out of
+   the way.
+
+---
+
+## Open items
+
+- **Serving gap:** `serve_ti2v.py` still uses the old per-module compile path (lines 137-141),
+  not `fast_dit`, and it warms up only once. Port it before the talk, or present serving as the
+  next step.
+- Confirm which node the 7.1 s validation run used (trn2 or trn3-dev1). This outline uses only
+  trn2 numbers.
+- Add Explorer screenshots: eager vs compiled block, and attention SDPA vs `attention_cte`.
+- Get the official Trainium price-performance wording.
