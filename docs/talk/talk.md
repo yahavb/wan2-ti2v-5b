@@ -20,54 +20,76 @@ cores → serve it (8.7 s). Each stage uses PyTorch the way the audience already
 
 ---
 
-## 1. World models and what they ask of the hardware (~8 min)
+## 1. From video diffusion to world models (~8 min)
 
-### Slide: what a world model is
-- A model that predicts how a scene evolves: the next frames, given what it has seen and an
-  instruction or action.
-- Today the most visible form is video generation. Robotics and games use the same idea with
-  actions as the condition.
+### Slide: the pipeline we optimize, end to end
+```
+ text ──► T5 ──────────────────┐
+                               ▼
+ image ─► VAE encode ─► latent ─► DiT × 10 steps ─► VAE decode ─► video
+```
+- **T5** encodes the prompt once per request.
+- **DiT** (diffusion transformer) denoises the latent video: 30 blocks, 7,854 tokens, full
+  attention over space and time. With 10 steps and 2 CFG passes, that is 600 block calls per video.
+- **VAE** decodes 21 latent frames into 81 frames of video.
 
-### Slide: the architecture, using Wan2.2 as the concrete case
-```
- text ──► T5 encoder ──────────────┐
-                                   ▼
- image ─► VAE encoder ─► latent ─► Diffusion Transformer (DiT) × 10 steps ─► VAE decoder ─► video
-                                   ▲  30 blocks, 7,854 video tokens
-                                   └─ CFG: conditional + unconditional pass every step
-```
-- **Text encoder:** runs once per request.
-- **DiT:** the core. Full attention over every video token (space and time). It runs 30 blocks
-  x 10 steps x 2 CFG passes = 600 block calls per video.
-- **VAE decoder:** a causal 3D conv net. It turns 21 latent frames into 81 frames of video.
+### Slide: a world model is this pipeline, extended in three ways
+1. **Checkpoints trained to model the world.** Realistic dynamics, and conditioning on actions
+   (move, turn, interact), not only on text.
+2. **Autoregressive.** It is the same T5 → DiT → VAE, run chunk after chunk. The DiT keeps the
+   KV cache from earlier chunks, so the scene stays consistent as the video goes on.
+3. **Streaming.** The DiT hands each chunk of a few latent frames to the VAE as soon as it is
+   ready. Pixels come out chunk by chunk while the DiT works on the next chunk. Sink and rolling
+   caches bound the memory.
+
+**Animation:** [`anim/world_model_streaming.html`](anim/world_model_streaming.html). T5 feeds
+the DiT once. The DiT produces chunk after chunk while a KV-cache bar grows, and each chunk flows
+to the VAE and appears as frames. At most 10 words on screen.
+
+**Talking point:** "For the next 40 minutes we optimize the video diffusion pipeline: T5, DiT,
+VAE. Everything carries over to a world model. At the end we come back to a real one."
 
 ### Slide: what this means for serving
 1. **Long sequences.** Attention over thousands of tokens dominates compute.
 2. **Many repeated calls.** The same block graph runs hundreds of times, so per-call overhead
    matters.
-3. **Two very different halves.** The DiT is a regular, matmul-heavy transformer. The VAE is
-   a long chain of convolutions whose shapes change from chunk to chunk.
-4. **Latency per request.** Users wait for a whole video, so the time to the last frame is
-   what counts.
+3. **Two different halves.** The DiT is a regular, matmul-heavy transformer. The VAE is a
+   chain of convolutions whose shapes change from chunk to chunk.
+4. **Latency per chunk.** In a world model, the user waits for each chunk, so time to the next
+   frames is what counts.
 
-Talking point: these four demands drive every decision in the rest of the talk.
-
----
+### Slide (end of talk, callback): LingBot-World v2
+- LingBot-World v2 ([`~/lingbot-world-v2`](https://technology.robbyant.com/lingbot-world-v2))
+  is built on Wan2.2. It is the same T5 → DiT → VAE, but causal (autoregressive), conditioned
+  on actions, with an unbounded horizon, and a distilled fast variant for real time.
+- What carries over from this talk: block-compiled DiT graphs, NKI attention, collectives in
+  the graph, and a VAE that decodes chunk by chunk with nkilib convs.
+- What is new: a KV cache that lives across calls, and a DiT → VAE handoff per chunk.
 
 ## 2. Why Trainium for this workload (~5 min)
 
-- One Trainium2 device exposes 8 NeuronCores in LNC1 mode. Each core has Tensor, Vector,
-  Scalar and GpSimd engines, and the cores share fast in-device collectives.
-- Every number in this talk uses one device and fits in its HBM: the 5B DiT, the T5 encoder
-  and the VAE together.
-- **Native PyTorch (TorchNeuron):** `neuron` is a regular torch device. Eager mode works, and
-  `torch.compile(backend="neuron")` compiles to device graphs (NEFFs). NKI kernels are
-  callable from PyTorch.
-- Kubernetes on EKS: the pod requests NeuronCores with a resource claim, the same way it would
-  request any other accelerator.
+### Slide: the hardware
+- One Trainium2 device exposes 8 NeuronCores in LNC1 mode.
+- Each core has four engines that run at the same time: **Tensor** (matmuls), **Vector**
+  (elementwise and reductions), **Scalar** (activations such as exp), **GpSimd** (general
+  purpose), plus on-chip SBUF memory.
+- The cores are linked for fast in-device collectives (all-reduce, all-gather,
+  reduce-scatter). Tensor and sequence parallelism ride on these links.
+- The whole pipeline (5B DiT, T5 and VAE) fits on one device's HBM.
 
-_Price-performance: quote only the official AWS figures here. This talk doesn't measure
-cost._
+### Slide: the software stack
+```
+ Kubernetes (EKS)    resource claim for NeuronCores, probes, model cache
+ PyTorch             eager on device "neuron", torch.compile(backend="neuron"), torch.distributed
+ TorchNeuron         lowers graphs to NEFFs, runs NKI kernels, Neuron runtime + collectives
+ Trainium2           NeuronCores, engines, HBM, collective links
+```
+
+**Animation:** [`anim/trainium_stack.html`](anim/trainium_stack.html). Eight cores light up.
+Inside one core the four engines pulse in turn, then collective links pulse between cores, then
+the stack builds up: PyTorch, TorchNeuron, Kubernetes. At most 10 words on screen.
+
+_Price-performance: quote only the official AWS figures here. This talk doesn't measure cost._
 
 ---
 
@@ -172,6 +194,27 @@ function inside the eager model.
 _rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
 ```
 
+### Slide: what is still slow? Profile the compiled DiT before any NKI
+The stage: whole-block graphs with `fullgraph=True`, native SDPA attention, no NKI in the DiT
+(TP=8, CFG as a batch of 2). Job:
+[`wan2-ti2v-5b-tp8-nonki-job.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/wan2-ti2v-5b-tp8-nonki-job.yaml)
+(`FAST_FULLGRAPH=1 FAST_ATTN_IMPL=sdpa FAST_CROSS_IMPL=sdpa USE_NKI_KERNELS=0`).
+
+Show in Neuron Explorer, using the DiT block's NEFF + NTFF pair:
+1. One block execution on the timeline. Attention takes the largest share of it.
+2. The engine view inside attention: Tensor busy only part of the time, the softmax on
+   Vector/Scalar, and DMA traffic for the score matrix.
+3. Point at the source line. That operator is what NKI fixes next.
+
+Numbers to read off the profile and fill in: block time, attention share of the block, Tensor
+utilization in attention. _Pending the job's results._
+
+Reference point from RESULTS.md: exact SDPA on all 30 layers ran at 1.92 s/step (18.2 ms per
+attention call). The kernels in the next section take it to 0.90 s/step.
+
+**Transition:** "The compiler fused everything around attention. Attention itself is now the
+bottleneck, and that is where a custom kernel pays off."
+
 ---
 
 ## 5. Step 3: NKI custom kernels for the critical operators (~12 min)
@@ -241,6 +284,19 @@ Then fuse into the kernel: the residual add (`residual_add_loc=POST_ACT`), and a
 followed by a conv done as four 2x2 convs on the low-res input (2.25x fewer MACs). VAE 6.0 →
 2.6 s.
 
+### Slide: the kernels in the profiler, DiT and VAE
+The optimized build, profiled with the same job and flags as the measured 8.7 s:
+[`wan2-ti2v-5b-tp8-job.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/wan2-ti2v-5b-tp8-job.yaml).
+It keeps NEFF + NTFF pairs for the DiT block and for the VAE conv graphs, named by component.
+
+Show side by side with the no-NKI profile from section 4:
+1. **DiT block:** `attention_cte` inside the block NEFF, with Tensor and Scalar busy together
+   and QK of one tile overlapping PV of the previous one. Block time before vs after.
+2. **VAE:** the nkilib `conv3d` graph. Tensor engine utilization on the main convs (RESULTS.md
+   measured 69-84% of peak), and the residual add inside the kernel.
+
+_Pending the job's results: screenshots and the per-block / per-conv times._
+
 ---
 
 ## 6. Step 4: scale across the cores with torch.distributed (~6 min)
@@ -276,18 +332,22 @@ The VAE is split the same way: each core decodes one spatial tile and rank 0 ble
 fed, and is deployed like any other pod.
 
 ### Slide: the server
-[`serve_ti2v.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/serve_ti2v.py):
-FastAPI on rank 0 (`POST /generate`, `/health`, `/readiness`), with all 8 ranks in one
-torchrun.
-- Collectives must run on the thread that compiled them. HTTP requests go on a queue, and the
-  main thread runs them.
-- Requests use the warm-up shape, so no request triggers a compile.
-- `/readiness` turns true only after warm-up, so Kubernetes sends no traffic to a cold pod.
+[`serve_ti2v.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/serve_ti2v.py) serves the
+same compiled pipeline the benchmark measures. It runs FastAPI on rank 0 (`POST /generate`,
+`/health`, `/readiness`), with all 8 ranks in one torchrun.
+- **Fixed shape.** Every request image is resized and cropped to the warm-up size, so no
+  request triggers a compile.
+- **Collectives stay on one thread.** They must run on the thread that compiled the graphs, so
+  HTTP requests go on a queue and the main thread runs them.
+- **T5 on the CPU, with a prompt cache.** It is needed for every request, and it does not fit
+  in HBM next to the DiT and VAE.
+- **Health before readiness.** `/health` answers while the model loads. `/readiness` turns true
+  only after warm-up.
 
 ### Slide: warm-up is part of deployment
 A lesson from this week: one warm-up run was not enough. On the current image, the second run
 still traced NKI kernels. The VAE took 186 s, then 21 s, then 3.6 s. Warm up until the
-timing settles before reporting ready.
+timing settles before reporting ready (the server does 3 runs, `WARMUP_RUNS`).
 
 ### Slide: keep the device fed
 Fixes found as gaps in the system trace:
@@ -346,10 +406,10 @@ For reference, an A100 with torch.compile takes 16.92 s for the same video.
 
 ## Open items
 
-- **Serving gap:** `serve_ti2v.py` still uses the old per-module compile path (lines 137-141),
-  not `fast_dit`, and it warms up only once. Port it before the talk, or present serving as the
-  next step.
+- Run `wan2-ti2v-5b-tp8-job.yaml` (DiT + VAE with kernels), then
+  `wan2-ti2v-5b-tp8-nonki-job.yaml` (compiled DiT, no NKI). Take Explorer screenshots for
+  sections 4 and 5.
+- Deploy the ported server (`wan2-ti2v-5b-deploy.yaml`) and record time per request.
 - Confirm which node the 7.1 s validation run used (trn2 or trn3-dev1). This outline uses only
   trn2 numbers.
-- Add Explorer screenshots: eager vs compiled block, and attention SDPA vs `attention_cte`.
 - Get the official Trainium price-performance wording.
