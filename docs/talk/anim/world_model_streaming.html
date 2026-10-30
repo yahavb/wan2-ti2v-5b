@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>World model streaming</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:pointer}
+  svg{display:block;width:100vw;height:100vh}
+  text{font-family:system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;font-weight:800;fill:#fff}
+</style>
+</head>
+<body>
+<svg id="s" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid meet" role="img"
+     aria-label="Text feeds T5 once. The DiT makes latent chunks one after another, reading a growing KV cache. Each chunk streams to the VAE and becomes frames on a filmstrip while the DiT works on the next chunk.">
+  <defs>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1600" height="900" fill="#0b0d12"/>
+  <g id="static"></g>
+  <g id="dyn"></g>
+</svg>
+<script>
+(function(){
+  "use strict";
+  var LOOP = 24;                       // seconds per loop
+  var C = ["#3d9bff","#ff7a3d","#2fd39a","#ffcc33","#e36bff"]; // one colour per chunk
+  var N = 5, FPC = 3, CAP = 4;          // chunks, frames per chunk, cache slots
+  var GRAY = "#5f6880";
+
+  // ---- timing (seconds) ----
+  var S0 = 3, PITCH = 3, DIT = 2.4, TRAVEL = 0.8, VAE = 1.5, FGAP = 0.25, FLY = 0.6;
+  function sC(c){ return S0 + c*PITCH; }        // DiT start for chunk c
+  function eC(c){ return sC(c) + DIT; }         // DiT done, chunk emitted, cache grows
+  function aC(c){ return eC(c) + TRAVEL; }      // chunk arrives at VAE
+  function fK(c,j){ return aC(c) + VAE + j*FGAP; } // frame j of chunk c leaves VAE
+
+  // ---- helpers ----
+  function clamp(x){ return x<0?0:x>1?1:x; }
+  function prog(t,a,d){ return clamp((t-a)/d); }
+  function ease(p){ return p<.5 ? 2*p*p : 1-Math.pow(-2*p+2,2)/2; }
+  function lerp(a,b,p){ return a+(b-a)*p; }
+  function hexA(h,a){ var n=parseInt(h.slice(1),16);
+    return "rgba("+(n>>16&255)+","+(n>>8&255)+","+(n&255)+","+a+")"; }
+  function R(x,y,w,h,rx,fill,stroke,sw,extra){
+    return '<rect x="'+x+'" y="'+y+'" width="'+Math.max(0,w)+'" height="'+Math.max(0,h)+'" rx="'+rx+
+      '" fill="'+fill+'"'+(stroke?' stroke="'+stroke+'" stroke-width="'+sw+'"':'')+(extra||'')+'/>'; }
+  function T(x,y,s,txt,fill){ return '<text x="'+x+'" y="'+y+'" font-size="'+s+'" text-anchor="middle"'+
+      (fill?' style="fill:'+fill+'"':'')+'>'+txt+'</text>'; }
+  // thick horizontal / vertical arrow
+  function arrowH(x1,x2,y,col){ return R(x1,y-7,x2-x1-26,14,7,col)+
+      '<polygon points="'+(x2-30)+','+(y-22)+' '+x2+','+y+' '+(x2-30)+','+(y+22)+'" fill="'+col+'"/>'; }
+  function arrowV(x,y1,y2,col){ // y2 is the tip; works both up and down
+    var d = y2>y1 ? 1 : -1, base = y2 - d*30;
+    return R(x-7,Math.min(y1,base),14,Math.abs(base-y1),7,col)+
+      '<polygon points="'+(x-22)+','+base+' '+x+','+y2+' '+(x+22)+','+base+'" fill="'+col+'"/>'; }
+
+  // ---- geometry ----
+  var DOC = {x:50,y:150,w:150,h:150};
+  var T5  = {x:280,y:150,w:200,h:150};
+  var DT  = {x:590,y:90,w:360,h:220};
+  var KV  = {x:590,y:390,w:360,h:80};
+  var VA  = {x:1180,y:110,w:240,h:180};
+  var FS  = {x:70,y:595,w:1460,h:210};
+  var FW = 88, FH = 140, FY = 630, FX0 = 80, FP = 96;
+  var SLOT = (KV.w - 24 - (CAP-1)*8)/CAP;
+
+  // ---- static layer ----
+  var st = '';
+  st += arrowH(210,272,225,GRAY);                 // text -> T5
+  st += arrowH(488,582,225,GRAY);                 // T5 -> DiT
+  st += arrowH(962,1172,200,GRAY);                // DiT -> VAE
+  st += arrowV(770,385,318,GRAY);                 // KV cache -> DiT (read)
+  st += arrowV(1300,298,588,GRAY);                // VAE -> frames
+  st += T(1067,300,44,'chunk');
+  st += T(770,535,44,'KV cache');
+  // filmstrip
+  st += R(FS.x,FS.y,FS.w,FS.h,12,'#1b1f29');
+  for (var sx = FS.x+14; sx < FS.x+FS.w-24; sx += 48){
+    st += R(sx,FS.y+8,24,14,4,'#6b7489') + R(sx,FS.y+FS.h-22,24,14,4,'#6b7489');
+  }
+  for (var k=0;k<N*FPC;k++) st += R(FX0+k*FP,FY,FW,FH,8,'#0b0d12');
+  st += T(800,875,44,'frames');
+  document.getElementById('static').innerHTML = st;
+
+  // ---- dynamic pieces ----
+  function box(b,col,active,label,fs){
+    var s = R(b.x,b.y,b.w,b.h,22, active?hexA(col,.30):'#151a25', col, active?10:6,
+              active?' filter="url(#glow)"':' opacity="0.75"');
+    return s + T(b.x+b.w/2, b.y+b.h/2 + fs*0.18 - (b===DT||b===VA?22:0), fs, label);
+  }
+  function bar(x,y,w,h,p,col){ return R(x,y,w,h,h/2,'#0b0d12','#3a4256',4) + (p>0?R(x,y,w*p,h,h/2,col):''); }
+  function token(cx,cy,col,sc,op){ // a stack of 3 latent frames
+    var s='', z=56*sc;
+    for (var m=2;m>=0;m--) s += R(cx-z/2+m*10*sc, cy-z/2-m*10*sc, z, z, 8*sc, col, '#0b0d12', 4,
+                                 ' opacity="'+op+'"');
+    return s;
+  }
+  function frame(x,y,w,h,k,col,op){
+    var sunX = x + 18 + (k/(N*FPC-1))*(w-36);    // the sun moves steadily: one consistent scene
+    return '<g opacity="'+op+'">'+R(x,y,w,h,8,hexA(col,.22),col,6)+
+      '<circle cx="'+sunX+'" cy="'+(y+h*0.32)+'" r="'+(w*0.16)+'" fill="#fff4b8"/>'+
+      '<ellipse cx="'+(x+w*0.5)+'" cy="'+(y+h-h*0.27)+'" rx="'+(w*0.36)+'" ry="'+(h*0.17)+'" fill="'+col+'"/></g>';
+  }
+  function dot(x,y,r,col){ return '<circle cx="'+x+'" cy="'+y+'" r="'+r+'" fill="'+(col||'#fff')+'" filter="url(#glow)"/>'; }
+
+  function render(t){
+    var s = '';
+    // --- text block, fed to T5 once ---
+    var dOp = ease(prog(t,0,0.6));
+    s += '<g opacity="'+dOp+'">'+R(DOC.x,DOC.y,DOC.w,DOC.h,16,'#1e2533','#e8ecf4',6);
+    [110,90,110,70].forEach(function(w,i){ s += R(DOC.x+20,DOC.y+28+i*28,w,14,7,'#e8ecf4'); });
+    s += '</g>';
+    var p1 = prog(t,0.6,0.8); if (p1>0 && p1<1) s += dot(lerp(205,275,ease(p1)),225,18);
+    var t5on = t>=1.4 && t<2.6;
+    s += box(T5,'#2fd3c9',t5on,'T5',64);
+    var p2 = prog(t,2.2,0.8); if (p2>0 && p2<1) s += dot(lerp(485,585,ease(p2)),225,18,'#7ff5ec');
+
+    // --- DiT ---
+    var cur = -1, dp = 0;
+    for (var c=0;c<N;c++) if (t>=sC(c) && t<eC(c)){ cur=c; dp=(t-sC(c))/DIT; }
+    s += box(DT, cur>=0?C[cur]:'#8fa3c7', cur>=0, 'DiT', 76);
+    s += bar(DT.x+40, DT.y+DT.h-62, DT.w-80, 34, cur>=0?dp:0, cur>=0?C[cur]:'#000');
+
+    // --- KV cache: grows each chunk; chunk 0 is a pinned sink, oldest other entry rolls out ---
+    var reading = cur>=1;
+    s += R(KV.x,KV.y,KV.w,KV.h,14,'#0f141e', reading?'#ffffff':'#8fa3c7', reading?8:6, reading?' filter="url(#glow)"':'');
+    var cx = KV.x+12;
+    for (c=0;c<N;c++){
+      var a = ease(prog(t,eC(c),0.5));
+      var ev = 0; if (c>=1 && c+CAP<=N) ev = ease(prog(t,eC(c+CAP-1),0.5)); // chunk 1 evicted when chunk 4 lands
+      var f = a*(1-ev);
+      if (f>0.001) s += R(cx, KV.y+12, SLOT*f, KV.h-24, 8, C[c], c===0?'#ffffff':null, 5);
+      cx += (SLOT+8)*f;
+    }
+    if (reading){ var ph = ((t-sC(cur))/0.55)%1; s += dot(770, lerp(380,322,ph), 15); }
+
+    // --- chunk tokens travelling DiT -> VAE ---
+    for (c=0;c<N;c++){
+      var tp = prog(t,eC(c),TRAVEL);
+      if (tp>0 && tp<1) s += token(lerp(990,1150,ease(tp)), 196, C[c], 1, tp>0.85?(1-tp)/0.15:1);
+    }
+
+    // --- VAE ---
+    var vc = -1, vp = 0;
+    for (c=0;c<N;c++) if (t>=aC(c) && t<fK(c,FPC-1)+0.2){ vc=c; vp=clamp((t-aC(c))/VAE); }
+    s += box(VA, vc>=0?C[vc]:'#8fa3c7', vc>=0, 'VAE', 64);
+    s += bar(VA.x+30, VA.y+VA.h-58, VA.w-60, 30, vc>=0?vp:0, vc>=0?C[vc]:'#000');
+
+    // --- frames fly from VAE to the filmstrip ---
+    for (c=0;c<N;c++) for (var j=0;j<FPC;j++){
+      var k = c*FPC+j, fp = prog(t,fK(c,j),FLY);
+      if (fp<=0) continue;
+      var e = ease(fp), sc = lerp(0.45,1,e);
+      var x = lerp(1300-FW*sc/2, FX0+k*FP, e), y = lerp(300, FY, e);
+      s += frame(x, y, FW*sc, FH*sc, k, C[c], 1);
+    }
+    document.getElementById('dyn').innerHTML = s;
+  }
+
+  // ---- loop / restart / reduced motion ----
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var t0 = performance.now();
+  function restart(){ t0 = performance.now(); }
+  var hm = /t=([\d.]+)/.exec(location.hash);       // e.g. #t=12 freezes at 12 s (for checking)
+  if (hm){ render(parseFloat(hm[1])); return; }
+  if (reduce){ render(LOOP - 0.01); return; }
+  function tick(now){ render(((now - t0)/1000) % LOOP); requestAnimationFrame(tick); }
+  requestAnimationFrame(tick);
+  document.addEventListener('click', restart);
+  document.addEventListener('keydown', function(ev){ if (ev.code==='Space'){ ev.preventDefault(); restart(); } });
+})();
+</script>
+</body>
+</html>
