@@ -15,10 +15,19 @@ torchrun --nproc_per_node=8 block_bench.py [variant ...]
   sp_a2o   sp_lx + all-to-all output + unsharded O-projection (FAST_A2A_O; CFG_PAR=1 only)
            SP timing probes: SP_NOCOMM, SP_NOQKN, SP_NOROPE, SP_NOSA, SP_NOXA (=1 each)
 The ablations change the math; they are timing probes only.
+Accuracy: REF32=1 adds rel_rms_vs_fp32 (the block in fp32 on the CPU, cached per input set);
+XMERGE=<n> zero-pads the context after n real tokens and runs the sp_lx / sp_a2o cross-attention on
+the merged keys with their score bias, as FAST_CROSS_MERGE does in the pipeline.
 Env: LAYER (0), REPS (20), SELF_IMPL (cte|constmax|sdpa), FAST_CROSS_IMPL,
-     CFG_PAR=1 (two TP groups of world/2, batch 1: the CFG_PARALLEL layout)
+     CFG_PAR=1 (two TP groups of world/2, batch 1: the CFG_PARALLEL layout; ranks 0..tp-1 are the
+     first group, so NEURON_RT_VISIBLE_CORES=c,c+2,..,c+1,c+3,.. puts the groups on alternating
+     cores as CFG_GROUPS=interleave does), BB_TP=4 with 4 ranks (one CFG group alone),
+     BB_STAGGER_MS (the second group's timed loop starts that much later), REAL_X=<file> (a saved
+     real block input), SP_NOLN / SP_NOPERM (more SP timing probes)
 """
+import copy
 import glob
+import math
 import os
 import sys
 import time
@@ -144,6 +153,10 @@ def main():
 
     variants = sys.argv[1:] or ["ref", "full", "no_ar", "no_sa", "no_xa", "no_ew", "mm_only", "ar_only"]
     blk, missing = load_block(LAYER)
+    # REF32=1: score the SP variants against the block in fp32 on the CPU (ref_fp32.block_fwd, the
+    # upstream math with exact attention), computed once by rank 0 from the unsharded weights.
+    ref32 = os.environ.get("REF32", "0") == "1"
+    blk32 = copy.deepcopy(blk).float() if ref32 else None
 
     class _M:  # minimal model stand-in for shard_model_tp
         pass
@@ -151,9 +164,9 @@ def main():
     m.blocks, m.num_heads, m.parameters = [blk], HEADS, blk.parameters
     # CFG_PAR=1: two TP groups of world/2 ranks, each running one CFG branch (batch 1).
     cfg_par = os.environ.get("CFG_PAR", "0") == "1"
-    tp = world // 2 if cfg_par else world
+    # BB_TP=4 with 4 ranks and CFG_PAR=1: one CFG group alone (the other group's cores idle)
+    tp = int(os.environ.get("BB_TP", "0")) or (world // 2 if cfg_par else world)
     bsz = 1 if cfg_par else B
-    import copy
     full_cross = copy.deepcopy(blk.cross_attn).to(torch.bfloat16).to(dev)
     full_o = copy.deepcopy(blk.self_attn.o).to(torch.bfloat16).to(dev)
     init_tp_group(tp_degree=tp)
@@ -166,13 +179,40 @@ def main():
     g = torch.Generator().manual_seed(0)
     x = (torch.randn(bsz, L, DIM, generator=g) * 0.5).to(torch.bfloat16).to(dev)
     e0 = (torch.randn(1, GRID[0], 6, DIM, generator=g) * 0.1).to(torch.bfloat16).to(dev)
+    real = os.environ.get("REAL_X", "")  # a real residual-stream input of block LAYER (+ its em = modulation + e0)
+    if real:
+        rd = torch.load(real)
+        x = rd["x"].view(1, L, DIM).expand(bsz, L, DIM).contiguous().to(dev)
+        e0 = (rd["em"].float() - blk.modulation.detach().float().cpu()).unsqueeze(0).to(torch.bfloat16).to(dev)
     c = D // 2
     freqs = torch.cat([rope_freqs(1024, D - 4 * (D // 6)), rope_freqs(1024, 2 * (D // 6)),
                        rope_freqs(1024, 2 * (D // 6))], 1)
     assert freqs.shape[1] == c
     cos, sin = fd._rope_tables(freqs, GRID, D, dev)
-    ctx = (torch.randn(bsz, LC, DIM, generator=g) * 0.5).to(torch.bfloat16).to(dev)
+    ctx = (torch.randn(bsz, LC, DIM, generator=g) * 0.5).to(torch.bfloat16)
+    nreal = int(os.environ.get("XMERGE", "0"))
+    if nreal:
+        ctx[:, nreal:] = 0  # zero-padded text context, as the pipeline's
+    ctx = ctx.to(dev)
     ck, cv = torch.compile(fd._FastCrossKV(blk), backend="neuron", dynamic=False)(ctx)
+    y32 = None
+    if ref32:
+        tag = os.path.basename(real).replace(".pt", "") if real else "rand"
+        path = f"/tmp/blk_ref32_L{LAYER}_b{bsz}_x{nreal}_{tag}.pt"
+        if rank == 0 and not os.path.exists(path):
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from ref_fp32 import block_fwd, lin, rms
+            torch.set_num_threads(int(os.environ.get("REF32_THREADS", "64")))
+            c32, ca32 = ctx.float().cpu(), blk32.cross_attn
+            ck32 = rms(lin(c32, ca32.k), ca32.norm_k).view(bsz, LC, ca32.num_heads, ca32.head_dim)
+            cv32 = lin(c32, ca32.v).view(bsz, LC, ca32.num_heads, ca32.head_dim)
+            cos32, sin32 = fd._rope_tables(freqs, GRID, D, torch.device("cpu"))
+            t0 = time.perf_counter()
+            out32 = block_fwd(blk32, x.float().cpu(), e0.float().cpu(), cos32, sin32, ck32, cv32, GRID[0])
+            torch.save(out32, path)
+            print(f"[block_bench] fp32 CPU reference {path} in {time.perf_counter() - t0:.1f}s", flush=True)
+        dist.barrier()
+        y32 = torch.load(path)  # [bsz, L, DIM] fp32
 
     from models.tp_utils import get_tp_rank, get_tp_world_size
     base_args = (x, e0, cos, sin, ck, cv)
@@ -192,15 +232,28 @@ def main():
             xs = xflat[shard * S:(shard + 1) * S].contiguous()
             oh = fd._sp_onehot(bsz, L, GRID[1] * GRID[2], GRID[0], Np, shard, tpw).to(dev)
             lx = var in ("sp_lx", "sp_a2o")
-            kk, vv = ck, cv
+            kk, vv, cb = ck, cv, None
+            cx = ctx
+            if lx and nreal:  # FAST_CROSS_MERGE: n real keys + copies of the pad key, log-weighted
+                lk = 128 * -(-(nreal + 1) // 128)
+                idx = torch.tensor(list(range(nreal)) + [nreal] * (lk - nreal), device=ctx.device)
+                cx = ctx.index_select(1, idx)
+                w = torch.zeros(lk, dtype=torch.float32)
+                w[nreal:] = math.log((LC - nreal) / (lk - nreal))
+                cb = w.to(dev)
             if lx:
-                kk, vv = torch.compile(fd._LocalCrossKV(full_cross), backend="neuron", dynamic=False)(ctx)
+                kk, vv = torch.compile(fd._LocalCrossKV(full_cross), backend="neuron", dynamic=False)(cx)
             args = (xs, e0, oh, cos.repeat(1, bsz, 1, 1), sin.repeat(1, bsz, 1, 1), kk, vv)
+            if cb is not None:
+                args = args + (cb,)
             unit = fd._FastBlockSP(blk, SELF_IMPL, bsz, L, Np, full_cross=full_cross if lx else None,
                                    full_o=full_o if var == "sp_a2o" else None)
             yr = F.pad(yr.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S].float().cpu()
             n_valid = max(0, min(S, N - shard * S))
-            sp_ref = (yr, n_valid)
+            yr32 = None
+            if y32 is not None:
+                yr32 = F.pad(y32.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S]
+            sp_ref = (yr, n_valid, yr32)
         elif var == "ref":
             unit = fd._FastBlock(blk, GRID[0], SELF_IMPL, None)
         elif var == "ar_only":
@@ -231,6 +284,25 @@ def main():
                 fd._local_rms = lambda t, nrm: t
             if os.environ.get("SP_NOROPE", "0") == "1":
                 fd._rope = lambda t, c_, s_: t
+            if os.environ.get("SP_NOLN", "0") == "1":  # norm1 / norm2 / norm3 -> identity
+                class _Id(torch.nn.Module):
+                    def forward(self, t):
+                        return t
+                blk.norm1, blk.norm2, blk.norm3 = _Id(), _Id(), _Id()
+            # SP_NOPERM=1: self-attention gets q / k / v as plain reshapes of the [L, n, d] tensors
+            # (no head-major permute copies, no k transpose, no output transpose): the layout cost
+            if os.environ.get("SP_NOPERM", "0") == "1":
+                _cte_real = fd._cte
+
+                def _cte_noperm(q, k, v, _o=_cte_real):
+                    from nkilib.core.attention.attention_cte import attention_cte
+                    B_, Lq, n_, d_ = q.shape
+                    if k.shape[1] != Lq:  # cross-attention: unchanged
+                        return _o(q, k, v)
+                    out = attention_cte(q.reshape(B_ * n_, Lq, d_), k.reshape(B_ * n_, d_, Lq),
+                                        v.reshape(B_ * n_, Lq, d_), scale=d_ ** -0.5, causal_mask=False)
+                    return out.view(B_, Lq, n_, d_)
+                fd._cte = _cte_noperm
             # SP_NOSA=1 / SP_NOXA=1: drop the self- / cross-attention kernel. Self returns v + q + k
             # so the q/k projections, QK-norm and RoPE stay live; cross returns q.
             nosa, noxa = os.environ.get("SP_NOSA", "0") == "1", os.environ.get("SP_NOXA", "0") == "1"
@@ -256,20 +328,36 @@ def main():
             y = f(*args)
         torch.neuron.synchronize()
         dist.barrier()
+        # BB_STAGGER_MS=<ms> (CFG_PAR=1): the second TP group starts its timed loop that much later,
+        # so the two groups run the same block phase-shifted (they never sync with each other here)
+        stag = float(os.environ.get("BB_STAGGER_MS", "0")) / 1e3 if rank >= tp else 0.0
+        if stag:
+            time.sleep(stag)
         t0 = time.perf_counter()
         for _ in range(REPS):
             y = f(*args)
         torch.neuron.synchronize()
         ms = (time.perf_counter() - t0) / REPS * 1e3
+        if os.environ.get("BB_STAGGER_MS") and world > tp:
+            allms = [None] * world
+            dist.all_gather_object(allms, ms)
+            if rank == 0:
+                print(f"{var:>8}: stagger {os.environ['BB_STAGGER_MS']} ms: group 0 "
+                      f"{max(allms[:tp]):.2f} ms/block, group 1 {max(allms[tp:]):.2f} ms/block", flush=True)
         chk = ""
         if var.startswith("sp") and sp_ref is not None:
-            yr, nv = sp_ref
+            yr, nv, yr32 = sp_ref
             ys = y.float().cpu()[:nv]
             chk = (f" rel_rms_vs_ref_rows={((ys - yr[:nv]).pow(2).mean().sqrt() / yr[:nv].pow(2).mean().sqrt()).item():.5f}"
                    f" pad_rows_finite={bool(torch.isfinite(y.float().cpu()[nv:]).all())}")
+            if yr32 is not None:  # this rank's rows vs the fp32 CPU block
+                r32 = yr32[:nv]
+                chk += f" rel_rms_vs_fp32={((ys - r32).pow(2).mean().sqrt() / r32.pow(2).mean().sqrt()).item():.5f}"
         if rank == 0:
             print(f"{var:>8}: {ms:7.2f} ms/block  (first call {t_first:.1f}s) "
                   f"out_rms={y.float().pow(2).mean().sqrt().item():.4f}{chk}", flush=True)
+        elif chk and os.environ.get("ALL_RANKS", "0") == "1":  # every shard of both CFG groups
+            print(f"{var:>8} rank {rank}:{chk}", flush=True)
         dist.barrier()
     dist.destroy_process_group()
 

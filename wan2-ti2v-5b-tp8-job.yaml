@@ -216,6 +216,20 @@ spec:
               value: "1"
             - name: FAST_CROSS_MERGE
               value: "1"
+            - name: FAST_QK_PREP
+              value: "1"
+            - name: FAST_QKV_CTE
+              value: "1"
+            - name: FAST_LN_MOD
+              value: "1"
+            - name: FAST_CTE_LB
+              value: "1"
+            - name: LINGBOT_CTE_VGROUP
+              value: "8"
+            - name: LINGBOT_CTE_KGROUP
+              value: "4"
+            - name: LINGBOT_CTE_KV_DGE
+              value: "hwdge_sync"
             - name: CFG_GROUPS
               value: "interleave"
             - name: VAE_FUSE_NORM

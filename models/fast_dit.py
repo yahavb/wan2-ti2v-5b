@@ -68,6 +68,35 @@ FAST_MOD_SPLIT = os.environ.get("FAST_MOD_SPLIT", "0") == "1"
 # as SDPA with the log-weights as an fp32 additive mask (1.11 -> 0.39 ms per block vs attention_cte
 # on 512 keys, scripts/validate/cross_merge_bench.py).
 FAST_CROSS_MERGE = os.environ.get("FAST_CROSS_MERGE", "0") == "1"
+# FAST_QK_PREP=1 (FAST_SP, cte self-attention): QK-norm, RoPE and the attention_cte layouts of
+# q / k / v in two NKI kernels (kernels/qk_prep.py: per-token sums of squares, then the all-reduce,
+# then norm + rotation + head-major / transposed writes in one pass) instead of the compiled fp32
+# chain and permute copies. Same rounding steps as the torch code.
+FAST_QK_PREP = os.environ.get("FAST_QK_PREP", "0") == "1"
+# FAST_QKV_CTE=1 (with FAST_QK_PREP): the q / k / v projections as one nkilib qkv_cte call on the
+# fused weight, which also emits the per-token sums of squares for QK-norm
+# (kernels/qk_prep.qkv_proj_kernel), instead of three compiler matmuls + the qk_sumsq kernel;
+# qk_apply then reads q / k / v from the fused output. 1.94 -> 1.56 ms on one core at this block's
+# shape, bitwise-equal outputs (scripts/validate/qkv_bench.py).
+FAST_QKV_CTE = os.environ.get("FAST_QKV_CTE", "0") == "1"
+# FAST_LN_MOD=1 (FAST_SP): the block's three LayerNorms on the token shard as NKI kernels
+# (kernels/ln_mod.py): norm1 / norm2 fused with their modulation (the per-frame scale / shift rows
+# selected on the PE by the token one-hot, from PSUM), norm3 with its affine weights, in fp32 with
+# one rounding. The compiled LayerNorms cost ~0.95 ms per block (block_bench SP_NOLN probe). With
+# these kernels the residual stream stays fp32 inside the block (_FastBlockSP.f32_res).
+FAST_LN_MOD = os.environ.get("FAST_LN_MOD", "0") == "1"
+# FAST_CTE_LB=1: the self-attention through lingbot-world's vendored attention_cte
+# (kernels/attention_cte_lb.py) instead of nkilib's. Its LINGBOT_CTE_* knobs (job: VGROUP=8,
+# KGROUP=4, KV_DGE=hwdge_sync) load 8 V / 4 K tiles per DMA with hardware descriptor generation
+# instead of one software-DGE DMA per tile (~0.75 us of GpSimd each): 5.11 -> 4.89 ms per call at
+# this pipeline's 6 x 7854 x 128 shape (scripts/validate/cte_lb_bench.py; rel-RMS ~4e-6 vs nkilib).
+FAST_CTE_LB = os.environ.get("FAST_CTE_LB", "0") == "1"
+# DUMP_BLOCKS=<dir>:<i,j,...> (diagnostic): on the first DiT call, every rank saves its token shard
+# entering and leaving blocks i, j, ... (with e0 and its CFG group / shard index) to <dir>.
+_DUMP_BLOCKS = None
+if os.environ.get("DUMP_BLOCKS"):
+    _d, _b = os.environ["DUMP_BLOCKS"].split(":")
+    _DUMP_BLOCKS = (_d, {int(v) for v in _b.split(",")})
 # FAST_TIMING=1: device-sync around each compiled unit and log per-block ms (diagnostic only;
 # the syncs serialize host and device, so the total is a little above the untimed step).
 FAST_TIMING = os.environ.get("FAST_TIMING", "0") == "1"
@@ -271,13 +300,22 @@ def _const_max_self(q, k, v):
     return out.view(B, n, L, d).transpose(1, 2)
 
 
+def _attention_cte():
+    """nkilib's attention_cte, or lingbot-world's vendored copy (FAST_CTE_LB)."""
+    if FAST_CTE_LB:
+        from kernels.attention_cte_lb import attention_cte
+    else:
+        from nkilib.core.attention.attention_cte import attention_cte
+    return attention_cte
+
+
 def _cte(q, k, v):
     """q [B, Lq, n, d], k/v [B, Lk, n, d] -> [B, Lq, n, d] via nkilib attention_cte.
 
     Exact flash attention (online softmax, no score-range limit, any seqlen), non-causal.
     Batch and heads are folded into the kernel's batch axis; at LNC1 it runs on one core.
     """
-    from nkilib.core.attention.attention_cte import attention_cte
+    attention_cte = _attention_cte()
     B, Lq, n, d = q.shape
     Lk = k.shape[1]
     qn = q.permute(0, 2, 1, 3).reshape(B * n, Lq, d)  # tp_q=True layout (bs, seqlen_q, d)
@@ -396,6 +434,35 @@ class _FastBlockSP(nn.Module):
                 f2.weight = nn.Parameter(f2.weight.new_empty(0), requires_grad=False)
         if full_o is not None and free_unused:  # the sharded O-projection is unused then
             block.self_attn.o.weight = nn.Parameter(block.self_attn.o.weight.new_empty(0), requires_grad=False)
+        # NKI kernels are built here, not in forward: dynamo ignores the lru_cache around the kernel
+        # factories and traces the factory itself, re-creating the kernel inside every graph.
+        sa, blk = block.self_attn, block
+        self.k_ln1 = self.k_ln2 = self.k_ln3 = self.k_qk = None
+        if FAST_LN_MOD and isinstance(blk.norm3, nn.LayerNorm) and blk.norm3.weight is not None:
+            from kernels.ln_mod import ln_affine_kernel, ln_mod_kernel
+            self.k_ln1 = ln_mod_kernel(float(blk.norm1.eps))
+            self.k_ln2 = ln_mod_kernel(float(blk.norm2.eps))
+            self.k_ln3 = ln_affine_kernel(float(blk.norm3.eps))
+        # norm3 / norm2 read the residual sum after the self- / cross-attention. The compiled block
+        # keeps that sum in fp32 until the block output; a kernel input is a bf16 tensor, and rounding
+        # the residual there moved the step-0 noise prediction from 0.0485 to 0.058 rel-RMS vs fp32.
+        # So with those kernels the residual stays fp32 explicitly (kernels get a bf16 copy): 0.0474.
+        self.f32_res = self.k_ln2 is not None or self.k_ln3 is not None
+        self.k_qkv = self.qkv_w = None
+        if (FAST_QK_PREP and attn_impl == "cte" and batch == 1 and sa.norm_q.eps == sa.norm_k.eps
+                and sa.norm_q.global_dim == sa.norm_k.global_dim):
+            from kernels.qk_prep import qk_apply_kernel, qkv_proj_kernel
+            self.k_qk = qk_apply_kernel(sa.head_dim, float(sa.norm_q.eps), int(sa.norm_q.global_dim),
+                                        fused=FAST_QKV_CTE)
+            if FAST_QKV_CTE:  # fused [C, 3D] weight and [1, 3D] bias for nkilib qkv_cte (built on the CPU)
+                cpu = lambda t: t.detach().cpu()  # noqa: E731
+                w = torch.cat([cpu(sa.q.weight), cpu(sa.k.weight), cpu(sa.v.weight)], 0).t().contiguous()
+                b = torch.cat([cpu(sa.q.bias), cpu(sa.k.bias), cpu(sa.v.bias)], 0).view(1, -1).contiguous()
+                self.qkv_w = (w.to(sa.q.weight.device), b.to(sa.q.weight.device))
+                self.k_qkv = qkv_proj_kernel(sa.num_heads, sa.head_dim)
+                if free_unused:  # the projection reads only the fused copies now
+                    for lin in (sa.q, sa.k, sa.v):
+                        lin.weight = nn.Parameter(lin.weight.new_empty(0), requires_grad=False)
 
     def _self_attn(self, q, k, v):
         if self.attn_impl == "constmax":
@@ -422,25 +489,55 @@ class _FastBlockSP(nn.Module):
             mods = [et[:, j] for j in range(6)]
 
         # self-attention
-        h = blk.norm1(xs).to(torch.bfloat16) * (1 + mods[1]) + mods[0]
+        if self.k_ln1 is not None or self.k_ln2 is not None:
+            ohT = oh.t().to(em.dtype).contiguous()  # [F, S]
+            er = [em[0, :, j].contiguous() for j in range(6)]  # modulation rows, each [F, C]
+        if self.k_ln1 is not None:
+            h = self.k_ln1(xs, ohT, er[1], er[0])
+        else:
+            h = blk.norm1(xs).to(torch.bfloat16) * (1 + mods[1]) + mods[0]
         hf = _ag(h)  # [Np, C]
-        q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
-        q, k = _tp_rms_qk(q.unsqueeze(0), k.unsqueeze(0), sa.norm_q, sa.norm_k)
-        q = _rope(q[:, :N].reshape(1, N, n, d), cos, sin).view(B, L, n, d)
-        k = _rope(k[:, :N].reshape(1, N, n, d), cos, sin).view(B, L, n, d)
-        v = v[:N].reshape(B, L, n, d)
-        y = F.pad(self._self_attn(q, k, v).reshape(N, n * d), (0, 0, 0, Np - N))
+        if self.k_qk is not None:
+            attention_cte = _attention_cte()
+            rope_cs = (cos.view(N, d // 2), sin.view(N, d // 2))
+            if self.k_qkv is not None:  # one nkilib qkv_cte call, with the per-token sums of squares
+                qkv, qss, kss = self.k_qkv(hf.unsqueeze(0), *self.qkv_w)  # [1, Np, 3D], 2 x [1, Np, 1]
+                ss = _all_reduce(torch.cat([qss[0], kss[0]], -1))  # [Np, 2]: global sums of squares
+                qn, kn, vn = self.k_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
+            else:
+                from kernels.qk_prep import qk_sumsq
+                q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
+                ss = _all_reduce(qk_sumsq(q, k))  # [Np, 2]: global sums of squares of q and k
+                qn, kn, vn = self.k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
+            o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
+            y = F.pad(o.view(n, N, d).transpose(0, 1).reshape(N, n * d), (0, 0, 0, Np - N))
+        else:
+            q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
+            q, k = _tp_rms_qk(q.unsqueeze(0), k.unsqueeze(0), sa.norm_q, sa.norm_k)
+            q = _rope(q[:, :N].reshape(1, N, n, d), cos, sin).view(B, L, n, d)
+            k = _rope(k[:, :N].reshape(1, N, n, d), cos, sin).view(B, L, n, d)
+            v = v[:N].reshape(B, L, n, d)
+            y = F.pad(self._self_attn(q, k, v).reshape(N, n * d), (0, 0, 0, Np - N))
         if self.full_o is not None:
             y = _lin(_head2seq(y), self.full_o)  # [S, C]: my tokens, all heads, unsharded O
         else:
             y = _rs(_mm(y, sa.o)) + sa.o.bias
-        xs = xs + y * mods[2]
+        if self.f32_res:  # the residual stays fp32 inside the block, rounded at its output (see FAST_LN_MOD)
+            xs = xs.float() + y.float() * mods[2].float()
+        else:
+            xs = xs + y * mods[2]
 
         # cross-attention; ck/cv precomputed once per prompt (_FastCrossKV / _LocalCrossKV)
+        if self.k_ln3 is not None:
+            n3 = lambda t: self.k_ln3(t.to(torch.bfloat16), blk.norm3.weight, blk.norm3.bias)  # noqa: E731
+        elif self.f32_res:
+            n3 = lambda t: blk.norm3(t).to(torch.bfloat16)  # noqa: E731
+        else:
+            n3 = blk.norm3
         if self.xca is not None:
             xa = self.xca
             nh, hd = xa.num_heads, xa.head_dim
-            q = _local_rms(_lin(blk.norm3(xs), xa.q), xa.norm_q).view(1, -1, nh, hd)  # [1, S, H, d]
+            q = _local_rms(_lin(n3(xs), xa.q), xa.norm_q).view(1, -1, nh, hd)  # [1, S, H, d]
             if cb is not None:
                 y = _sdpa_attn_bias(q, ck, cv, cb)
             else:
@@ -454,7 +551,10 @@ class _FastBlockSP(nn.Module):
             xs = xs + (_rs(_mm(y, ca.o)) + ca.o.bias)
 
         # FFN
-        h = blk.norm2(xs).to(torch.bfloat16) * (1 + mods[4]) + mods[3]
+        if self.k_ln2 is not None:
+            h = self.k_ln2(xs.to(torch.bfloat16), ohT, er[4], er[3])
+        else:
+            h = blk.norm2(xs).to(torch.bfloat16) * (1 + mods[4]) + mods[3]
         hf = _ag(h)
         if self.mlp_w is not None:
             from nkilib.core.mlp.mlp import mlp
@@ -466,6 +566,8 @@ class _FastBlockSP(nn.Module):
             y = _rs(y.reshape(Np, C)) + blk.ffn[2].bias
         else:
             y = _rs(_mm(blk.ffn[1](_lin(hf, blk.ffn[0])), blk.ffn[2])) + blk.ffn[2].bias
+        if self.f32_res:
+            return (xs + y.float() * mods[5].float()).to(torch.bfloat16)
         return xs + y * mods[5]
 
 
@@ -809,8 +911,18 @@ class FastWanDiT:
             return self._timed_call(latent, t)
         e, e0 = self._time_embed(t)
         x = self.patch(latent.to(torch.bfloat16))
+        dump = _DUMP_BLOCKS if not getattr(self, "_blocks_dumped", False) else None
         for i in range(len(self.blocks)):
+            if dump and i in dump[1]:
+                x_in = x.cpu()
             x = self._block(i, x, e0)
+            if dump and i in dump[1]:  # diagnostic: this rank's shard in / out of block i, first call only
+                from models.tp_utils import get_tp_rank
+                os.makedirs(dump[0], exist_ok=True)
+                torch.save({"x_in": x_in, "x_out": x.cpu(), "e0": e0.cpu(), "t": float(t), "group": self.cfg_group,
+                            "shard": get_tp_rank() if self.sp else 0},
+                           os.path.join(dump[0], f"blk{i}_rank{torch.distributed.get_rank()}.pt"))
+        self._blocks_dumped = True
         return self._head(x, e)
 
     def _timed_call(self, latent, t):

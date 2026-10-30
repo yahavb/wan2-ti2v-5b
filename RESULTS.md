@@ -34,7 +34,13 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | 0.58 | 5.8s | 1.8s | 7.6s | 0.0484* |
 | + T5 freed before the other models load; 4 latent frames per VAE decoder call (`VAE_TCHUNK=4`) | 0.58 | 5.8s | 1.7s | 7.5s | 0.0484* |
 | + cross-attention over the real context tokens plus weighted copies of the identical pad key (`FAST_CROSS_MERGE=1`); VAE: sub-pixel interleave + shortcut as one NKI kernel (`VAE_SUBPIXEL_MERGE=1`), compiled own-rows middle attention (`VAE_STRIP_ATTN=1`), 1x1 shortcuts as one matmul (`VAE_CONV1X1_MM=1`) | 0.57 | 5.7s | 1.6s | 7.3s | 0.0485* |
-| + VAE latent level in 2 calls instead of 6 (`VAE_LAT_ALL=1`), chunk copy-out behind the queued graphs (`VAE_SHIP_THREAD=1`), uint8 conversion on every rank (`VAE_U8_SHIP=1`) | **0.57** | **5.7s** | **1.5s** | **7.2s** | 0.0485* |
+| + VAE latent level in 2 calls instead of 6 (`VAE_LAT_ALL=1`), chunk copy-out behind the queued graphs (`VAE_SHIP_THREAD=1`), uint8 conversion on every rank (`VAE_U8_SHIP=1`) | 0.57 | 5.7s | 1.5s | 7.2s | 0.0485* |
+| + QK-norm, RoPE and the attention layouts in NKI kernels (`FAST_QK_PREP=1`), q/k/v as one nkilib `qkv_cte` call that also writes the QK-norm sums (`FAST_QKV_CTE=1`), LayerNorms + modulation as NKI kernels with an fp32 residual (`FAST_LN_MOD=1`), vendored `attention_cte` with grouped hardware-DGE K/V loads (`FAST_CTE_LB=1`) † | **0.57** | **5.67s** | **1.55s** | **7.22s** | **0.0474*** |
+
+† Measured on a second trn2.48xlarge (device 3), where the row above runs at 0.59 s/step, denoise
+5.88 s, VAE 1.54 s, total 7.42 s and 0.0485 accuracy: an A/B of two processes per configuration,
+alternating, mean of warm runs 3-4 of 4 each (denoise 5.844-5.916 -> 5.619-5.698 s, total
+7.365-7.465 -> 7.133-7.329 s), so -0.21 s denoise and -0.20 s total.
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
@@ -166,6 +172,54 @@ alternating runs on one device (2 warm runs each, the dump run excluded): VAE 1.
 1.489-1.493 s (one 1.604 in the run with the memory monitor), total 7.29-7.35 -> 7.16-7.20 s; the
 latent and the mp4 bytes are identical to the configuration above (same md5 in every run), and the
 VAE-phase device memory drops to 9.2-9.4 GB per core (neuron-monitor peak).
+
+The DiT-block kernels of the † row, per block on the block bench (`sp_a2o`, `CFG_PAR=1`, `XMERGE=70`,
+contiguous cores, 20 reps): 18.89 ms -> 18.77 (`FAST_QK_PREP`) -> 18.54 (+ `FAST_QKV_CTE`) -> 18.53
+(+ `FAST_LN_MOD`) -> 18.33 ms (+ `FAST_CTE_LB`); on interleaved cores, as the pipeline runs, 17.68 ms.
+Block output rel-RMS vs the fp32 block 0.00512 -> 0.00444. `FAST_QK_PREP` computes the per-token sums
+of squares of q and k, all-reduces them over the TP group (QK-norm runs over all 24 heads), then
+normalizes, rotates and writes q, k^T and v in `attention_cte`'s layouts in one pass, instead of the
+compiled fp32 chain plus permute copies. `FAST_QKV_CTE` replaces the three projections with one
+nkilib `qkv_cte` call on the fused [3072, 2304] weight, which writes the sums of squares while each
+tile is in SBUF: 1.94 -> 1.56 ms on one core, outputs and sums bitwise equal
+(`scripts/validate/qkv_bench.py`). `FAST_LN_MOD` runs norm1 and norm2 with their per-frame modulation
+(scale and shift rows selected on the PE by the token one-hot) and norm3 with its affine weights as
+NKI kernels, fp32 throughout with one rounding: on a real residual-stream shard the kernel's error
+vs fp32 is the bf16 rounding of the fp32 result (1.7e-3 rel-RMS; the compiled LayerNorm 4.1e-3,
+`scripts/validate/ln_real_check.py`). The compiled block keeps the residual sum fp32 between the
+attention and the block output; a kernel input is a bf16 tensor, and rounding the residual there
+moved the step-0 noise prediction from 0.0485 to 0.058 vs fp32, so with these kernels the residual
+stays fp32 explicitly and the kernels get a bf16 copy (0.0474). Rounding to bf16 after every LN
+step, as eager torch does, scored 0.0480 at the same speed. `FAST_CTE_LB` takes lingbot-world's
+vendored `attention_cte`, whose knobs load 8 V tiles or 4 K tiles per DMA with hardware descriptor
+generation (each software-DGE DMA costs ~0.75 us of GpSimd time regardless of size): 5.11 -> 4.89 ms
+per call at 6 x 7854 x 128. With every new flag off the mp4 is byte-identical to the row above.
+With the flags on, 10 of 11 processes on two devices (two of them compiling into empty NEFF caches)
+wrote the same latent and mp4; one, the first process after a source change recompiled the block
+graph, wrote another latent (its video is 24.7 dB PSNR from the usual one; the flags-off video is
+24.5 dB from the usual one, which is how far any rounding change drifts over 10 steps).
+`qkv_cte` with its software-DGE DMAs switched to hardware DGE (`scripts/validate/qkv_dge_bench.py`):
+1.529 -> 1.523 ms, bitwise equal, so no change to propose there.
+Tried and dropped: the gate + residual adds fused into the LayerNorm kernels (19.27 vs 19.29 ms per
+block; the compiler already does them in one pass), the cross-attention query's RMSNorm and
+head-major layout as one kernel (+0.26 ms), wider exp instructions in `attention_cte` (4.91 ->
+4.98-5.22 ms per call), the compiler's collective-compute overlap options
+(`--distribution-strategy=llm-training`, `--enable-ccop-compute-overlap --cc-pipeline-tiling-factor=2`:
+`scripts/validate/overlap_bench.py` unchanged within 0.07 ms), NUMA-pinning the ranks (no change).
+
+Why the DiT runs slower than its kernels do alone: with all 8 cores busy the device reaches its power
+limit (`/sys/devices/virtual/neuron_device/neuron<N>/stats/hardware/power/utilization` peaks at 100%,
+74% with 4 cores) and the PE-heavy kernels slow down. `scripts/validate/pwr_bench.py` (the same
+independent kernel on every busy core): the FFN's nkilib `mlp` call 4.70 ms per call with 1, 2 or 4
+busy cores and 6.17 ms with 8; `attention_cte` 4.72-4.73 vs 4.79 ms. The block bench gives 15.6-15.8
+ms per block with one CFG group running alone and 17.6-17.7 ms with both. It is not the collectives:
+with them replaced by local stand-ins (`SP_NOCOMM=1`) the gap stays (15.01 vs 16.94 ms), and in place
+they cost ~0.75 ms per block. Starting the second group's blocks 3-12 ms later, so the two groups'
+FFNs no longer coincide, gives 17.48-17.62 ms (0.8% at best), so the limit acts on average power,
+not on the overlap of phases. Standalone collectives at the block's shapes are slower with both
+groups running (`scripts/validate/cc_contention_bench.py`: reduce-scatter 0.82 -> 1.13 ms,
+all-to-all 0.40 -> 0.57 ms, all-gather 0.80 -> 0.88 ms) and slower on 4 contiguous cores than on 4
+alternating ones (all-gather 1.08 vs 0.80 ms), which is the `CFG_GROUPS=interleave` gain.
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next
