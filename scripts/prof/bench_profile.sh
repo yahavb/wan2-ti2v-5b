@@ -90,6 +90,15 @@ echo "CLEAN s/step per run: ${CS[*]:-none}  -> T_CLEAN (median of runs after the
 cp /tmp/wan2_ti2v_output.mp4 "$RESULTS/output_clean.mp4" 2>/dev/null \
   && echo "VALIDATE THE OUTPUT: $RESULTS/output_clean.mp4 ($GIT_BRANCH@${GIT_SHA:0:8})"
 
+# ═══ [2b] one DiT block on one core, no collectives: the block NEFF that --single-io can replay
+#          (the production block graph holds collectives, so [4b] cannot capture it) ═══
+if [ "${BLOCK_PAIR:-1}" = "1" ]; then
+  echo "=== [2b] DiT block pair: one core, production shard, no collectives ==="
+  NEURON_RT_VISIBLE_CORES=0 timeout 3600 torchrun --nproc_per_node=1 --master_port=29501 \
+    scripts/prof/block_pair.py > "$RESULTS/block_pair.log" 2>&1
+  echo "block_pair exit=$?"; grep -E "\[block_pair\]|graph breaks|Error|Traceback" "$RESULTS/block_pair.log" | tail -5
+fi
+
 # NEFF cache location is image-dependent; find what this process compiled.
 find /tmp /var/tmp /root -name '*.neff' -size +100k 2>/dev/null | grep -v -e /tmp/results -e /tmp/systrace \
   > "$RESULTS/neff_cache_list.txt" || true
