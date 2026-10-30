@@ -125,23 +125,23 @@ spec:
               fi
               echo "Model weights ready at $MODEL_LOCAL"
 
-              # ─── Launch serving with torchrun (SP=2 x TP=4 = 8 ranks) ──
+              # ─── Launch serving with torchrun (8 ranks: CFG-parallel 2 x TP4) ──
               export WAN_DIR="/tmp/wan2-ti2v-5b"
               export MODEL_PATH=/tmp/Wan2.2-TI2V-5B
 
-              echo "Launching SP=2 TP=4 serving with torchrun..."
+              echo "Launching serving with torchrun..."
               torchrun --nproc_per_node=8 --master_port=29500 \
                 /tmp/wan2-ti2v-5b/serve_ti2v.py
           resources:
             claims:
               - name: neurons
             requests:
-              cpu: 44
-              memory: 440Gi
+              cpu: 88
+              memory: 880Gi
               ephemeral-storage: 120Gi
             limits:
-              cpu: 90
-              memory: 900Gi
+              cpu: 180
+              memory: 1800Gi
               ephemeral-storage: 200Gi
           volumeMounts:
             - name: dshm
@@ -163,19 +163,54 @@ spec:
               value: "--model-type=transformer"
             - name: TORCH_NEURONX_FALLBACK_ONLY_FOR_UNIMPLEMENTED_OPS
               value: "0"
+            # Same pipeline and flags as wan2-ti2v-5b-tp8-job.yaml (the measured 8.7 s config).
             - name: TP_DEGREE
-              value: "4"
-            - name: SP_DEGREE
-              value: "2"
+              value: "8"
             - name: T5_RANK
               value: "2"
-            - name: VAE_TP_DEGREE
+            - name: T5_DEVICE
+              value: "cpu"
+            - name: WARMUP_RUNS
+              value: "3"
+            - name: DIT_FAST
               value: "1"
-            - name: USE_NKI_KERNELS
+            - name: FAST_ATTN_IMPL
+              value: "cte"
+            - name: FAST_CROSS_IMPL
+              value: "cte"
+            - name: CFG_PARALLEL
+              value: "1"
+            - name: CFG_GROUPS
+              value: "interleave"
+            - name: FAST_SP
+              value: "1"
+            - name: FAST_LOCAL_CROSS
+              value: "1"
+            - name: DEVICE_SCHEDULER
+              value: "1"
+            - name: MP4_VFORK
               value: "1"
             - name: USE_NKI_VAE
-              value: "0"
-            - name: USE_NST_SELF_ATTN
+              value: "1"
+            - name: USE_NKI_CONV3D
+              value: "1"
+            - name: NKI_CONV3D_SMALL_COUT
+              value: "1"
+            - name: VAE_TILED
+              value: "1"
+            - name: VAE_TILE_OVERLAP
+              value: "4"
+            - name: VAE_STREAM
+              value: "1"
+            - name: VAE_FUSE_NORM
+              value: "1"
+            - name: VAE_SUBPIXEL
+              value: "1"
+            - name: VAE_FUSE_CAT
+              value: "1"
+            - name: VAE_FUSE_RES
+              value: "1"
+            - name: VAE_FUSE_SHORTCUT
               value: "1"
             - name: NUM_STEPS
               value: "10"
