@@ -292,6 +292,12 @@ _STRIP_NKI_NORM = os.environ.get("VAE_STRIP_NKI_NORM", "0") == "1"
 # computes only this rank's rows (queries) against the gathered full frame (keys and values),
 # instead of the eager per-frame NKI loop on the full frame (~35 graph launches per call).
 _STRIP_ATTN = os.environ.get("VAE_STRIP_ATTN", "0") == "1"
+# VAE_LAT_ALL=1: the latent-resolution part of the decoder (Decoder3d.forward_lat: conv1, middle,
+# first up block) runs in 2 calls, latent frame 0 (first_chunk) and then all the other frames at
+# once, and only the rest of the decoder per VAE_TCHUNK chunk. Same ops: the causal convs see the
+# same frames, the first up block's temporal upsample starts on frame 1 with zero padding as it
+# does in chunk 1, and everything else there is per frame. Fewer, larger graphs.
+_LAT_ALL = os.environ.get("VAE_LAT_ALL", "0") == "1"
 # VAE_SUBPIXEL_MERGE=1 (with VAE_SUBPIXEL + VAE_FUSE_SHORTCUT): each upsample stage ends with one NKI
 # kernel (kernels/vae_subpixel_merge.py) that interleaves the 4 sub-pixel phases and adds the DupUp3D
 # shortcut, instead of an eager stack + permute and the compiled shortcut + add graph.
@@ -1318,6 +1324,12 @@ class Decoder3d(nn.Module):
             pack(self.middle)
         return n
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        x = self.forward_lat(x, feat_cache, feat_idx, first_chunk)
+        return self.forward_hi(x, feat_cache, feat_idx, first_chunk)
+
+    def forward_lat(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        """conv1, the middle blocks and the first up block: everything at the latent resolution,
+        up to its 2x output (VAE_LAT_ALL runs it on more frames per call than the rest)."""
         if _STRIP is not None:  # x: this rank's latent-resolution window with its halo rows
             _STRIP.level = 0
         if feat_cache is not None:
@@ -1344,16 +1356,28 @@ class Decoder3d(nn.Module):
             else:
                 x = layer(x)
 
-        ## upsamples
-        for ui, layer in enumerate(self.upsamples):
+        ## first upsample (spatial only)
+        layer = self.upsamples[0]
+        if feat_cache is not None:
+            x = layer(x, feat_cache, feat_idx, first_chunk)
+        else:
+            x = layer(x)
+        if _STRIP is not None:  # latent-res window -> exact 2x strip
+            c0, cn = _STRIP.hi_crop
+            x = x[:, :, :, c0:c0 + cn].contiguous()
+            _STRIP.level = 1
+        return x
+
+    def forward_hi(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
+        """The rest of forward() after forward_lat(): the up blocks from the 2x resolution on
+        (temporal upsampling, so chunked) and the head."""
+        if _STRIP is not None:
+            _STRIP.level = 1
+        for layer in list(self.upsamples)[1:]:
             if feat_cache is not None:
                 x = layer(x, feat_cache, feat_idx, first_chunk)
             else:
                 x = layer(x)
-            if _STRIP is not None and ui == 0:  # latent-res window -> exact 2x strip
-                c0, cn = _STRIP.hi_crop
-                x = x[:, :, :, c0:c0 + cn].contiguous()
-                _STRIP.level = 1
 
         ## head
         head_layers = list(self.head)
@@ -1551,10 +1575,27 @@ class WanVAE_(nn.Module):
         x = F.pad(self.conv2(z), (0, 0, int(a == 0), int(a + n == H)))
         _STRIP = ctx
         try:
-            for i, k in _decode_chunk_spans(z.shape[2]):
+            spans = _decode_chunk_spans(z.shape[2])
+            if _LAT_ALL:  # latent-resolution part in 2 calls (frame 0, then all the others)
                 self._conv_idx = [0]
-                out_ = self.decoder(x[:, :, i:i + k, :, :], feat_cache=self._feat_map,
-                                    feat_idx=self._conv_idx, first_chunk=(i == 0))
+                lat0 = self.decoder.forward_lat(x[:, :, :1], feat_cache=self._feat_map,
+                                                feat_idx=self._conv_idx, first_chunk=True)
+                idx0 = self._conv_idx[0]
+                if len(spans) > 1:
+                    self._conv_idx = [0]
+                    lat1 = self.decoder.forward_lat(x[:, :, 1:], feat_cache=self._feat_map,
+                                                    feat_idx=self._conv_idx, first_chunk=False)
+                    f = lat1.shape[2] // (z.shape[2] - 1)  # 2x-level frames per latent frame
+            for i, k in spans:
+                if _LAT_ALL:
+                    xin = lat0 if i == 0 else lat1[:, :, f * (i - 1):f * (i - 1 + k)].contiguous()
+                    self._conv_idx = [idx0]
+                    out_ = self.decoder.forward_hi(xin, feat_cache=self._feat_map,
+                                                   feat_idx=self._conv_idx, first_chunk=(i == 0))
+                else:
+                    self._conv_idx = [0]
+                    out_ = self.decoder(x[:, :, i:i + k, :, :], feat_cache=self._feat_map,
+                                        feat_idx=self._conv_idx, first_chunk=(i == 0))
                 yield unpatchify(out_, patch_size=2)
         finally:
             _STRIP = None

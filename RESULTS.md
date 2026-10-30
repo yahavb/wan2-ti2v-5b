@@ -33,13 +33,14 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + VAE in exact 8x1 strips with a one-row halo exchange per conv, instead of overlap-4 tiles (`VAE_STRIPS=1`) | 0.58 | 5.8s | 2.0s | 7.9s | 0.0484* |
 | + the strips' norm + halo + cache step as one NKI kernel (`VAE_STRIP_NKI_NORM=1`) | 0.58 | 5.8s | 1.8s | 7.6s | 0.0484* |
 | + T5 freed before the other models load; 4 latent frames per VAE decoder call (`VAE_TCHUNK=4`) | 0.58 | 5.8s | 1.7s | 7.5s | 0.0484* |
-| + cross-attention over the real context tokens plus weighted copies of the identical pad key (`FAST_CROSS_MERGE=1`); VAE: sub-pixel interleave + shortcut as one NKI kernel (`VAE_SUBPIXEL_MERGE=1`), compiled own-rows middle attention (`VAE_STRIP_ATTN=1`), 1x1 shortcuts as one matmul (`VAE_CONV1X1_MM=1`) | **0.57** | **5.7s** | **1.6s** | **7.3s** | 0.0485* |
+| + cross-attention over the real context tokens plus weighted copies of the identical pad key (`FAST_CROSS_MERGE=1`); VAE: sub-pixel interleave + shortcut as one NKI kernel (`VAE_SUBPIXEL_MERGE=1`), compiled own-rows middle attention (`VAE_STRIP_ATTN=1`), 1x1 shortcuts as one matmul (`VAE_CONV1X1_MM=1`) | 0.57 | 5.7s | 1.6s | 7.3s | 0.0485* |
+| + VAE latent level in 2 calls instead of 6 (`VAE_LAT_ALL=1`), chunk copy-out behind the queued graphs (`VAE_SHIP_THREAD=1`), uint8 conversion on every rank (`VAE_U8_SHIP=1`) | **0.57** | **5.7s** | **1.5s** | **7.2s** | 0.0485* |
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
 VAE_SUBPIXEL=1 VAE_FUSE_CAT=1 VAE_FUSE_RES=1 VAE_FUSE_SHORTCUT=1 VAE_TCHUNK=4 DEVICE_SCHEDULER=1 MP4_VFORK=1
 FAST_A2A_O=1 FAST_NKI_MLP=1 FAST_MOD_SPLIT=1 VAE_STRIPS=1 VAE_STRIP_NKI_NORM=1 FAST_CROSS_MERGE=1
-VAE_SUBPIXEL_MERGE=1 VAE_STRIP_ATTN=1 VAE_CONV1X1_MM=1`. The `VAE_FUSE_CAT` and
+VAE_SUBPIXEL_MERGE=1 VAE_STRIP_ATTN=1 VAE_CONV1X1_MM=1 VAE_LAT_ALL=1 VAE_SHIP_THREAD=1 VAE_U8_SHIP=1`. The `VAE_FUSE_CAT` and
 `VAE_FUSE_RES` rows round to the same tenths as the row above them; run-to-run (DONE to DONE) they
 are 8.97, 8.90 and 8.86 s, and the slowest VAE tile 2.71-2.73, 2.62-2.67 and 2.57-2.58 s.
 `VAE_FUSE_SHORTCUT` writes a byte-identical mp4: it runs DupUp3D's repeat_interleave + permute and
@@ -148,6 +149,23 @@ exact fp32 decode. Pipeline, alternating runs on one device with everything in t
 each, the dump run excluded): denoise 5.76-5.84 -> 5.65-5.74 s, VAE 1.675-1.678 -> 1.61-1.62 s
 (decode 1.52 -> 1.45-1.46 s), total 7.43-7.51 -> 7.27-7.36 s; step-0 noise prediction 0.0485 vs fp32;
 VAE-phase device memory 10.2-10.4 GB per core (was 10.6-10.8); one mp4 hash over 4 runs.
+
+The latent-resolution part of the decoder (conv1, the middle blocks and the first up block, ~30 ms
+of every 4-frame call) runs per chunk only because the rest of the decoder does. `VAE_LAT_ALL`
+runs it in two calls, latent frame 0 and then the other 20 frames, before the chunked rest: the
+causal convs see the same frames and the first up block's temporal upsample starts on frame 1 with
+zero padding either way, so the frames are bit-identical (decode 1.40 -> 1.35 s on the same
+latent). Each rank's copy-out of a chunk was a `.cpu()` that waits for everything queued, i.e.
+for the whole next chunk, then a file write with nothing queued behind it (~5 ms of device idle
+per decoder call in the trace); `VAE_SHIP_THREAD` queues a `non_blocking` copy right behind the
+chunk's graphs with an event after it, and a helper thread waits on the event and writes the file
+(`scripts/validate/d2h_bench.py`: the copy is stream-ordered and returns at once). `VAE_U8_SHIP` has every
+rank convert its own rows to uint8 before shipping them, so rank 0 only stacks uint8 rows; the
+frames are no longer concatenated into one 93 MB array inside the timed phase. Pipeline,
+alternating runs on one device (2 warm runs each, the dump run excluded): VAE 1.607-1.622 ->
+1.489-1.493 s (one 1.604 in the run with the memory monitor), total 7.29-7.35 -> 7.16-7.20 s; the
+latent and the mp4 bytes are identical to the configuration above (same md5 in every run), and the
+VAE-phase device memory drops to 9.2-9.4 GB per core (neuron-monitor peak).
 
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next

@@ -244,6 +244,12 @@ spec:
               value: "1"
             - name: VAE_CONV1X1_MM
               value: "1"
+            - name: VAE_LAT_ALL
+              value: "1"
+            - name: VAE_SHIP_THREAD
+              value: "1"
+            - name: VAE_U8_SHIP
+              value: "1"
             - name: DEVICE_SCHEDULER
               value: "1"
             - name: MP4_VFORK

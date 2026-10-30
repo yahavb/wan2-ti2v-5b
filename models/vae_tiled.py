@@ -261,6 +261,19 @@ def strip_sources(wins, h, world, rank):
 _STRIP_CTX = {}
 
 
+# VAE_SHIP_THREAD=1: each chunk's device->host copy is queued right behind its graphs
+# (non_blocking: stream-ordered, returns at once) with an event after it; a helper thread waits for
+# the event and converts / writes the chunk while the main thread queues the next one. Before, the
+# main thread's .cpu() of chunk c-1 (which waits for everything queued, i.e. all of chunk c) + file
+# write ran with nothing queued behind it, idling the device ~5 ms per decoder call.
+_SHIP_THREAD = os.environ.get("VAE_SHIP_THREAD", "0") == "1"
+# VAE_U8_SHIP=1 (streamed strips, caller passes finish_strip): every rank converts its own rows of
+# each chunk to uint8 frames (finish()'s elementwise math on this rank's CPU) before shipping, so
+# rank 0 only stacks uint8 rows instead of a float32 cat + convert of the whole frame, and the
+# frames come back as a list of chunks (no 93 MB concatenate inside the timed VAE phase).
+_U8_SHIP = os.environ.get("VAE_U8_SHIP", "0") == "1"
+
+
 def _strip_ctx(z, group):
     """This rank's StripCtx for a latent of z's height (cached: its compiled graphs are reused)."""
     from wan.modules.vae2_2 import StripCtx
@@ -276,10 +289,12 @@ def _strip_ctx(z, group):
     return _STRIP_CTX[key]
 
 
-def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done):
+def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done, u8=False):
     """Rank 0 helper thread: for each chunk, stack the ranks' strips (bf16, exact: the decoder's
     clamped output is bf16-valued) into the frame, convert with finish() and feed the writer.
-    finish=None: keep the float32 chunks instead (done["video"] = [3, F, H, W])."""
+    finish=None: keep the float32 chunks instead (done["video"] = [3, F, H, W]).
+    u8 (VAE_U8_SHIP): the ranks shipped uint8 frame strips [f, rows, W, 3] (already converted);
+    they are only stacked, and done["frames"] is the list of [f, H, W, 3] chunks."""
     try:
         deadline = time.time() + 600
         frames, chunks = [], []
@@ -288,19 +303,26 @@ def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done):
             for r in range(world):
                 path = f"{tag}_{r}_{c}.bin"
                 _wait_for(path, deadline)
-                part = torch.from_numpy(np.fromfile(path, dtype=np.int16)).view(torch.bfloat16)
-                parts.append(part.view(3, -1, rows, width))
+                if u8:
+                    parts.append(np.fromfile(path, dtype=np.uint8).reshape(-1, rows, width, 3))
+                else:
+                    part = torch.from_numpy(np.fromfile(path, dtype=np.int16)).view(torch.bfloat16)
+                    parts.append(part.view(3, -1, rows, width))
                 os.remove(path)
             t_in = time.time()  # every rank's part of this chunk has arrived
-            acc = torch.cat(parts, dim=2).float()  # [3, f, H, W]
             if c == n_chunks - 1:
                 done["t_last_chunk"] = t_in
-            if finish is None:
-                chunks.append(acc)
-                continue
-            t_cat = time.time()
-            v = finish(acc)  # [f, H, W, 3] uint8 numpy
-            t_fin = time.time()
+            if u8:
+                v = np.concatenate(parts, axis=1)  # [f, H, W, 3] uint8
+                t_cat = t_fin = time.time()
+            else:
+                acc = torch.cat(parts, dim=2).float()  # [3, f, H, W]
+                if finish is None:
+                    chunks.append(acc)
+                    continue
+                t_cat = time.time()
+                v = finish(acc)  # [f, H, W, 3] uint8 numpy
+                t_fin = time.time()
             for fr in v:
                 writer.append_data(fr)
             frames.append(v)
@@ -311,12 +333,12 @@ def _assemble_strips(tag, world, rows, width, n_chunks, writer, finish, done):
         t0 = time.time()
         writer.close()
         done["t_close"] = time.time() - t0
-        done["frames"] = np.concatenate(frames, 0)
+        done["frames"] = frames if u8 else np.concatenate(frames, 0)
     except BaseException as ex:  # noqa: BLE001 - re-raised by the caller
         done["error"] = ex
 
 
-def _decode_strips(vae, z, cpu_group, make_writer, finish, group):
+def _decode_strips(vae, z, cpu_group, make_writer, finish, group, finish_strip=None):
     import threading
     rank, world = dist.get_rank(), dist.get_world_size()
     n_chunks = vae.num_decode_chunks(z.shape[1])
@@ -324,28 +346,64 @@ def _decode_strips(vae, z, cpu_group, make_writer, finish, group):
     a, n = wins[rank]
     _CALL[0] += 1
     tag = f"{SHM_DIR}/wan_vae_strip_{os.getppid()}_{_CALL[0]}"
+    u8 = _U8_SHIP and finish is not None and finish_strip is not None
     done, thread = {}, None
     if rank == 0:
         thread = threading.Thread(
             target=_assemble_strips,
             args=(tag, world, 8 * R, 16 * z.shape[3], n_chunks,
-                  make_writer() if finish is not None else None, finish, done),
+                  make_writer() if finish is not None else None, finish, done, u8),
             daemon=True)
         thread.start()
     t0 = time.time()
 
     def ship(c, part):
         p = f"{tag}_{rank}_{c}.bin"
-        part.cpu().view(torch.int16).numpy().tofile(p + ".tmp")
+        if u8:  # this rank's rows of the chunk's frames, converted here
+            finish_strip(part.cpu()).tofile(p + ".tmp")
+        else:
+            part.cpu().view(torch.int16).numpy().tofile(p + ".tmp")
         os.rename(p + ".tmp", p)  # atomic: the reader never sees a partial file
 
-    pending = None
-    for c, out in enumerate(vae.decode_strip_chunks(z, ctx, a, n)):  # [3, f, 16 R / 2, W*16]
-        part = out.to(torch.bfloat16)
-        if pending is not None:  # copy the previous chunk while this one is queued
-            ship(*pending)
-        pending = (c, part)
-    ship(*pending)
+    if _SHIP_THREAD:  # async D2H queued here; convert + write in a helper thread
+        import queue
+        jobs, errs = queue.Queue(), []
+
+        def shipper():
+            while True:
+                item = jobs.get()
+                if item is None:
+                    return
+                try:
+                    c, host, ev = item
+                    ev.synchronize()  # the copy into host has landed
+                    ship(c, host)  # host tensor: .cpu() is a no-op
+                except BaseException as e:  # re-raised on the main thread
+                    errs.append(e)
+        st = threading.Thread(target=shipper, daemon=True)
+        st.start()
+        try:
+            for c, out in enumerate(vae.decode_strip_chunks(z, ctx, a, n)):
+                # Stream-ordered async copy right behind this chunk's graphs + an event after it:
+                # the main thread queues the next chunk at once and the helper waits for the event
+                # (.cpu() would wait for everything queued: scripts/validate/d2h_bench.py).
+                host = out.to(torch.bfloat16).to("cpu", non_blocking=True)
+                ev = torch.neuron.Event()
+                ev.record()
+                jobs.put((c, host, ev))
+        finally:
+            jobs.put(None)
+            st.join()
+        if errs:
+            raise errs[0]
+    else:
+        pending = None
+        for c, out in enumerate(vae.decode_strip_chunks(z, ctx, a, n)):  # [3, f, 16 R / 2, W*16]
+            part = out.to(torch.bfloat16)
+            if pending is not None:  # copy the previous chunk while this one is queued
+                ship(*pending)
+            pending = (c, part)
+        ship(*pending)
     t_dec = time.time() - t0
     gathered = [None] * world if rank == 0 else None
     dist.gather_object(t_dec, gathered, dst=0, group=cpu_group)
@@ -366,9 +424,12 @@ def _decode_strips(vae, z, cpu_group, make_writer, finish, group):
     return done.get("frames") if finish is not None else done["video"]
 
 
-def decode_strips_stream(vae, z, cpu_group, make_writer, finish, group=None):
-    """decode_tiled_stream() with exact strips (VAE_STRIPS=1): same arguments and result."""
-    return _decode_strips(vae, z, cpu_group, make_writer, finish, group)
+def decode_strips_stream(vae, z, cpu_group, make_writer, finish, group=None, finish_strip=None):
+    """decode_tiled_stream() with exact strips (VAE_STRIPS=1): same arguments and result.
+    finish_strip (VAE_U8_SHIP): finish() for one rank's rows, bf16 [3, f, rows, W] -> uint8
+    [f, rows, W, 3], when finish() is elementwise (no crop); the result is then a list of
+    [f, H, W, 3] chunks."""
+    return _decode_strips(vae, z, cpu_group, make_writer, finish, group, finish_strip)
 
 
 def decode_strips(vae, z, cpu_group, group=None):

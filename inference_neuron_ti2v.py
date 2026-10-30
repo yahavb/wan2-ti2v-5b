@@ -605,15 +605,21 @@ def main():
             def _writer():
                 return imageio.get_writer(output_path, fps=24, codec='libx264', **MP4_KW)
 
+            def _to_frames_strip(part):  # _to_frames on one rank's rows (only when the crop is a no-op)
+                return part.float().add_(1).mul_(127.5).to(torch.uint8).permute(1, 2, 3, 0).contiguous().numpy()
+
             if VAE_STRIPS:
+                no_crop = tuple(16 * s for s in latent.shape[-2:]) == (crop_h, crop_w)
                 video_np = decode_strips_stream(vae, latent.to(torch.bfloat16), cpu_group, _writer,
-                                                _to_frames)
+                                                _to_frames, finish_strip=_to_frames_strip if no_crop else None)
+                # VAE_U8_SHIP: rank 0 gets a list of [f, H, W, 3] chunks (joined only for a dump)
             else:
                 video_np = decode_tiled_stream(vae, latent.to(torch.bfloat16), cpu_group,
                                                VAE_TILE_OVERLAP, _writer, _to_frames)
             if rank == 0:
                 dump_video = video_np
-                logger.info(f"Video saved to {output_path} ({len(video_np)} frames, streamed)")
+                n_frames = sum(len(v) for v in video_np) if isinstance(video_np, list) else len(video_np)
+                logger.info(f"Video saved to {output_path} ({n_frames} frames, streamed)")
         elif VAE_TILED:
             # Tiled decode across all ranks; rank 0 receives the blended video
             from models.vae_tiled import decode_tiled, tile_grid
@@ -660,6 +666,8 @@ def main():
         run_time = time.time() - run_start
 
         if rank == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1 and dump_video is not None:
+            if isinstance(dump_video, list):  # VAE_U8_SHIP chunks
+                dump_video = np.concatenate(dump_video, 0)
             _dump_outputs(DUMP_DIR, latent, dump_video)  # after the timers
             torch.save({"latent_in": dump_step0[0].float(), "noise_pred": dump_step0[1].float(),
                         "t": dump_step0[2], "ctx": context[0][0].float().cpu(),
