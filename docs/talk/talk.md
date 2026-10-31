@@ -93,7 +93,7 @@ _Price-performance: quote only the official AWS figures here. This talk doesn't 
 
 ---
 
-## 3. Step 1: the eager prototype (~7 min)
+## 3. The eager prototype (~7 min)
 
 **Message:** start in eager mode. It runs the reference model with very few changes, and it
 gives you a correct baseline.
@@ -122,7 +122,7 @@ optimization must reproduce it.
 
 ---
 
-## 4. Step 2: torch.compile fuses the model into device graphs (~12 min)
+## 4. torch.compile fuses the model into device graphs (~12 min)
 
 **Message:** torch.compile is where most of the speed comes from. What you put inside one
 compiled graph matters as much as compiling at all.
@@ -255,7 +255,7 @@ off."
 
 ---
 
-## 5. Step 3: NKI custom kernels for the critical operators (~12 min)
+## 5. NKI custom kernels for the critical operators (~12 min)
 
 **Message:** when one operator dominates and the compiler's version is not good enough, write
 or reuse an NKI kernel and call it from PyTorch. This works in eager mode and inside a
@@ -367,7 +367,7 @@ core is the same as in production.
 
 ---
 
-## 6. Step 4: scale across the cores with torch.distributed (~6 min)
+## 6. Scale across the cores with torch.distributed (~6 min)
 
 **Message:** the parallelism is plain `torch.distributed` and functional collectives, traced
 into the compiled graphs.
@@ -394,7 +394,7 @@ The VAE is split the same way: each core decodes one spatial tile and rank 0 ble
 
 ---
 
-## 7. Step 5: from benchmark to serving (~8 min)
+## 7. From benchmark to serving (~8 min)
 
 **Message:** the compiled model is only useful if the server starts warm, keeps the device
 fed, and is deployed like any other pod.

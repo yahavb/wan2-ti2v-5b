@@ -88,7 +88,7 @@ Inside one core the four engines pulse in turn, then collective links pulse betw
 the stack builds up: PyTorch, TorchNeuron, Kubernetes. At most 10 words on screen.</p>
 <p><em>Price-performance: quote only the official AWS figures here. This talk doesn't measure cost.</em></p>
 <hr />
-<h2>3. Step 1: the eager prototype (~7 min)</h2>
+<h2>3. The eager prototype (~7 min)</h2>
 <p><strong>Message:</strong> start in eager mode. It runs the reference model with very few changes, and it
 gives you a correct baseline.</p>
 <p>Live code: move the model to the device.
@@ -108,7 +108,7 @@ reference that every later step is checked against.</p>
 <p>Talking point: get it correct in eager mode first, and save that output. Every later
 optimization must reproduce it.</p>
 <hr />
-<h2>4. Step 2: torch.compile fuses the model into device graphs (~12 min)</h2>
+<h2>4. torch.compile fuses the model into device graphs (~12 min)</h2>
 <p><strong>Message:</strong> torch.compile is where most of the speed comes from. What you put inside one
 compiled graph matters as much as compiling at all.</p>
 <h3>Slide: the first attempt, compiling pieces</h3>
@@ -260,7 +260,7 @@ Q×K and P×V matmuls, with gaps between them.</p>
 the engines take turns. Attention is now the bottleneck, and that is where a custom kernel pays
 off."</p>
 <hr />
-<h2>5. Step 3: NKI custom kernels for the critical operators (~12 min)</h2>
+<h2>5. NKI custom kernels for the critical operators (~12 min)</h2>
 <p><strong>Message:</strong> when one operator dominates and the compiler's version is not good enough, write
 or reuse an NKI kernel and call it from PyTorch. This works in eager mode and inside a
 compiled graph.</p>
@@ -380,7 +380,7 @@ Attention goes from about 32 ms to about 5 ms, and the block from 56 ms to 17 ms
 because the real block graph contains collectives and can't be replayed on its own. The work per
 core is the same as in production.</p>
 <hr />
-<h2>6. Step 4: scale across the cores with torch.distributed (~6 min)</h2>
+<h2>6. Scale across the cores with torch.distributed (~6 min)</h2>
 <p><strong>Message:</strong> the parallelism is plain <code>torch.distributed</code> and functional collectives, traced
 into the compiled graphs.</p>
 <table>
@@ -424,7 +424,7 @@ y = _rs(_mm(y, sa.o)) + sa.o.bias    # funcol.reduce_scatter_tensor: back to the
 9.0 → 6.0 s).
 <a href="https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/vae_tiled.py#L58-L118"><code>models/vae_tiled.py#L58-L118</code></a></p>
 <hr />
-<h2>7. Step 5: from benchmark to serving (~8 min)</h2>
+<h2>7. From benchmark to serving (~8 min)</h2>
 <p><strong>Message:</strong> the compiled model is only useful if the server starts warm, keeps the device
 fed, and is deployed like any other pod.</p>
 <h3>Slide: the server</h3>
