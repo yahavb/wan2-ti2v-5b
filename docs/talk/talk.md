@@ -212,6 +212,11 @@ utilization in attention. _Pending the job's results._
 Reference point from RESULTS.md: exact SDPA on all 30 layers ran at 1.92 s/step (18.2 ms per
 attention call). The kernels in the next section take it to 0.90 s/step.
 
+**Animation:** [`anim/sdpa_softmax_engines.html`](anim/sdpa_softmax_engines.html). Per head:
+Tensor computes Q×K, then idles while Vector finds the row max, Scalar computes exp and Vector
+sums the row; then Tensor computes P×V. Three heads, then cross-attention + FFN run densely on
+Tensor. Ends on "Tensor idle ≈ 21 ms of 56" (from the trace: 7-15, 18-25, 28-34 ms).
+
 **Transition:** "The compiler fused everything around attention. Attention itself is now the
 bottleneck, and that is where a custom kernel pays off."
 

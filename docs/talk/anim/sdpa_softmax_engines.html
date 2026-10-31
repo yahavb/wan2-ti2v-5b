@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Native SDPA on the NeuronCore engines</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0f17; overflow: hidden; }
+  canvas { display: block; margin: 0 auto; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1600" height="900" aria-label="Animation: one DiT block with native SDPA. For each of 3 attention heads the Tensor engine computes Q times K, then sits idle while Vector computes the row max, Scalar computes exp and Vector computes the row sum, then Tensor multiplies by V. After the three heads, Tensor runs cross-attention and the FFN densely."></canvas>
+<script>
+// One DiT block, native SDPA, no NKI (profile: 1_compiled_no_nki, rank01_dit_56.14ms).
+// Timeline in block milliseconds, simplified from the Neuron Explorer trace: per head, Tensor
+// does QK, then idles while Vector (row max), Scalar (exp), Vector (row sum) run the softmax,
+// then Tensor does P x V. Three heads per core, then O-proj + cross-attention + FFN (dense).
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+const W = 1600, H = 900;
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  cv.style.marginTop = (innerHeight - H * s) / 2 + 'px';
+}
+addEventListener('resize', fit); fit();
+
+const C = { tensor: '#ff6b8b', vector: '#4ade80', scalar: '#facc15', dma: '#60a5fa',
+            idle: '#ef4444', text: '#f1f5f9', dim: '#334155', grid: '#1e293b' };
+const LANES = [['Tensor', C.tensor], ['Vector', C.vector], ['Scalar', C.scalar]];
+const BLOCK_MS = 56;
+
+// segments: [lane, start_ms, end_ms, phase]
+// Per head, from the trace: [QK start, softmax start, max->exp, exp->sum, PV start, PV end]
+const HD = [[4, 7, 9.7, 12.3, 15, 16.5], [16.5, 18, 20.3, 22.7, 25, 26.5], [26.5, 28, 30, 32, 34, 35.5]];
+const DENSE = 35.5;
+const SEG = [[0, 0, 4, 'qkv']];
+HD.forEach(([q, m, e, su, pv, end], h) => {
+  SEG.push([0, q, m, 'qk' + h]);
+  SEG.push([1, m, e, 'max' + h]);
+  SEG.push([2, e, su, 'exp' + h]);
+  SEG.push([1, su, pv, 'sum' + h]);
+  SEG.push([0, pv, end, 'pv' + h]);
+});
+SEG.push([0, DENSE, 56, 'dense']);
+// light vector/scalar work during the dense part (norms, gates)
+for (let t = 36.5; t < 56; t += 2.2) { SEG.push([1, t, t + 0.6, 'ew']); SEG.push([2, t + 0.9, t + 1.4, 'ew']); }
+const IDLE = HD.map(h => [h[1], h[4]]);   // Tensor idle: 7-15, 18-25, 28-34 ms = 21 ms
+const HEADS = HD.map(h => h[0]);
+
+const MS_PER_SEC = 2.6;                 // playback speed
+const PLAY = BLOCK_MS / MS_PER_SEC;     // seconds for the sweep
+const HOLD = 5;                         // seconds on the final frame
+const LOOP = PLAY + HOLD;
+
+// layout
+const X0 = 170, X1 = 1540, LANE_Y = 520, LANE_H = 70, LANE_GAP = 22;
+const xOf = ms => X0 + (X1 - X0) * ms / BLOCK_MS;
+
+function phaseAt(ms) {
+  for (const s of SEG) if (s[3] !== 'ew' && ms >= s[1] && ms < s[2]) return s[3];
+  return ms >= 56 ? 'dense' : 'qkv';
+}
+
+function rr(x, y, w, h, r) { g.beginPath(); g.roundRect(x, y, w, h, r); }
+
+function drawLanes(ms) {
+  g.font = 'bold 34px system-ui, sans-serif'; g.textBaseline = 'middle'; g.textAlign = 'right';
+  LANES.forEach(([name, col], i) => {
+    const y = LANE_Y + i * (LANE_H + LANE_GAP);
+    g.fillStyle = C.grid; rr(X0, y, X1 - X0, LANE_H, 10); g.fill();
+    g.fillStyle = col; g.fillText(name, X0 - 18, y + LANE_H / 2);
+  });
+  // idle windows on Tensor (hatched red), once reached
+  IDLE.forEach(([a, b]) => {
+    if (ms <= a) return;
+    const e = Math.min(ms, b), y = LANE_Y;
+    g.save(); rr(xOf(a), y, xOf(e) - xOf(a), LANE_H, 8); g.clip();
+    g.fillStyle = 'rgba(239,68,68,0.18)'; g.fillRect(xOf(a), y, xOf(e) - xOf(a), LANE_H);
+    g.strokeStyle = C.idle; g.lineWidth = 6;
+    for (let x = xOf(a) - LANE_H; x < xOf(e); x += 26) { g.beginPath(); g.moveTo(x, y + LANE_H); g.lineTo(x + LANE_H, y); g.stroke(); }
+    g.restore();
+    if (ms >= b) {
+      g.fillStyle = C.idle; g.textAlign = 'center'; g.font = 'bold 30px system-ui, sans-serif';
+      g.fillText('idle', (xOf(a) + xOf(b)) / 2, y - 24);
+    }
+  });
+  // busy segments up to the playhead
+  for (const [lane, a, b, ph] of SEG) {
+    if (ms <= a) continue;
+    const e = Math.min(ms, b), y = LANE_Y + lane * (LANE_H + LANE_GAP);
+    const col = LANES[lane][1];
+    g.fillStyle = col;
+    if (ph === 'dense') {   // dense: many tight instructions
+      for (let t = a; t < e; t += 0.35) g.fillRect(xOf(t), y + 6, Math.max(2, xOf(Math.min(t + 0.28, e)) - xOf(t)), LANE_H - 12);
+    } else if (ph === 'ew') {
+      g.globalAlpha = 0.55; g.fillRect(xOf(a), y + 14, xOf(e) - xOf(a), LANE_H - 28); g.globalAlpha = 1;
+    } else {
+      rr(xOf(a) + 1, y + 6, xOf(e) - xOf(a) - 2, LANE_H - 12, 6); g.fill();
+      const w = xOf(e) - xOf(a);
+      const lab = ph.replace(/\d/, '');
+      const word = { qk: 'Q×K', pv: 'P×V', max: 'max', exp: 'exp', sum: 'sum', qkv: '' }[lab];
+      if (word && w > 40) {
+        g.fillStyle = '#0b0f17'; g.textAlign = 'center'; g.font = 'bold ' + (w > 60 ? 24 : 19) + 'px system-ui, sans-serif';
+        g.fillText(word, xOf(a) + w / 2, y + LANE_H / 2);
+      }
+    }
+  }
+  // head brackets
+  g.textAlign = 'center'; g.font = 'bold 30px system-ui, sans-serif';
+  HD.forEach((hd, h) => {
+    const b = hd[0], bend = hd[5];
+    if (ms < b) return;
+    const a = xOf(b), e = xOf(Math.min(ms, bend));
+    g.strokeStyle = C.text; g.lineWidth = 4;
+    g.beginPath(); g.moveTo(a, LANE_Y - 70); g.lineTo(a, LANE_Y - 82); g.lineTo(e, LANE_Y - 82);
+    if (ms >= bend) g.lineTo(e, LANE_Y - 70);
+    g.stroke();
+    if (ms >= b + 1) { g.fillStyle = C.text; g.fillText('head ' + (h + 1), (a + xOf(bend)) / 2, LANE_Y - 108); }
+  });
+  if (ms >= 38) {
+    g.fillStyle = C.tensor; g.font = 'bold 30px system-ui, sans-serif';
+    g.fillText('cross-attn + FFN', (xOf(DENSE) + xOf(56)) / 2, LANE_Y - 108);
+  }
+  // time axis + playhead
+  g.fillStyle = '#94a3b8'; g.font = '24px system-ui, sans-serif'; g.textAlign = 'center';
+  [0, 10, 20, 30, 40, 50, 56].forEach(t => g.fillText(t + ' ms', xOf(t), LANE_Y + 3 * (LANE_H + LANE_GAP) + 12));
+  if (ms < BLOCK_MS) {
+    const x = xOf(ms); g.strokeStyle = C.text; g.lineWidth = 3;
+    g.beginPath(); g.moveTo(x, LANE_Y - 50); g.lineTo(x, LANE_Y + 3 * (LANE_H + LANE_GAP) - LANE_GAP); g.stroke();
+  }
+}
+
+// Score matrix of the current head: 6 rows x 10 keys
+const R = 6, K = 10, MX = 580, MY = 24, CS = 50;
+const vals = []; for (let i = 0; i < R; i++) { vals.push([]); for (let j = 0; j < K; j++) vals[i].push(Math.abs(Math.sin(i * 2.3 + j * 1.3 + i * j * 0.7))); }
+const rowMax = vals.map(r => r.indexOf(Math.max(...r)));
+
+function frac(ms, a, b) { return Math.max(0, Math.min(1, (ms - a) / (b - a))); }
+
+function drawMatrix(ms) {
+  const ph = phaseAt(ms);
+  if (ph === 'dense' || ms >= DENSE) {
+    // dense part: show a big matmul tile stream instead of the score matrix
+    g.fillStyle = C.tensor; g.textAlign = 'center'; g.font = 'bold 44px system-ui, sans-serif';
+    for (let i = 0; i < 6; i++) for (let j = 0; j < 12; j++) {
+      const on = ((Math.floor(ms * 6) + i + j) % 3) !== 0;
+      g.globalAlpha = on ? 0.95 : 0.35; rr(MX - 120 + j * 50, MY + i * 50, 42, 42, 6); g.fill();
+    }
+    g.globalAlpha = 1;
+    return;
+  }
+  const h = ph.match(/\d/) ? +ph.match(/\d/)[0] : 0;
+  if (ph === 'qkv') return;
+  const [q, m, e, su, pv, end] = HD[h];
+  const tQK = frac(ms, q, m), tMax = frac(ms, m, e), tExp = frac(ms, e, su),
+        tSum = frac(ms, su, pv), tPV = frac(ms, pv, end);
+  const shown = Math.floor(tQK * R * K);
+  for (let i = 0; i < R; i++) for (let j = 0; j < K; j++) {
+    const idx = i * K + j; if (idx >= shown && tQK < 1) continue;
+    const v = vals[i][j];
+    let col;
+    if (tExp > 0 && (i + 1) / R <= tExp + 1e-6) col = `rgba(250,204,21,${0.25 + 0.75 * v * v})`;      // exp'd
+    else col = `rgba(255,107,139,${0.25 + 0.75 * v})`;                                                 // raw scores
+    g.fillStyle = col; rr(MX + j * CS, MY + i * CS, CS - 8, CS - 8, 6); g.fill();
+    if (tMax > 0 && j === rowMax[i] && (i + 1) / R <= tMax + 1e-6) {               // row max found
+      g.strokeStyle = C.vector; g.lineWidth = 6; rr(MX + j * CS - 2, MY + i * CS - 2, CS - 4, CS - 4, 8); g.stroke();
+    }
+  }
+  // Vector sweep while computing max / sum
+  const sweep = tMax > 0 && tMax < 1 ? tMax : (tSum > 0 && tSum < 1 ? tSum : -1);
+  if (sweep >= 0) {
+    const i = Math.min(R - 1, Math.floor(sweep * R));
+    g.strokeStyle = C.vector; g.lineWidth = 5; rr(MX - 8, MY + i * CS - 6, K * CS + 8, CS + 4, 10); g.stroke();
+  }
+  // row sums bar
+  if (tSum > 0) for (let i = 0; i < R; i++) {
+    if ((i + 1) / R > tSum + 1e-6) continue;
+    const s = vals[i].reduce((a, v) => a + v * v, 0) / K;
+    g.fillStyle = C.vector; rr(MX + K * CS + 24, MY + i * CS + 8, 40 + 120 * s, CS - 24, 6); g.fill();
+  }
+  // labels
+  g.textAlign = 'right'; g.font = 'bold 36px system-ui, sans-serif';
+  const label = tPV > 0 ? ['P×V', C.tensor] : tSum > 0 ? ['sum', C.vector] : tExp > 0 ? ['exp', C.scalar]
+              : tMax > 0 ? ['max', C.vector] : ['Q×K', C.tensor];
+  g.fillStyle = label[1]; g.fillText(label[0], MX - 30, MY + R * CS / 2);
+  g.textAlign = 'center'; g.fillStyle = C.text; g.font = 'bold 34px system-ui, sans-serif';
+  g.fillText('head ' + (h + 1), MX + K * CS / 2, MY + R * CS + 26);
+  if (tPV > 0) { g.globalAlpha = 1 - tPV; g.fillStyle = '#0b0f17'; g.fillRect(MX - 10, MY - 10, K * CS + 220, R * CS + 10); g.globalAlpha = 1; }
+}
+
+function draw(t) {
+  g.clearRect(0, 0, W, H);
+  const ms = Math.min(BLOCK_MS, t * MS_PER_SEC);
+  drawMatrix(ms);
+  drawLanes(ms);
+  if (t >= PLAY) {   // final: total Tensor idle
+    g.textAlign = 'center'; g.fillStyle = C.idle; g.font = 'bold 46px system-ui, sans-serif';
+    g.fillText('Tensor idle ≈ 21 ms of 56', W / 2, H - 28);
+  }
+}
+
+const params = new URLSearchParams(location.hash.slice(1));
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let t0 = performance.now();
+function restart() { t0 = performance.now(); }
+addEventListener('click', restart);
+addEventListener('keydown', e => { if (e.code === 'Space') { e.preventDefault(); restart(); } });
+function tick(now) {
+  if (params.has('t')) { draw(+params.get('t')); return; }
+  if (reduce) { draw(PLAY + 0.1); return; }
+  draw(((now - t0) / 1000) % LOOP);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
