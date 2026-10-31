@@ -225,6 +225,13 @@ What the timeline shows (block = 56.1 ms):
 5. **From about 34 ms on, Tensor is dense:** output projection, cross-attention and FFN. That
    part is fine.
 
+Selecting the source line `fast_dit.py:188` (`F.scaled_dot_product_attention`) in the Code
+Editor highlights every instruction it produced (red). Vector and Scalar are red almost without
+a break from about 5 ms to 33 ms: that is the softmax. Tensor is red only in short bursts, the
+Q×K and P×V matmuls, with gaps between them.
+
+![No-NKI DiT block: all instructions from fast_dit.py:188 (native SDPA) highlighted](img/no_nki_dit_sdpa_source_highlight.png)
+
 The same thing, simplified:
 
 ![Native SDPA: Q×K, then Vector max, Scalar exp, Vector sum, then P×V, for 3 heads](img/sdpa_softmax_engines.gif)
