@@ -143,6 +143,10 @@ def all_reduce_sum(x): ...
 [`models/fast_dit.py#L260-L311`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L260-L311),
 [`#L586-L645`](https://github.com/yahavb/wan2-ti2v-5b/blob/788674b/models/fast_dit.py#L586-L645)
 
+The FFN (feed-forward network) is the part of each transformer block that runs every token
+through two large matmuls with an activation between them (here 3072 → 14336 → 3072), after
+the attention layers.
+
 ```python
 import torch.distributed._functional_collectives as funcol
 
