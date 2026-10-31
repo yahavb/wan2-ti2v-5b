@@ -246,7 +246,7 @@ def main():
             args = (xs, e0, oh, cos.repeat(1, bsz, 1, 1), sin.repeat(1, bsz, 1, 1), kk, vv)
             if cb is not None:
                 args = args + (cb,)
-            cmax = fd.FAST_CMAX and SELF_IMPL == "cte" and 0 in fd.const_max_layers([blk])[0]
+            cmax = fd.cmax_softmax_max([blk])[0].get(0) if fd.FAST_CMAX and SELF_IMPL == "cte" else None
             unit = fd._FastBlockSP(blk, SELF_IMPL, bsz, L, Np, full_cross=full_cross if lx else None,
                                    full_o=full_o if var == "sp_a2o" else None, cmax=cmax)
             if rank == 0 and fd.FAST_CMAX:

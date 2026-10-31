@@ -226,6 +226,8 @@ spec:
               value: "1"
             - name: FAST_CMAX
               value: "1"
+            - name: CMAX_MAX_M
+              value: "65"
             - name: LINGBOT_CTE_VGROUP
               value: "8"
             - name: LINGBOT_CTE_KGROUP

@@ -153,6 +153,32 @@ def const_max_layers(blocks):
         dist.all_reduce(hard, op=dist.ReduceOp.MAX, group=gloo)
     hard = hard.tolist()
     return {i for i, h in enumerate(hard) if h <= CONST_MAX_HARD_LIMIT}, hard
+
+
+# FAST_CMAX's constant max per layer: CONST_MAX_SOFTMAX_MAX where the bound allows it, else the
+# bound minus the same headroom (CONST_MAX_HARD_LIMIT - CONST_MAX_SOFTMAX_MAX = 55), as long as that
+# stays <= CMAX_MAX_M. The output does not depend on the max; it only has to keep exp(score - max)
+# in range: at most e^55 above, and rows far below it are fine once the kernel's floor on the
+# softmax sum is lowered (_cmax_kernel). CMAX_MAX_M = CONST_MAX_SOFTMAX_MAX (default) keeps the
+# hard <= CONST_MAX_HARD_LIMIT rule.
+CMAX_MAX_M = float(os.environ.get("CMAX_MAX_M", str(CONST_MAX_SOFTMAX_MAX)))
+
+
+def cmax_softmax_max(blocks):
+    """{block index: constant max} for FAST_CMAX, and the bounds (max over ranks)."""
+    _, hard = const_max_layers(blocks)
+    room = CONST_MAX_HARD_LIMIT - CONST_MAX_SOFTMAX_MAX
+    ms = {i: max(CONST_MAX_SOFTMAX_MAX, h - room) for i, h in enumerate(hard)}
+    return {i: m for i, m in ms.items() if m <= CMAX_MAX_M}, hard
+
+
+def _cmax_kernel():
+    """nkilib's attention_const_max with the floor on its softmax sum (1e-9 upstream, against a
+    division by zero) lowered to 1e-30: with a max m, a row's sum is about Sk * exp(typical score -
+    m), which is below 1e-9 once m exceeds ~30 and would then be clamped. fp32 still holds 1e-30."""
+    import nkilib.experimental.attention.attention_const_max as m
+    m._EPS = 1e-30
+    return m.attention_const_max
 # In-graph all-reduce chunking (0 = off). The 8MB eager limit in tp_utils was an NRT
 # eager-collective constraint; set this if the compiled collective hits a size error.
 FAST_ALLREDUCE_CHUNK_BYTES = int(os.environ.get("FAST_ALLREDUCE_CHUNK_BYTES", "0"))
@@ -432,11 +458,12 @@ class _FastBlockSP(nn.Module):
     """
 
     def __init__(self, block, attn_impl, batch, seq_len, n_pad, full_cross=None, full_o=None,
-                 free_unused=False, cmax=False):
+                 free_unused=False, cmax=None):
         """full_cross: an unsharded WanCrossAttention (bf16, on device). When given (batch 1 only),
         cross-attention runs on this rank's token shard with all heads and the precomputed
-        all-head K/V -- no collectives. cmax: const-max self-attention for this block (FAST_CMAX;
-        the caller decides per block for all ranks at once, see const_max_layers)."""
+        all-head K/V -- no collectives. cmax: the constant max of const-max self-attention for this
+        block (FAST_CMAX), or None; the caller decides per block for all ranks at once
+        (cmax_softmax_max)."""
         super().__init__()
         self.block = block
         self.attn_impl = attn_impl
@@ -472,12 +499,14 @@ class _FastBlockSP(nn.Module):
         self.f32_res = self.k_ln2 is not None or self.k_ln3 is not None
         self.k_qkv = self.qkv_w = None
         self.cmax = False
+        self.cmax_m = cmax
         if (FAST_QK_PREP and attn_impl == "cte" and batch == 1 and sa.norm_q.eps == sa.norm_k.eps
                 and sa.norm_q.global_dim == sa.norm_k.global_dim):
             from kernels.qk_prep import qk_apply_kernel, qkv_proj_kernel
             # FAST_CMAX: const-max self-attention on this block; qk_apply then writes q head-major
             # [n, d, N] (the kernel's native Q layout)
-            self.cmax = bool(cmax)
+            self.cmax = cmax is not None
+            self.k_cmax = _cmax_kernel() if self.cmax else None
             self.k_qk = qk_apply_kernel(sa.head_dim, float(sa.norm_q.eps), int(sa.norm_q.global_dim),
                                         fused=FAST_QKV_CTE, q_t=self.cmax)
             if FAST_QKV_CTE:  # fused [C, 3D] weight and [1, 3D] bias for nkilib qkv_cte (built on the CPU)
@@ -536,8 +565,7 @@ class _FastBlockSP(nn.Module):
                 ss = _all_reduce(qk_sumsq(q, k))  # [Np, 2]: global sums of squares of q and k
                 qn, kn, vn = self.k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
             if self.cmax:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
-                from nkilib.experimental.attention.attention_const_max import attention_const_max
-                o = attention_const_max(qn, kn, vn, CONST_MAX_SOFTMAX_MAX, d ** -0.5)
+                o = self.k_cmax(qn, kn, vn, float(self.cmax_m), d ** -0.5)
             else:
                 o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
             y = F.pad(o.view(n, N, d).transpose(0, 1).reshape(N, n * d), (0, 0, 0, Np - N))
@@ -803,12 +831,13 @@ class FastWanDiT:
         impls = [FAST_ATTN_IMPL] * len(model.blocks)
         if FAST_ATTN_IMPL == "cte":
             logger.info(f"[fast_dit] self-attn: nkilib attention_cte on all {len(impls)} layers")
-        cmax_layers = set()
+        cmax_layers = {}
         if FAST_CMAX and FAST_ATTN_IMPL == "cte":
-            cmax_layers, hard = const_max_layers(model.blocks)
+            cmax_layers, hard = cmax_softmax_max(model.blocks)
             logger.info(f"[fast_dit] FAST_CMAX: const-max self-attention on {len(cmax_layers)}/"
-                        f"{len(model.blocks)} layers {sorted(cmax_layers)} (hard bounds, max over ranks: "
-                        f"{[round(h, 1) for h in hard]})")
+                        f"{len(model.blocks)} layers, max per layer "
+                        f"{ {i: round(m, 1) for i, m in sorted(cmax_layers.items())} } (hard bounds, max over "
+                        f"ranks: {[round(h, 1) for h in hard]})")
         if FAST_ATTN_IMPL == "constmax":
             if CONST_MAX_LAYERS == "all":
                 chosen = set(range(len(model.blocks)))
@@ -843,7 +872,7 @@ class FastWanDiT:
                 torch.compile(_FastBlockSP(b, impl, batch, self.seq_len, n_pad,
                                            full_cross=full_cross[i] if local_x else None,
                                            full_o=full_o[i] if (full_o is not None and batch == 1) else None,
-                                           free_unused=True, cmax=i in cmax_layers),
+                                           free_unused=True, cmax=cmax_layers.get(i)),
                               **kw)
                 for i, (b, impl) in enumerate(zip(model.blocks, impls))]
             if full_o is not None and batch == 1:

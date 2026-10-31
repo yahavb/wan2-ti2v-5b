@@ -37,7 +37,8 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + VAE latent level in 2 calls instead of 6 (`VAE_LAT_ALL=1`), chunk copy-out behind the queued graphs (`VAE_SHIP_THREAD=1`), uint8 conversion on every rank (`VAE_U8_SHIP=1`) | 0.57 | 5.7s | 1.5s | 7.2s | 0.0485* |
 | + QK-norm, RoPE and the attention layouts in NKI kernels (`FAST_QK_PREP=1`), q/k/v as one nkilib `qkv_cte` call that also writes the QK-norm sums (`FAST_QKV_CTE=1`), LayerNorms + modulation as NKI kernels with an fp32 residual (`FAST_LN_MOD=1`), vendored `attention_cte` with grouped hardware-DGE K/V loads (`FAST_CTE_LB=1`) † | **0.57** | **5.67s** | **1.55s** | **7.22s** | **0.0474*** |
 
-| + self-attention through nkilib's `attention_const_max` on the 22 layers whose QK-norm weights bound the scores (`FAST_CMAX=1`) ‡ | **0.55** | **5.52s** | **1.52s** | **7.05s** | **0.0477*** |
+| + self-attention through nkilib's `attention_const_max` on the 22 layers whose QK-norm weights bound the scores (`FAST_CMAX=1`) ‡ | 0.55 | 5.52s | 1.52s | 7.05s | 0.0477* |
+| + const-max on 7 more layers with a shifted constant max (`CMAX_MAX_M=65`) § | **0.55** | **5.48s** | **1.55s** | **7.03s** | **0.0470*** |
 
 † Measured on a second trn2.48xlarge (device 3), where the row above runs at 0.59 s/step, denoise
 5.88 s, VAE 1.54 s, total 7.42 s and 0.0485 accuracy: an A/B of two processes per configuration,
@@ -48,6 +49,10 @@ alternating, mean of warm runs 3-4 of 4 each (denoise 5.844-5.916 -> 5.619-5.698
 -0.13 s denoise and -0.13 s total. On device 4 the same A/B gave 5.48 -> 5.34 s denoise and 6.95 ->
 6.85 s total. The chips differ: device 5 ran this row's denoise in 5.17 s (under the system
 profiler, total 6.59 s), device 3 in 5.52 s.
+§ Same device and protocol, against the ‡ configuration measured alongside (denoise 5.47-5.55 s, total
+6.98-7.07 s): denoise 5.44-5.50 s, total 6.96-7.13 s, so -0.03 s denoise; the VAE varied by more than
+that (1.50-1.63 s). On device 5, 2 processes per configuration with 3 warm runs each: denoise
+5.18-5.28 -> 5.13-5.21 s (means 5.22 -> 5.18), total 6.61-6.73 -> 6.56-6.66 s (6.67 -> 6.62).
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
@@ -227,6 +232,22 @@ In the pipeline's system trace (device 5) the 220 const-max blocks of a run take
 the 80 others 17.74 ms, as on the bench; step-0 noise prediction 0.0474 -> 0.0477 vs fp32; frames 20,
 50 and 80 look the same as without it. With the four flags of the † row and `FAST_CMAX=0` the
 latent and mp4 are unchanged, and with every flag off the mp4 is still byte-identical to 1f64c2e.
+`CMAX_MAX_M=65` (§ row) extends it to the layers whose bound exceeds 70 (bounds 72.9-115.8; only the
+last layer, 630, stays on `attention_cte`): their constant max is the bound minus the same 55 of
+headroom (20.2-60.8), so exp(score - max) still stays below e^55. The output does not depend on the
+max, but each row's softmax sum is about Sk * exp(typical score - max), below the kernel's 1e-9 floor
+on the sum once the max passes ~30, so the floor is lowered to 1e-30 (no effect on the other layers:
+the ‡ configuration's latent stays bitwise the same). Block bench, `attention_cte` -> const-max:
+layer 5 (max 20.2) 17.85 -> 16.61 ms, layer 26 (60.8) 17.79 -> 16.57 ms, layer 28 (44.7) 17.77 ->
+16.87 ms, block rel-RMS vs fp32 unchanged on every rank (0.00349-0.00351, 0.00502-0.00505,
+0.00494-0.00497); step-0 noise prediction 0.0477 -> 0.0470 vs fp32. In the pipeline the gain is
+smaller than the 7 x ~1.1 ms per step the bench implies. Tried and dropped: the three token-shard
+projections ([1964, 3072] @ [3072, 3072]) through nkilib `qkv_cte` as a plain projection, 0.634 ->
+0.582 ms each alone and bitwise equal, but 16.70 -> 17.03 ms per block in place (the compiler fuses
+the neighbouring elementwise work into its own matmuls); an mp4 written with `-tune zerolatency`
+(no change: the tail is the encode of the last 16-frame chunk, not the lookahead); the seq-major Q
+loader of `attention_const_max` on PE transposes instead of DMA transposes (3.385 -> 3.337 ms).
+The const-max kernel's profile (one core, 3.22 ms): PE and Scalar engines 87.5% busy each, MFU 75%.
 Tried and dropped: the gate + residual adds fused into the LayerNorm kernels (19.27 vs 19.29 ms per
 block; the compiler already does them in one pass), the cross-attention query's RMSNorm and
 head-major layout as one kernel (+0.26 ms), wider exp instructions in `attention_cte` (4.91 ->
