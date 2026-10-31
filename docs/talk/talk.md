@@ -195,30 +195,52 @@ _rms_silu = torch.compile(_rms_silu_impl, backend="neuron", dynamic=False)
 ```
 
 ### Slide: what is still slow? Profile the compiled DiT before any NKI
-The stage: whole-block graphs with `fullgraph=True`, native SDPA attention, no NKI in the DiT
-(TP=8, CFG as a batch of 2). Job:
-[`wan2-ti2v-5b-tp8-nonki-job.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/wan2-ti2v-5b-tp8-nonki-job.yaml)
-(`FAST_FULLGRAPH=1 FAST_ATTN_IMPL=sdpa FAST_CROSS_IMPL=sdpa USE_NKI_KERNELS=0`).
+The stage: one DiT block compiled as one graph (`fullgraph=True`) with native SDPA attention and
+no NKI. One core, one production rank's shard: 3 heads x 2 CFG passes x 7,854 tokens. The
+pipeline at this stage takes 21.9 s (1.90 s/step).
 
-Show in Neuron Explorer, using the DiT block's NEFF + NTFF pair:
-1. One block execution on the timeline. Attention takes the largest share of it.
-2. The engine view inside attention: Tensor busy only part of the time, the softmax on
-   Vector/Scalar, and DMA traffic for the score matrix.
-3. Point at the source line. That operator is what NKI fixes next.
+Profile: `1_compiled_no_nki/pairs/rank01_dit_56.14ms_c9eb70b86909` (`.neff` + `.ntff`), with
+`1_compiled_no_nki/source.tar.gz` uploaded as the source. Job:
+[`wan2-ti2v-5b-tp8-nonki-job.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/wan2-ti2v-5b-tp8-nonki-job.yaml),
+script: [`scripts/prof/block_pair.py`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/scripts/prof/block_pair.py).
 
-Numbers to read off the profile and fill in: block time, attention share of the block, Tensor
-utilization in attention. _Pending the job's results._
+![No-NKI DiT block, engines and memory (Neuron Explorer)](img/no_nki_dit_engines_timeline.png)
 
-Reference point from RESULTS.md: exact SDPA on all 30 layers ran at 1.92 s/step (18.2 ms per
-attention call). The kernels in the next section take it to 0.90 s/step.
+What the timeline shows (block = 56.1 ms):
+1. **The Tensor row has three long gaps:** about 7-15 ms, 18-25 ms and 28-34 ms. That's about
+   21 ms of a 56 ms block, nearly 40%, with the matmul engine doing nothing.
+2. **During those gaps, Vector shows long dark-green bars and Scalar stays busy.** That is the
+   softmax of native SDPA (`fast_dit.py:188`). Vector computes the row max and row sum, and
+   Scalar computes the exp. The "Estimated Inst" utilization drops to zero in exactly those three
+   windows:
 
-**Animation:** [`anim/sdpa_softmax_engines.html`](anim/sdpa_softmax_engines.html). Per head:
-Tensor computes Q×K, then idles while Vector finds the row max, Scalar computes exp and Vector
-sums the row; then Tensor computes P×V. Three heads, then cross-attention + FFN run densely on
-Tensor. Ends on "Tensor idle ≈ 21 ms of 56" (from the trace: 7-15, 18-25, 28-34 ms).
+   ![No-NKI DiT block, utilization](img/no_nki_dit_utilization.png)
+3. **Each Tensor burst after a gap** is P×V. It waits for the whole softmax. The Pending DMA
+   spikes just before each burst are the softmax output loading back from memory.
+4. **The pattern repeats three times,** once for each of the 3 attention heads on this core.
+5. **From about 34 ms on, Tensor is dense:** output projection, cross-attention and FFN. That
+   part is fine.
 
-**Transition:** "The compiler fused everything around attention. Attention itself is now the
-bottleneck, and that is where a custom kernel pays off."
+The same thing, simplified:
+
+![Native SDPA: Q×K, then Vector max, Scalar exp, Vector sum, then P×V, for 3 heads](img/sdpa_softmax_engines.gif)
+
+(Live version: [`anim/sdpa_softmax_engines.html`](anim/sdpa_softmax_engines.html).)
+
+Measured on the instruction table (`engine_overlap.py`):
+
+| | Native SDPA block |
+|---|---|
+| Block time | 56.1 ms |
+| Every engine idle | 16% |
+| Only one engine busy | 36% |
+| Tensor busy | 39% |
+| Softmax max and sum (Vector) | 12.8 ms |
+| Softmax exp (Scalar) | 7.7 ms |
+
+**Transition:** "The compiler runs attention as matmul, then the whole softmax, then matmul, so
+the engines take turns. Attention is now the bottleneck, and that is where a custom kernel pays
+off."
 
 ---
 
@@ -290,17 +312,47 @@ followed by a conv done as four 2x2 convs on the low-res input (2.25x fewer MACs
 2.6 s.
 
 ### Slide: the kernels in the profiler, DiT and VAE
-The optimized build, profiled with the same job and flags as the measured 8.7 s:
+The same block, same shard, same core, with nkilib `attention_cte` for self- and
+cross-attention. The pipeline in this configuration takes 9.7 s on the Kubernetes job (8.7 s in
+RESULTS.md from a Docker run).
+
+Profile: `2_kernels/pairs/rank01_dit_17.34ms_abb236a5e049`, with `2_kernels/source.tar.gz` as
+the source (it includes nkilib's `attention_cte.py` and `conv3d.py`). Job:
 [`wan2-ti2v-5b-tp8-job.yaml`](https://github.com/yahavb/wan2-ti2v-5b/blob/main/wan2-ti2v-5b-tp8-job.yaml).
-It keeps NEFF + NTFF pairs for the DiT block and for the VAE conv graphs, named by component.
 
-Show side by side with the no-NKI profile from section 4:
-1. **DiT block:** `attention_cte` inside the block NEFF, with Tensor and Scalar busy together
-   and QK of one tile overlapping PV of the previous one. Block time before vs after.
-2. **VAE:** the nkilib `conv3d` graph. Tensor engine utilization on the main convs (RESULTS.md
-   measured 69-84% of peak), and the residual add inside the kernel.
+![attention_cte DiT block in Neuron Explorer, with the source line](img/kernels_dit_attention_cte_timeline.png)
 
-_Pending the job's results: screenshots and the per-block / per-conv times._
+What the timeline shows (block = 17.3 ms):
+1. **Self-attention runs from about 3.3 to 8.0 ms** (the long red bar on TensorMatrix): about
+   5 ms for all three heads, against about 32 ms with native SDPA.
+2. **The Tensor row has no gaps in that window,** and Vector and Scalar are busy in the same
+   window. The softmax runs at the same time as the matmuls instead of between them.
+3. **The selected instruction is `attention_cte.py:4120`:** `nc_matmul` of a Q tile with one K
+   tile (Q×K), inside `for k_tile_idx in range(...)`. The next step in the kernel is "Masking +
+   scale + max reduce" on Vector, which runs while Tensor moves on to the next K tile.
+4. **The short red bar at about 10.2-11.0 ms is cross-attention,** also `attention_cte`, under
+   1 ms.
+5. **Everything else is the QKV, output projection and FFN matmuls,** dense on Tensor.
+
+| | Native SDPA | `attention_cte` |
+|---|---|---|
+| Block time | 56.1 ms | 17.3 ms |
+| Self-attention | ~32 ms | ~5 ms |
+| Every engine idle | 16% | 1.1% |
+| 3+ engines busy | 16% | 34% |
+| Tensor busy | 39% | 79% |
+
+**VAE:** `2_kernels/pairs/rank03_vae_7.51ms_85b7d56324c0` is the heaviest VAE graph, nkilib
+`conv3d` (`conv3d.py:3459`). Tensor is busy 98% of the time at 95% of peak, and 3+ engines are
+busy 80% of the time.
+
+**Talking point:** "Same block, same shape, same core. The kernel splits the keys into tiles,
+so Tensor computes Q×K for the next tile while Vector and Scalar finish the softmax of this one.
+Attention goes from about 32 ms to about 5 ms, and the block from 56 ms to 17 ms."
+
+**Caveat to say once:** these block profiles run one block on one core with no collectives,
+because the real block graph contains collectives and can't be replayed on its own. The work per
+core is the same as in production.
 
 ---
 
@@ -411,9 +463,7 @@ For reference, an A100 with torch.compile takes 16.92 s for the same video.
 
 ## Open items
 
-- Run `wan2-ti2v-5b-tp8-job.yaml` (DiT + VAE with kernels), then
-  `wan2-ti2v-5b-tp8-nonki-job.yaml` (compiled DiT, no NKI). Take Explorer screenshots for
-  sections 4 and 5.
+- Add an Explorer screenshot of the VAE `conv3d` pair (`2_kernels/pairs/rank03_vae_7.51ms_85b7d56324c0`).
 - Deploy the ported server (`wan2-ti2v-5b-deploy.yaml`) and record time per request.
 - Confirm which node the 7.1 s validation run used (trn2 or trn3-dev1). This outline uses only
   trn2 numbers.
