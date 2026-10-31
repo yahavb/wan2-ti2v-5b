@@ -56,6 +56,12 @@ def main():
     for name, a, b in zip(("fused qn", "fused kn", "fused vn"), out, fused):
         print(f"[qk_prep_sim] {name} vs unfused: bitwise equal "
               f"{torch.equal(torch.as_tensor(a), torch.as_tensor(b))}", flush=True)
+    qt = nki.simulate(qk_apply_kernel(D, EPS, G, fused=True, q_t=True))(qkv, sref, wq, wk, cos, sin)
+    qt0 = torch.as_tensor(qt[0])
+    print(f"[qk_prep_sim] q_t qn {tuple(qt0.shape)} == qn transposed: "
+          f"{torch.equal(qt0, torch.as_tensor(fused[0]).transpose(1, 2))}; kn, vn bitwise equal "
+          f"{torch.equal(torch.as_tensor(qt[1]), torch.as_tensor(fused[1]))}, "
+          f"{torch.equal(torch.as_tensor(qt[2]), torch.as_tensor(fused[2]))}", flush=True)
     for name, a, b in zip(("qn", "kn", "vn"), ref, out):
         b = torch.as_tensor(b)
         assert tuple(b.shape) == tuple(a.shape), (name, b.shape, a.shape)

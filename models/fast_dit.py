@@ -91,6 +91,14 @@ FAST_LN_MOD = os.environ.get("FAST_LN_MOD", "0") == "1"
 # instead of one software-DGE DMA per tile (~0.75 us of GpSimd each): 5.11 -> 4.89 ms per call at
 # this pipeline's 6 x 7854 x 128 shape (scripts/validate/cte_lb_bench.py; rel-RMS ~4e-6 vs nkilib).
 FAST_CTE_LB = os.environ.get("FAST_CTE_LB", "0") == "1"
+# FAST_CMAX=1 (with FAST_QK_PREP, FAST_ATTN_IMPL=cte): self-attention through nkilib's
+# attention_const_max (experimental) on the layers whose QK-norm weights bound the scaled scores of
+# every rank's heads by CONST_MAX_HARD_LIMIT (const_max_layers), with the constant max
+# CONST_MAX_SOFTMAX_MAX; the other layers keep attention_cte. A constant max removes the
+# online-softmax max pass and the transposes of the probabilities (scores are computed
+# keys-on-partitions): one core, 6 x 7854 x 128, 5.06 -> 3.26 ms per call
+# (scripts/validate/const_max_bench.py).
+FAST_CMAX = os.environ.get("FAST_CMAX", "0") == "1"
 # DUMP_BLOCKS=<dir>:<i,j,...> (diagnostic): on the first DiT call, every rank saves its token shard
 # entering and leaving blocks i, j, ... (with e0 and its CFG group / shard index) to <dir>.
 _DUMP_BLOCKS = None
@@ -132,6 +140,19 @@ def const_max_layer_ok(block):
     gk = sa.norm_k.weight.detach().float().cpu().reshape(-1, d).abs().amax(1)
     hard = float((d ** 0.5) * (gq * gk).max())
     return hard <= CONST_MAX_HARD_LIMIT, hard
+
+
+def const_max_layers(blocks):
+    """Indices of the blocks whose const_max_layer_ok bound holds on every rank, and the bounds.
+    Each rank only sees its heads' gammas, so the bound is the max over ranks: every rank of a
+    collective group must run the SAME graph per block (the runtime rejects MPMD collectives)."""
+    hard = torch.tensor([const_max_layer_ok(b)[1] for b in blocks])
+    if torch.distributed.is_initialized():
+        import torch.distributed as dist
+        gloo = dist.new_group(backend="gloo")
+        dist.all_reduce(hard, op=dist.ReduceOp.MAX, group=gloo)
+    hard = hard.tolist()
+    return {i for i, h in enumerate(hard) if h <= CONST_MAX_HARD_LIMIT}, hard
 # In-graph all-reduce chunking (0 = off). The 8MB eager limit in tp_utils was an NRT
 # eager-collective constraint; set this if the compiled collective hits a size error.
 FAST_ALLREDUCE_CHUNK_BYTES = int(os.environ.get("FAST_ALLREDUCE_CHUNK_BYTES", "0"))
@@ -411,10 +432,11 @@ class _FastBlockSP(nn.Module):
     """
 
     def __init__(self, block, attn_impl, batch, seq_len, n_pad, full_cross=None, full_o=None,
-                 free_unused=False):
+                 free_unused=False, cmax=False):
         """full_cross: an unsharded WanCrossAttention (bf16, on device). When given (batch 1 only),
         cross-attention runs on this rank's token shard with all heads and the precomputed
-        all-head K/V -- no collectives."""
+        all-head K/V -- no collectives. cmax: const-max self-attention for this block (FAST_CMAX;
+        the caller decides per block for all ranks at once, see const_max_layers)."""
         super().__init__()
         self.block = block
         self.attn_impl = attn_impl
@@ -449,11 +471,15 @@ class _FastBlockSP(nn.Module):
         # So with those kernels the residual stays fp32 explicitly (kernels get a bf16 copy): 0.0474.
         self.f32_res = self.k_ln2 is not None or self.k_ln3 is not None
         self.k_qkv = self.qkv_w = None
+        self.cmax = False
         if (FAST_QK_PREP and attn_impl == "cte" and batch == 1 and sa.norm_q.eps == sa.norm_k.eps
                 and sa.norm_q.global_dim == sa.norm_k.global_dim):
             from kernels.qk_prep import qk_apply_kernel, qkv_proj_kernel
+            # FAST_CMAX: const-max self-attention on this block; qk_apply then writes q head-major
+            # [n, d, N] (the kernel's native Q layout)
+            self.cmax = bool(cmax)
             self.k_qk = qk_apply_kernel(sa.head_dim, float(sa.norm_q.eps), int(sa.norm_q.global_dim),
-                                        fused=FAST_QKV_CTE)
+                                        fused=FAST_QKV_CTE, q_t=self.cmax)
             if FAST_QKV_CTE:  # fused [C, 3D] weight and [1, 3D] bias for nkilib qkv_cte (built on the CPU)
                 cpu = lambda t: t.detach().cpu()  # noqa: E731
                 w = torch.cat([cpu(sa.q.weight), cpu(sa.k.weight), cpu(sa.v.weight)], 0).t().contiguous()
@@ -509,7 +535,11 @@ class _FastBlockSP(nn.Module):
                 q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
                 ss = _all_reduce(qk_sumsq(q, k))  # [Np, 2]: global sums of squares of q and k
                 qn, kn, vn = self.k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
-            o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
+            if self.cmax:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
+                from nkilib.experimental.attention.attention_const_max import attention_const_max
+                o = attention_const_max(qn, kn, vn, CONST_MAX_SOFTMAX_MAX, d ** -0.5)
+            else:
+                o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
             y = F.pad(o.view(n, N, d).transpose(0, 1).reshape(N, n * d), (0, 0, 0, Np - N))
         else:
             q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
@@ -773,20 +803,18 @@ class FastWanDiT:
         impls = [FAST_ATTN_IMPL] * len(model.blocks)
         if FAST_ATTN_IMPL == "cte":
             logger.info(f"[fast_dit] self-attn: nkilib attention_cte on all {len(impls)} layers")
+        cmax_layers = set()
+        if FAST_CMAX and FAST_ATTN_IMPL == "cte":
+            cmax_layers, hard = const_max_layers(model.blocks)
+            logger.info(f"[fast_dit] FAST_CMAX: const-max self-attention on {len(cmax_layers)}/"
+                        f"{len(model.blocks)} layers {sorted(cmax_layers)} (hard bounds, max over ranks: "
+                        f"{[round(h, 1) for h in hard]})")
         if FAST_ATTN_IMPL == "constmax":
             if CONST_MAX_LAYERS == "all":
                 chosen = set(range(len(model.blocks)))
             elif CONST_MAX_LAYERS == "auto":
-                # Each rank only sees its heads' gammas; take the max over ranks so every
-                # rank compiles the SAME graph per block (collectives need identical NEFFs).
-                hard = torch.tensor([const_max_layer_ok(b)[1] for b in model.blocks])
-                if torch.distributed.is_initialized():
-                    import torch.distributed as dist
-                    gloo = dist.new_group(backend="gloo")
-                    dist.all_reduce(hard, op=dist.ReduceOp.MAX, group=gloo)
-                chosen = {i for i, h in enumerate(hard.tolist()) if h <= CONST_MAX_HARD_LIMIT}
-                logger.info(f"[fast_dit] const-max hard bounds (max over ranks): "
-                            f"{[round(h, 1) for h in hard.tolist()]}")
+                chosen, hard = const_max_layers(model.blocks)
+                logger.info(f"[fast_dit] const-max hard bounds (max over ranks): {[round(h, 1) for h in hard]}")
             else:
                 chosen = {int(x) for x in CONST_MAX_LAYERS.split(",") if x.strip()}
             impls = ["constmax" if i in chosen else "sdpa" for i in range(len(model.blocks))]
@@ -815,7 +843,7 @@ class FastWanDiT:
                 torch.compile(_FastBlockSP(b, impl, batch, self.seq_len, n_pad,
                                            full_cross=full_cross[i] if local_x else None,
                                            full_o=full_o[i] if (full_o is not None and batch == 1) else None,
-                                           free_unused=True),
+                                           free_unused=True, cmax=i in cmax_layers),
                               **kw)
                 for i, (b, impl) in enumerate(zip(model.blocks, impls))]
             if full_o is not None and batch == 1:

@@ -10,7 +10,8 @@ Two kernels, because QK-norm is over all heads (3072 features) and this rank hol
   qk_sumsq(q, k) -> ss [Np, 2] fp32: per token, the sum of squares of this rank's q / k features
   (the caller all-reduces it over the TP group), then
   qk_apply(q, k, v, ss, wq, wk, cos, sin) -> qn [H, N, d], kn [H, d, N], vn [H, N, d]:
-    qn = rope(bf16(bf16(q * rsqrt(ss_q / G + eps)) * wq)), head-major (attention_cte tp_q layout)
+    qn = rope(bf16(bf16(q * rsqrt(ss_q / G + eps)) * wq)), head-major (attention_cte tp_q layout;
+         with q_t, [H, d, N] like kn, for attention_const_max)
     kn = the same for k, transposed per head on the PE (tp_k=False layout)
     vn = v head-major
   with the rounding of the torch reference: fp32 products, bf16 after the norm, after the weight,
@@ -52,15 +53,16 @@ def qk_sumsq(q, k):
     return ss
 
 
-def _apply(src, ss, wq, wk, cos, sin, d, eps, inv_g, gp=False):
+def _apply(src, ss, wq, wk, cos, sin, d, eps, inv_g, gp=False, q_t=False):
     """src: ((q, c_q), (k, c_k), (v, c_v)), each segment D = wq.shape[0] columns of its tensor
-    starting at column c_* (three [Np, D] tensors at 0, or one fused [Np, 3D] qkv at 0, D, 2D)."""
+    starting at column c_* (three [Np, D] tensors at 0, or one fused [Np, 3D] qkv at 0, D, 2D).
+    q_t: q is written transposed per head, [H, d, N], like k."""
     (q, cq), (k, ck), (v, cv) = src
     D = wq.shape[0]
     H = D // d
     half = d // 2
     N = cos.shape[0]
-    qn = nl.ndarray((H, N, d), dtype=q.dtype, buffer=nl.shared_hbm)
+    qn = nl.ndarray((H, d, N) if q_t else (H, N, d), dtype=q.dtype, buffer=nl.shared_hbm)
     kn = nl.ndarray((H, d, N), dtype=k.dtype, buffer=nl.shared_hbm)
     vn = nl.ndarray((H, N, d), dtype=v.dtype, buffer=nl.shared_hbm)
     for h in range(H):  # v: head-major, HBM -> HBM
@@ -117,7 +119,7 @@ def _apply(src, ss, wq, wk, cos, sin, d, eps, inv_g, gp=False):
             oo = o.ap(pattern=[[D, n], [d, H], [2, half]], offset=1)
             nisa.tensor_tensor(dst=oe, data1=a[0:n, 0:H, 0:half], data2=b[0:n, 0:H, 0:half], op=nl.subtract)
             nisa.tensor_tensor(dst=oo, data1=c[0:n, 0:H, 0:half], data2=e[0:n, 0:H, 0:half], op=nl.add)
-            if j == 0:  # qn[h, t0 + p, :] = o[p, h*d:(h+1)*d], all heads in one DMA
+            if j == 0 and not q_t:  # qn[h, t0 + p, :] = o[p, h*d:(h+1)*d], all heads in one DMA
                 _dma(qn.ap(pattern=[[d, n], [N * d, H], [1, d]], offset=t0 * d),
                      o.ap(pattern=[[D, n], [d, H], [1, d]], offset=0))
             else:  # per head a PE transpose into one PSUM tile, one copy out, one DMA
@@ -126,26 +128,28 @@ def _apply(src, ss, wq, wk, cos, sin, d, eps, inv_g, gp=False):
                     nisa.nc_transpose(dst=tp[0:d, h, 0:n], data=o[0:n, h * d:(h + 1) * d])
                 ts = nl.ndarray((d, H, P), dtype=x.dtype, buffer=nl.sbuf)
                 nisa.tensor_copy(dst=ts[0:d, 0:H, 0:n], src=tp[0:d, 0:H, 0:n], engine=nisa.scalar_engine)
-                _dma(kn.ap(pattern=[[N, d], [d * N, H], [1, n]], offset=t0),
+                _dma((qn if j == 0 else kn).ap(pattern=[[N, d], [d * N, H], [1, n]], offset=t0),
                      ts.ap(pattern=[[H * P, d], [P, H], [1, n]], offset=0))
     return qn, kn, vn
 
 
 @functools.lru_cache(maxsize=None)
-def qk_apply_kernel(d, eps, global_dim, gp=False, fused=False):
+def qk_apply_kernel(d, eps, global_dim, gp=False, fused=False, q_t=False):
     """qk_apply for one head size / norm eps / global norm width (gp: two of the six RoPE
     products on the GpSimd engine; fused: q / k / v as one [Np, 3D] tensor, qkv_proj_kernel's
-    output). Each configuration gets its own kernel name: NKI's persistent trace cache keys a
-    kernel by name and argument shapes, not closure values."""
+    output; q_t: q written as [H, d, N], the head-major layout of nkilib's attention_const_max).
+    Each configuration gets its own kernel name: NKI's persistent trace cache keys a kernel by name
+    and argument shapes, not closure values."""
     inv_g = 1.0 / global_dim
     if fused:
         def kernel(qkv, ss, wq, wk, cos, sin):
             D = wq.shape[0]
-            return _apply(((qkv, 0), (qkv, D), (qkv, 2 * D)), ss, wq, wk, cos, sin, d, eps, inv_g, gp)
+            return _apply(((qkv, 0), (qkv, D), (qkv, 2 * D)), ss, wq, wk, cos, sin, d, eps, inv_g, gp, q_t)
     else:
         def kernel(q, k, v, ss, wq, wk, cos, sin):
-            return _apply(((q, 0), (k, 0), (v, 0)), ss, wq, wk, cos, sin, d, eps, inv_g, gp)
-    name = f"qk_apply_d{d}_g{global_dim}_e{eps:g}" + ("_gp" if gp else "") + ("_fused" if fused else "")
+            return _apply(((q, 0), (k, 0), (v, 0)), ss, wq, wk, cos, sin, d, eps, inv_g, gp, q_t)
+    name = (f"qk_apply_d{d}_g{global_dim}_e{eps:g}" + ("_gp" if gp else "") + ("_fused" if fused else "")
+            + ("_qt" if q_t else ""))
     kernel.__name__ = kernel.__qualname__ = name.replace(".", "p").replace("-", "m")
     return nki.jit(kernel)
 

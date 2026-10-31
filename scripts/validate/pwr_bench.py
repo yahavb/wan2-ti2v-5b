@@ -5,7 +5,7 @@ reports its time per call; run with 8, 4, 2 or 1 ranks and compare.
   torchrun --nproc_per_node=<n> pwr_bench.py      Env: KERNEL (mlp | attn | cmax), REPS (200)
 mlp: the SP block's FFN as one nkilib mlp call ([7856, 3072] tokens, [3072, 3584] / [3584, 3072]
 weights); attn: attention_cte_lb over 6 heads x 7854 tokens x 128; cmax: nkilib's experimental
-attention_const_max at the same shape (K / V zero-padded to 7936 keys; timing only).
+attention_const_max at the same shape and layouts as FAST_CMAX (timing only).
 """
 import os
 import sys
@@ -40,16 +40,12 @@ def main():
             y = mlp(x.unsqueeze(0), wu, wu, wd, up_proj_bias_tensor=bu,
                     activation_fn=ActFnType.GELU_Tanh_Approx, skip_gate_proj=True)
             return y[0] if isinstance(y, (list, tuple)) else y
-    elif KERNEL == "cmax":  # nkilib const-max attention, K / V zero-padded to a multiple of 128 keys
+    elif KERNEL == "cmax":  # nkilib const-max attention as FAST_CMAX calls it (q, k [N, d, Sk], v [N, Sk, d])
         from nkilib.experimental.attention.attention_const_max import attention_const_max
         BS, L, D = 6, 7854, 128
-        LK = -(-L // 128) * 128
-        q = torch.randn(BS, D, L, generator=g)
-        k = torch.zeros(BS, D, LK)
-        k[:, :, :L] = torch.randn(BS, D, L, generator=g)
-        v = torch.zeros(BS, LK, D)
-        v[:, :L] = torch.randn(BS, L, D, generator=g)
-        args = [q.to(bf16).to(dev), k.to(bf16).to(dev), v.to(bf16).to(dev)]
+        args = [(0.1 * torch.randn(BS, D, L, generator=g)).to(bf16).to(dev),
+                (0.1 * torch.randn(BS, D, L, generator=g)).to(bf16).to(dev),
+                torch.randn(BS, L, D, generator=g).to(bf16).to(dev)]
 
         def fn(q_, k_, v_):
             return attention_const_max(q_, k_, v_, 10.0, D ** -0.5)

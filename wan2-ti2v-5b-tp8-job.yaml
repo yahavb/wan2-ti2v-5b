@@ -224,6 +224,8 @@ spec:
               value: "1"
             - name: FAST_CTE_LB
               value: "1"
+            - name: FAST_CMAX
+              value: "1"
             - name: LINGBOT_CTE_VGROUP
               value: "8"
             - name: LINGBOT_CTE_KGROUP

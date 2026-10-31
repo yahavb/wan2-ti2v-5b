@@ -246,8 +246,11 @@ def main():
             args = (xs, e0, oh, cos.repeat(1, bsz, 1, 1), sin.repeat(1, bsz, 1, 1), kk, vv)
             if cb is not None:
                 args = args + (cb,)
+            cmax = fd.FAST_CMAX and SELF_IMPL == "cte" and 0 in fd.const_max_layers([blk])[0]
             unit = fd._FastBlockSP(blk, SELF_IMPL, bsz, L, Np, full_cross=full_cross if lx else None,
-                                   full_o=full_o if var == "sp_a2o" else None)
+                                   full_o=full_o if var == "sp_a2o" else None, cmax=cmax)
+            if rank == 0 and fd.FAST_CMAX:
+                print(f"[block_bench] layer {LAYER}: const-max self-attention {cmax}", flush=True)
             yr = F.pad(yr.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S].float().cpu()
             n_valid = max(0, min(S, N - shard * S))
             yr32 = None
