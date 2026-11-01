@@ -277,6 +277,35 @@ front. qk_apply + attention 3.65 -> 3.26 ms on one core, bitwise equal (`cmax_qk
 bench (layer 0, interleaved cores, 3 rounds each): 16.59-16.62 -> 16.05-16.25 ms with FLAT, then
 16.10-16.23 -> 15.65-15.96 ms with QK added; block rel-RMS vs fp32 unchanged (0.00444). As with the
 earlier const-max rows, the pipeline gains about half of what the bench implies.
+
+After the ¶ row (device 3, rank 0's system trace of a 3-run pipeline): denoise 5.36 s, the device
+busy 98.7% of it; the DiT blocks average 16.10 ms in step 1 and 17.2-17.9 ms in steps 2-9 (the
+block bench gives 15.2-16.4 ms); VAE 1.54 s, 96% busy, ~1.0 s of it in the 3x3x3 convs.
+Tried and dropped after it, all with the same output where it applies:
+- The FFN's all-gather -> mlp -> reduce-scatter in 2 or 4 chunks of each rank's rows in the
+  compiled block: 15.74 / 15.79 vs 15.81 / 16.07 ms per block with 2 chunks, 16.36 / 16.45 vs
+  15.80 / 15.81 ms with 4. The compiler runs in-graph collectives serialized with compute, so
+  chunking only adds mlp calls.
+- Collectives issued inside an NKI kernel (`nki.collectives`) do overlap that kernel's compute
+  (`scripts/validate/kcc_bench.py`, two groups of 4: reduce-scatter 1.07 ms + 4096 matmuls 1.13 ms
+  -> 1.23 ms in one kernel; all-gather 0.83 + 1.13 -> 1.17 ms). The FFN as one kernel built on that
+  (in-kernel all-gather, nkilib's `mlp_cte`, each chunk's reduce-scatter issued from the mlp's own
+  token-tile stores): bitwise-equal output, but 6.69-6.90 ms vs 6.62-6.77 ms for the compiled path
+  over 5 alternating rounds with one chunk, and 6.61-7.17 ms with 2-4 chunks. The overlap the pure
+  matmul test shows does not survive next to the mlp's own weight streaming.
+- The cross-attention after its q-projection as one NKI kernel (q's RMSNorm, then per head the
+  softmax over the 128 merged keys with their score bias as the exp's per-key bias and a constant
+  max): 0.67 -> 0.35 ms per call alone and closer to fp32 (rel-RMS 2.78e-3 -> 2.72e-3), but the
+  block 15.66-15.74 -> 15.61-15.75 ms: the compiler interleaves its softmax ops with the q- and
+  o-projection matmuls around it.
+The power limit, measured directly (`scripts/validate/pe_burn_bench.py`: 8192 bf16 matmuls per call
+on SBUF-resident operands): 1.83 ms on one core (75 TFLOP/s) and 2.18 ms with all 8 cores running it
+(63 TFLOP/s). With zeros in either operand it stays at 1.80 ms on 8 cores; a moving operand whose
+columns are correlated (0.9) or confined to one exponent range still gives 2.17-2.18 ms; adding 1 MB
+of HBM -> SBUF DMA per 16 matmuls, or one Scalar-engine exp per 4 matmuls, leaves it at 2.18 ms. So
+the limit tracks the multipliers' switching, which any real bf16 data drives about as hard as random
+data, and the other engines and HBM traffic do not move it: with every core busy, the matmul work of
+a block sets a floor of roughly its time at 84% of peak.
 Tried and dropped: the gate + residual adds fused into the LayerNorm kernels (19.27 vs 19.29 ms per
 block; the compiler already does them in one pass), the cross-attention query's RMSNorm and
 head-major layout as one kernel (+0.26 ms), wider exp instructions in `attention_cte` (4.91 ->
