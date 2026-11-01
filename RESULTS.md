@@ -38,7 +38,8 @@ that a change adds no error beyond bf16. Videos checked visually on frames 20/50
 | + QK-norm, RoPE and the attention layouts in NKI kernels (`FAST_QK_PREP=1`), q/k/v as one nkilib `qkv_cte` call that also writes the QK-norm sums (`FAST_QKV_CTE=1`), LayerNorms + modulation as NKI kernels with an fp32 residual (`FAST_LN_MOD=1`), vendored `attention_cte` with grouped hardware-DGE K/V loads (`FAST_CTE_LB=1`) † | **0.57** | **5.67s** | **1.55s** | **7.22s** | **0.0474*** |
 
 | + self-attention through nkilib's `attention_const_max` on the 22 layers whose QK-norm weights bound the scores (`FAST_CMAX=1`) ‡ | 0.55 | 5.52s | 1.52s | 7.05s | 0.0477* |
-| + const-max on 7 more layers with a shifted constant max (`CMAX_MAX_M=65`) § | **0.55** | **5.48s** | **1.55s** | **7.03s** | **0.0470*** |
+| + const-max on 7 more layers with a shifted constant max (`CMAX_MAX_M=65`) § | 0.55 | 5.48s | 1.55s | 7.03s | 0.0470* |
+| + const-max attention as one pipeline over all heads and query blocks with Q / K / V resident in SBUF (`FAST_CMAX_FLAT=1`), QK-norm + RoPE inside that kernel (`FAST_CMAX_QK=1`) ¶ | **0.53** | **5.32s** | **1.53s** | **6.86s** | **0.0470*** |
 
 † Measured on a second trn2.48xlarge (device 3), where the row above runs at 0.59 s/step, denoise
 5.88 s, VAE 1.54 s, total 7.42 s and 0.0485 accuracy: an A/B of two processes per configuration,
@@ -53,6 +54,9 @@ profiler, total 6.59 s), device 3 in 5.52 s.
 6.98-7.07 s): denoise 5.44-5.50 s, total 6.96-7.13 s, so -0.03 s denoise; the VAE varied by more than
 that (1.50-1.63 s). On device 5, 2 processes per configuration with 3 warm runs each: denoise
 5.18-5.28 -> 5.13-5.21 s (means 5.22 -> 5.18), total 6.61-6.73 -> 6.56-6.66 s (6.67 -> 6.62).
+¶ Device 3 again, against the § configuration measured alongside (2 processes per configuration,
+alternating, warm runs 3-4 of 4 each): denoise 5.40-5.48 -> 5.29-5.34 s (means 5.45 -> 5.32), total
+6.90-7.00 -> 6.80-6.96 s (6.95 -> 6.86). The latent and mp4 are byte-identical to the § row's.
 
 Env for the last row: `CFG_PARALLEL=1 CFG_GROUPS=interleave FAST_SP=1 FAST_LOCAL_CROSS=1
 FAST_ATTN_IMPL=cte FAST_CROSS_IMPL=cte VAE_FUSE_NORM=1 VAE_STREAM=1 NKI_CONV3D_SMALL_COUT=1
@@ -248,6 +252,31 @@ the neighbouring elementwise work into its own matmuls); an mp4 written with `-t
 (no change: the tail is the encode of the last 16-frame chunk, not the lookahead); the seq-major Q
 loader of `attention_const_max` on PE transposes instead of DMA transposes (3.385 -> 3.337 ms).
 The const-max kernel's profile (one core, 3.22 ms): PE and Scalar engines 87.5% busy each, MFU 75%.
+
+`FAST_CMAX_FLAT` + `FAST_CMAX_QK` (¶ row, `kernels/attention_cmax.py`). Per 128-key tile the
+const-max kernel runs MM1 (scores, keys on partitions) on the PE, the exp on the Scalar engine and
+MM2 (P^T [V | 1]) on the PE eight tiles behind, and the two engines are equally loaded; nkilib runs
+that pipeline once per 512-query block, so at each of the 96 block boundaries of a call the PE
+drains the last eight MM2s while the Scalar engine waits and then runs eight MM1s while it catches
+up. In the block's device profile those boundaries were most of the 48 PE gaps over 2 us in the
+attention window, and each was followed by the 50% activity throttle (99 events, 577 us). The wan2
+kernel keeps nkilib's instructions per KV tile but runs every (head, block, tile) step as one
+pipeline, the next block's MM1 + exp overlapping this block's last MM2s, with each head's Q, K and
+V (already in the [V | 1] layout) resident in SBUF, loaded two heads ahead (nkilib streams K / V
+for every query block and copies each V tile on the Vector engine). Output bitwise equal; one core
+3.26 -> 3.13 ms per call; all 8 cores of a device running it 3.66 -> 3.51 ms (`pwr_bench.py`).
+The first version, with one probabilities buffer for the whole call, ran 10.3 ms: the compiler
+ordered each MM2 behind the newest exp, and the profile showed the PE and the Scalar engine taking
+turns, with the PE held at the 50% activity limit from 34 us to the end (one ring per query block,
+as nkilib allocates it, fixed it; explicitly placed PSUM banks gave NaNs). With the freed Vector
+engine, `FAST_CMAX_QK` moves `qk_apply` (QK-norm + RoPE + layouts, 0.5-0.75 ms per block,
+Vector-bound) into the same kernel: while head h's attention runs, the Vector engine normalizes and
+rotates head h + 1's q / k one 512-token chunk per query block (the same operations and roundings),
+and the PE transposes them into the resident buffers one block later; only head 0 is prepared up
+front. qk_apply + attention 3.65 -> 3.26 ms on one core, bitwise equal (`cmax_qk_bench.py`). Block
+bench (layer 0, interleaved cores, 3 rounds each): 16.59-16.62 -> 16.05-16.25 ms with FLAT, then
+16.10-16.23 -> 15.65-15.96 ms with QK added; block rel-RMS vs fp32 unchanged (0.00444). As with the
+earlier const-max rows, the pipeline gains about half of what the bench implies.
 Tried and dropped: the gate + residual adds fused into the LayerNorm kernels (19.27 vs 19.29 ms per
 block; the compiler already does them in one pass), the cross-attention query's RMSNorm and
 head-major layout as one kernel (+0.26 ms), wider exp instructions in `attention_cte` (4.91 ->

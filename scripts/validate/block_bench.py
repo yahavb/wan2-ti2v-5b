@@ -23,7 +23,7 @@ Env: LAYER (0), REPS (20), SELF_IMPL (cte|constmax|sdpa), FAST_CROSS_IMPL,
      first group, so NEURON_RT_VISIBLE_CORES=c,c+2,..,c+1,c+3,.. puts the groups on alternating
      cores as CFG_GROUPS=interleave does), BB_TP=4 with 4 ranks (one CFG group alone),
      BB_STAGGER_MS (the second group's timed loop starts that much later), REAL_X=<file> (a saved
-     real block input), SP_NOLN / SP_NOPERM (more SP timing probes)
+     real block input), SP_NOLN / SP_NOPERM (more SP timing probes), BB_DROP (see _apply_drops)
 """
 import copy
 import glob
@@ -44,6 +44,57 @@ SELF_IMPL = os.environ.get("SELF_IMPL", "cte")
 GRID = (21, 22, 17)
 L = GRID[0] * GRID[1] * GRID[2]
 B, DIM, FFN, HEADS, D, LC = 2, 3072, 14336, 24, 128, 512
+
+
+def _apply_drops(drops, unit, fd):
+    """BB_DROP=<a,b,...> (sp variants, FAST_QK_PREP path): take parts out of the block to time them in
+    place (the math is wrong; timing probes only; keep the data finite: the chip runs at its power
+    limit and NaN data draws less power, so it would speed up the rest). ln: the three LayerNorm kernels; qkv: the q/k/v
+    projection (a slice of its input instead); ar: the all-reduce of the q/k sums of squares; attn:
+    the self-attention kernel (returns v; with FAST_CMAX_QK the fused kernel, QK-norm + RoPE
+    included); oT: the attention output's head -> token transpose (a
+    reshape); a2a: the all-to-all before the O-projection (a reshape); oproj: the O-projection; xattn:
+    the cross-attention kernel (returns q); xproj: the cross-attention q and o projections; ffn: the
+    mlp kernel (returns its input); ag: the all-gathers (a broadcast copy instead); rs: the
+    reduce-scatter (a sum of the row blocks, which still reads every row)."""
+    T = fd.get_tp_world_size()
+    lin0, skip = fd._lin, set()
+    for name in drops:
+        if name == "ln":
+            unit.k_ln1 = unit.k_ln2 = lambda x, ohT, a, b: x.to(torch.bfloat16)
+            unit.k_ln3 = lambda x, w, b: x
+        elif name == "qkv":  # finite sums (an all-NaN q / k would also change the attention's power)
+            unit.k_qkv = lambda x, w, b: (x[..., :w.shape[1]].contiguous(),
+                                          x[..., :1].float().abs() * 0.0 + 3072.0, x[..., 1:2].float().abs() * 0.0 + 3072.0)
+        elif name == "ar":
+            fd._all_reduce = lambda t: t
+        elif name == "attn":
+            unit.k_cmax = lambda qn, kn, vn, m, s: vn
+            fd._attention_cte = lambda: (lambda q, k, v, scale=None, causal_mask=False: v)
+            if unit.k_cmax_qk is not None:  # FAST_CMAX_QK: the fused kernel (its QK-norm + RoPE too) -> v
+                unit.k_cmax_qk = lambda qkv, ss, wq, wk, c, s, m, sc: (
+                    qkv[:c.shape[0], 2 * wq.shape[0]:].reshape(c.shape[0], -1, 2 * c.shape[1]).transpose(0, 1).contiguous())
+        elif name == "oT":
+            fd._heads_to_tokens = lambda o, n, N, d, Np: F.pad(o.reshape(N, n * d), (0, 0, 0, Np - N))
+        elif name == "a2a":
+            fd._head2seq = lambda x: x.reshape(x.shape[0] // T, x.shape[1] * T)
+        elif name == "oproj":
+            skip.add(id(unit.full_o))
+        elif name == "xattn":
+            fd._sdpa_attn_bias = lambda q, k, v, w: q
+        elif name == "xproj":
+            skip.update((id(unit.xca.q), id(unit.xca.o)))
+        elif name == "ffn":
+            import nkilib.core.mlp.mlp as m
+            m.mlp = lambda x, *a, **k: x
+        elif name == "ag":
+            fd._ag = lambda t: t.repeat(T, 1)
+        elif name == "rs":
+            fd._rs = lambda t: t.view(T, t.shape[0] // T, *t.shape[1:]).sum(0)
+        else:
+            raise ValueError(f"BB_DROP: unknown part {name}")
+    if skip:
+        fd._lin = lambda x, layer: x if id(layer) in skip else lin0(x, layer)
 
 
 def load_block(layer):
@@ -251,6 +302,9 @@ def main():
                                    full_o=full_o if var == "sp_a2o" else None, cmax=cmax)
             if rank == 0 and fd.FAST_CMAX:
                 print(f"[block_bench] layer {LAYER}: const-max self-attention {cmax}", flush=True)
+            drops = [s for s in os.environ.get("BB_DROP", "").split(",") if s]
+            if drops:
+                _apply_drops(drops, unit, fd)
             yr = F.pad(yr.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S].float().cpu()
             n_valid = max(0, min(S, N - shard * S))
             yr32 = None

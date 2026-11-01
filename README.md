@@ -6,15 +6,16 @@ Text+Image-to-Video generation using the Wan2.2-TI2V-5B diffusion model on AWS T
 
 Full run-by-run log: [RESULTS.md](RESULTS.md).
 
-**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **8.7s** total
-(denoise 6.0s = 0.60 s/step, VAE 2.6s), down from 16.2s on `main` with the same image and SDK —
-**1.95x faster than A100** (16.92s), 1.08x slower than H100 (8.02s). DiT changes: nkilib
-`attention_cte` for self- and cross-attention, CFG-parallel (2 TP groups of 4 on alternating
-cores), Megatron-style sequence parallelism, cross-attention local to each rank's token shard,
-UniPC scheduler step on the device. VAE: RMS_norm + SiLU compiled as one graph together with the
-causal-cache concat; head conv on nkilib; upsample convs in sub-pixel form; tile blend and mp4
-encode streamed during the decode, encoder spawned with vfork.
-Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0487 (`main` const-max: 0.0474,
+**`loop_engineering` branch** (5B, 704x544, 81 frames, 10 steps, one trn2 device): **6.9s** total
+(denoise 5.3s = 0.53 s/step, VAE 1.5s), down from 16.2s on `main` with the same image and SDK —
+**2.5x faster than A100** (16.92s), 1.17x faster than H100 (8.02s). DiT changes: CFG-parallel
+(2 TP groups of 4 on alternating cores), Megatron-style sequence parallelism, cross-attention local
+to each rank's token shard over the merged context keys, NKI kernels for the LayerNorms +
+modulation, the q/k/v projection (nkilib `qkv_cte`), the FFN (nkilib `mlp`) and a const-max
+self-attention kernel with QK-norm + RoPE folded in on 29 of 30 layers, UniPC scheduler step on the
+device. VAE: exact 8x1 strips with a one-row halo exchange, norms and convs fused into NKI kernels
+and compiled graphs; mp4 encode streamed during the decode.
+Step-0 noise prediction vs an fp32 CPU reference: rel-RMS 0.0470 (`main` const-max: 0.0474,
 exact SDPA: 0.0485). See RESULTS.md.
 
 **Versus GPUs** (`main`, 5B, 704x544, 81 frames, 10 steps): Trainium2 one device **17.9s** total (denoise 11.9s, VAE 6.0s) — **1.06x slower than A100** (16.92s; denoise 11.4s, VAE 5.5s), 2.2x slower than H100 (8.02s), 3.3x faster than the earlier Trainium2 run (58.68s).
@@ -160,6 +161,8 @@ FastAPI server on port 8000:
 | `FAST_LN_MOD` | 0 (job: 1) | 1 (with `FAST_SP=1`) = the block's three LayerNorms on the token shard run as NKI kernels (`kernels/ln_mod.py`): norm1 / norm2 fused with their per-frame modulation (rows selected on the PE by the token one-hot), norm3 with its affine weights, all in fp32 with one rounding. The residual stream then stays fp32 inside the block, as the compiled block keeps it: rounding it to bf16 at a kernel input moved the step-0 noise prediction from 0.0485 to 0.058 rel-RMS vs fp32 |
 | `FAST_CTE_LB` | 0 (job: 1) | 1 (with `FAST_ATTN_IMPL=cte`) = the self-attention through a vendored copy of `attention_cte` (`kernels/attention_cte_lb.py`, from lingbot-world) whose `LINGBOT_CTE_VGROUP` / `KGROUP` / `KV_DGE` knobs (job: 8 / 4 / `hwdge_sync`) load 8 V or 4 K tiles per DMA with hardware descriptor generation instead of one software-DGE DMA per tile; the knobs are read at import, so A/B them with `NKI_ENABLE_TRACE_CACHE=0` |
 | `FAST_CMAX` | 0 (job: 1) | 1 (with `FAST_QK_PREP=1`, `FAST_ATTN_IMPL=cte`) = self-attention through nkilib's experimental `attention_const_max` on the layers whose QK-norm weights bound every rank's scaled scores by `CONST_MAX_HARD_LIMIT` (22 of 30 layers, 29 with `CMAX_MAX_M=65`; the bound is the max over ranks, so every rank of a group runs the same graph), with the constant max `CONST_MAX_SOFTMAX_MAX`; the other layers keep `attention_cte`. A constant max drops the online-softmax max pass and the transposes of the probabilities: 5.06 -> 3.26 ms per call on one core, 4.81 -> 3.55 ms with all 8 cores busy; `qk_apply` then writes q head-major, the kernel's native layout |
+| `FAST_CMAX_FLAT` | 0 (job: 1) | 1 (with `FAST_CMAX=1`) = the const-max layers run `kernels/attention_cmax.py` instead of nkilib's kernel: the same instructions per KV tile, as one software pipeline over all heads and query blocks (nkilib restarts it per 512-query block, so the Tensor and Scalar engines take turns idling 96 times per call) with each head's Q, K and V resident in SBUF, loaded two heads ahead; bitwise-equal output, one core 3.26 -> 3.13 ms per call (`scripts/validate/cmax_flat_bench.py`) |
+| `FAST_CMAX_QK` | 0 (job: 1) | 1 (with `FAST_CMAX_FLAT=1`, `FAST_QKV_CTE=1`) = on the const-max layers the QK-norm + RoPE of `qk_apply` run inside that attention kernel (`attention_cmax_qk_kernel`): the Vector engine normalizes and rotates head h + 1's q / k (PE transposes into the resident buffers) while head h's attention runs; bitwise-equal output, one core 3.65 -> 3.26 ms for the two kernels (`scripts/validate/cmax_qk_bench.py`) |
 | `CMAX_MAX_M` | 15 (job: 65) | With `FAST_CMAX=1`: a layer whose bound exceeds `CONST_MAX_HARD_LIMIT` still takes const-max if the bound minus the same 55 of headroom, used as its constant max, is at most this; the kernel's floor on the softmax sum is lowered from 1e-9 to 1e-30 so rows far below that max stay exact. 65 covers 29 of 30 layers (all but the last, whose bound is 630) |
 | `CFG_GROUPS` | contiguous | With `CFG_PARALLEL=1`: `contiguous` = cond ranks 0-3 / uncond 4-7; `interleave` = cond 0,2,4,6 / uncond 1,3,5,7 (each group spans every HBM stack; 4% faster DiT, same output) |
 | `VAE_FUSE_NORM` | 0 | 1 = every VAE RMS_norm + SiLU pair runs as one `torch.compile`d graph (VAE decode 3.7 -> 2.9 s per tile) |

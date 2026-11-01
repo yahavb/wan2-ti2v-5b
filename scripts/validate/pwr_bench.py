@@ -2,11 +2,12 @@
 
 Every rank runs the same independent kernel in a loop, started together after a barrier, and
 reports its time per call; run with 8, 4, 2 or 1 ranks and compare.
-  torchrun --nproc_per_node=<n> pwr_bench.py      Env: KERNEL (mlp | attn | cmax), REPS (200),
+  torchrun --nproc_per_node=<n> pwr_bench.py      Env: KERNEL (mlp | attn | cmax | cmaxf | qkv), REPS (200),
   PWR_START_AT (epoch seconds: start the timed loop then, so jobs on several devices overlap)
 mlp: the SP block's FFN as one nkilib mlp call ([7856, 3072] tokens, [3072, 3584] / [3584, 3072]
 weights); attn: attention_cte_lb over 6 heads x 7854 tokens x 128; cmax: nkilib's experimental
-attention_const_max at the same shape and layouts as FAST_CMAX (timing only).
+attention_const_max at the same shape and layouts as FAST_CMAX (timing only); cmaxf:
+kernels/attention_cmax (FAST_CMAX_FLAT) at the same shape.
 """
 import os
 import sys
@@ -41,8 +42,21 @@ def main():
             y = mlp(x.unsqueeze(0), wu, wu, wd, up_proj_bias_tensor=bu,
                     activation_fn=ActFnType.GELU_Tanh_Approx, skip_gate_proj=True)
             return y[0] if isinstance(y, (list, tuple)) else y
-    elif KERNEL == "cmax":  # nkilib const-max attention as FAST_CMAX calls it (q, k [N, d, Sk], v [N, Sk, d])
-        from nkilib.experimental.attention.attention_const_max import attention_const_max
+    elif KERNEL == "qkv":  # FAST_QKV_CTE's projection: nkilib qkv_cte + q / k sums of squares
+        from kernels.qk_prep import qkv_proj_kernel
+        NP, H, D3 = 7856, 3072, 2304
+        k_qkv = qkv_proj_kernel(6, 128)
+        args = [torch.randn(1, NP, H, generator=g).to(bf16).to(dev),
+                (torch.randn(H, D3, generator=g) * H ** -0.5).to(bf16).to(dev),
+                (0.1 * torch.randn(1, D3, generator=g)).to(bf16).to(dev)]
+
+        def fn(x, w, b):
+            return k_qkv(x, w, b)
+    elif KERNEL in ("cmax", "cmaxf"):  # const-max attention as FAST_CMAX calls it (q, k [N, d, Sk], v [N, Sk, d])
+        if KERNEL == "cmax":  # nkilib's
+            from nkilib.experimental.attention.attention_const_max import attention_const_max
+        else:  # FAST_CMAX_FLAT's (kernels/attention_cmax)
+            from kernels.attention_cmax import attention_cmax as attention_const_max
         BS, L, D = 6, 7854, 128
         args = [(0.1 * torch.randn(BS, D, L, generator=g)).to(bf16).to(dev),
                 (0.1 * torch.randn(BS, D, L, generator=g)).to(bf16).to(dev),

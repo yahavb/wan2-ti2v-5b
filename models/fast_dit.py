@@ -99,6 +99,15 @@ FAST_CTE_LB = os.environ.get("FAST_CTE_LB", "0") == "1"
 # keys-on-partitions): one core, 6 x 7854 x 128, 5.06 -> 3.26 ms per call
 # (scripts/validate/const_max_bench.py).
 FAST_CMAX = os.environ.get("FAST_CMAX", "0") == "1"
+# FAST_CMAX_FLAT=1 (with FAST_CMAX): those layers through kernels/attention_cmax instead, the same
+# per-KV-tile instructions as one software pipeline over all heads and query blocks, with each head's
+# Q / K / V resident in SBUF: bitwise equal output, one core 3.26 -> 3.13 ms, all 8 cores 3.66 ->
+# 3.51 ms per call (scripts/validate/cmax_flat_bench.py, pwr_bench.py KERNEL=cmaxf).
+FAST_CMAX_FLAT = os.environ.get("FAST_CMAX_FLAT", "0") == "1"
+# FAST_CMAX_QK=1 (with FAST_CMAX, FAST_QKV_CTE): on the const-max layers, qk_apply's QK-norm + RoPE
+# run inside the attention kernel (kernels/attention_cmax.attention_cmax_qk_kernel): the Vector
+# engine prepares head h + 1 while head h's attention runs (scripts/validate/cmax_qk_bench.py).
+FAST_CMAX_QK = os.environ.get("FAST_CMAX_QK", "0") == "1"
 # DUMP_BLOCKS=<dir>:<i,j,...> (diagnostic): on the first DiT call, every rank saves its token shard
 # entering and leaving blocks i, j, ... (with e0 and its CFG group / shard index) to <dir>.
 _DUMP_BLOCKS = None
@@ -175,7 +184,11 @@ def cmax_softmax_max(blocks):
 def _cmax_kernel():
     """nkilib's attention_const_max with the floor on its softmax sum (1e-9 upstream, against a
     division by zero) lowered to 1e-30: with a max m, a row's sum is about Sk * exp(typical score -
-    m), which is below 1e-9 once m exceeds ~30 and would then be clamped. fp32 still holds 1e-30."""
+    m), which is below 1e-9 once m exceeds ~30 and would then be clamped. fp32 still holds 1e-30.
+    FAST_CMAX_FLAT: kernels/attention_cmax (floor 1e-30, same call signature)."""
+    if FAST_CMAX_FLAT:
+        from kernels.attention_cmax import attention_cmax
+        return attention_cmax
     import nkilib.experimental.attention.attention_const_max as m
     m._EPS = 1e-30
     return m.attention_const_max
@@ -236,6 +249,12 @@ def _real_len(ctx):
     if n == 0 or n >= nz.numel() or not bool(nz[:n].all()):
         return None
     return n
+
+
+def _heads_to_tokens(o, n, N, d, Np):
+    """Self-attention output [n, N, d] (this rank's heads, head-major) -> [Np, n * d] token rows with
+    zero pad rows, the layout _head2seq and the row-parallel O-projection read."""
+    return F.pad(o.view(n, N, d).transpose(0, 1).reshape(N, n * d), (0, 0, 0, Np - N))
 
 
 def _head2seq(x):
@@ -497,7 +516,7 @@ class _FastBlockSP(nn.Module):
         # the residual there moved the step-0 noise prediction from 0.0485 to 0.058 rel-RMS vs fp32.
         # So with those kernels the residual stays fp32 explicitly (kernels get a bf16 copy): 0.0474.
         self.f32_res = self.k_ln2 is not None or self.k_ln3 is not None
-        self.k_qkv = self.qkv_w = None
+        self.k_qkv = self.qkv_w = self.k_cmax_qk = None
         self.cmax = False
         self.cmax_m = cmax
         if (FAST_QK_PREP and attn_impl == "cte" and batch == 1 and sa.norm_q.eps == sa.norm_k.eps
@@ -515,6 +534,9 @@ class _FastBlockSP(nn.Module):
                 b = torch.cat([cpu(sa.q.bias), cpu(sa.k.bias), cpu(sa.v.bias)], 0).view(1, -1).contiguous()
                 self.qkv_w = (w.to(sa.q.weight.device), b.to(sa.q.weight.device))
                 self.k_qkv = qkv_proj_kernel(sa.num_heads, sa.head_dim)
+                if self.cmax and FAST_CMAX_QK:  # qk_apply's work inside the attention kernel
+                    from kernels.attention_cmax import attention_cmax_qk_kernel
+                    self.k_cmax_qk = attention_cmax_qk_kernel(float(sa.norm_q.eps), int(sa.norm_q.global_dim))
                 if free_unused:  # the projection reads only the fused copies now
                     for lin in (sa.q, sa.k, sa.v):
                         lin.weight = nn.Parameter(lin.weight.new_empty(0), requires_grad=False)
@@ -558,17 +580,21 @@ class _FastBlockSP(nn.Module):
             if self.k_qkv is not None:  # one nkilib qkv_cte call, with the per-token sums of squares
                 qkv, qss, kss = self.k_qkv(hf.unsqueeze(0), *self.qkv_w)  # [1, Np, 3D], 2 x [1, Np, 1]
                 ss = _all_reduce(torch.cat([qss[0], kss[0]], -1))  # [Np, 2]: global sums of squares
-                qn, kn, vn = self.k_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
+                if self.k_cmax_qk is not None:  # QK-norm + RoPE + const-max attention in one kernel
+                    o = self.k_cmax_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs,
+                                       float(self.cmax_m), d ** -0.5)  # [n, N, d]
+                else:
+                    qn, kn, vn = self.k_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
             else:
                 from kernels.qk_prep import qk_sumsq
                 q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
                 ss = _all_reduce(qk_sumsq(q, k))  # [Np, 2]: global sums of squares of q and k
                 qn, kn, vn = self.k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
-            if self.cmax:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
+            if self.k_cmax_qk is None and self.cmax:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
                 o = self.k_cmax(qn, kn, vn, float(self.cmax_m), d ** -0.5)
-            else:
+            elif self.k_cmax_qk is None:
                 o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
-            y = F.pad(o.view(n, N, d).transpose(0, 1).reshape(N, n * d), (0, 0, 0, Np - N))
+            y = _heads_to_tokens(o, n, N, d, Np)
         else:
             q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
             q, k = _tp_rms_qk(q.unsqueeze(0), k.unsqueeze(0), sa.norm_q, sa.norm_k)
