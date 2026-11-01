@@ -2,7 +2,8 @@
 
 Every rank runs the same independent kernel in a loop, started together after a barrier, and
 reports its time per call; run with 8, 4, 2 or 1 ranks and compare.
-  torchrun --nproc_per_node=<n> pwr_bench.py      Env: KERNEL (mlp | attn | cmax), REPS (200)
+  torchrun --nproc_per_node=<n> pwr_bench.py      Env: KERNEL (mlp | attn | cmax), REPS (200),
+  PWR_START_AT (epoch seconds: start the timed loop then, so jobs on several devices overlap)
 mlp: the SP block's FFN as one nkilib mlp call ([7856, 3072] tokens, [3072, 3584] / [3584, 3072]
 weights); attn: attention_cte_lb over 6 heads x 7854 tokens x 128; cmax: nkilib's experimental
 attention_const_max at the same shape and layouts as FAST_CMAX (timing only).
@@ -65,6 +66,9 @@ def main():
         f(*args)
     torch.neuron.synchronize()
     dist.barrier()
+    start_at = float(os.environ.get("PWR_START_AT") or 0)  # epoch s: jobs on several devices time one window
+    if start_at:
+        time.sleep(max(0.0, start_at - time.time()))
     t0 = time.perf_counter()
     for _ in range(REPS):
         f(*args)

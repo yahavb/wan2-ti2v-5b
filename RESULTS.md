@@ -269,6 +269,22 @@ groups running (`scripts/validate/cc_contention_bench.py`: reduce-scatter 0.82 -
 all-to-all 0.40 -> 0.57 ms, all-gather 0.80 -> 0.88 ms) and slower on 4 contiguous cores than on 4
 alternating ones (all-gather 1.08 vs 0.80 ms), which is the `CFG_GROUPS=interleave` gain.
 
+The limit also makes the same build run at different speeds on different chips, and it tightens over
+a run. `1f64c2e` (one mp4 hash everywhere) denoises in 5.69 s on device 3 of the first host and, on
+the second host, in 5.51-5.56 s on device 5, 5.68 s on device 4 and 5.82-5.92 s on device 3; the
+latest configuration in 5.13-5.21 s on device 5 and 5.44-5.50 s on device 3. Devices 4 and 5 traced in
+one batch, same build (`scripts/prof/sys_block_steps.py`): denoise 5.34 vs 5.18 s, the device busy
+99.3% vs 99.2% of it, so the difference is execution speed, not the host. The blocks run at nearly
+the same speed in the first step (16.97 vs 16.80 ms) and slow down over the run on both chips, by
+4.3% on device 4 and 2.3% on device 5 by step 10. The FFN's `mlp` kernel on one core takes 4.70 ms on
+both chips; on all 8 cores 6.06-6.11 ms over 300 calls (~2 s) and 7.16 ms over 4000 calls (~29 s) on
+device 5, and over 2000 calls 7.17 ms on device 4 against 6.99 ms on device 5. Loading both devices at
+once changes either by under 1% (7.19 and 7.04 ms), so the chips do not share a budget at this load.
+This fits a per-chip limit on power averaged over seconds, or on temperature, that differs from chip
+to chip; the device temperature is not exposed here, so which of the two is not checked. So an A/B
+is only valid on one device with the configurations alternating, as in the rows above, and absolute
+times can differ by up to ~6% between chips.
+
 Host stalls, from the runtime system trace (`scripts/prof/sys_phases.py`). Each denoising step left
 the device idle ~19 ms: ~7 ms for the CPU UniPC round trip after the head, then ~12 ms in the next
 step's first in-graph collective, waiting for the ranks whose single-threaded CPU scheduler was
