@@ -3,6 +3,32 @@
 All runs: one trn2 NeuronDevice, 10 denoising steps, CFG on, same prompt/image/seed.
 Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 
+## Const-max attention off in the job (2026-11-03)
+
+The job and the validate script now set `FAST_CMAX=0 FAST_CMAX_FLAT=0 FAST_CMAX_QK=0`: exact
+`attention_cte` self-attention on all 30 layers.
+
+| Config | Denoise | VAE | Total | step-0 vs fp32 |
+|---|---|---|---|---|
+| const-max on 29 of 30 layers (the previous default, ¶ row below) | 5.3 / 5.4s | 1.5s | 6.8 / 7.0s | 0.0470 |
+| `attention_cte` on all layers (new default) | 5.6 / 5.7s | 1.5s | **7.1 / 7.2s** | 0.0474 |
+
+Runs 2 and 3 of 3, same host and device (Ohio trn2, device 3, LNC1). Video of the exact run vs the
+const-max run: 21.2 dB (worst frame 19.3, different accumulation order over 10 steps); frames 20, 50
+and 80 show the same content.
+
+Why: a constant max c is exact only while every row's exponentials exp(score - c) and their sums stay
+representable, roughly while each row's largest scaled score lies between c - 85 and c + 78.
+`FAST_CMAX` picked its layers and constants from a per-head bound on the scores computed from the
+QK-norm weights, sqrt(d) * max|g_q| * max|g_k|. That bound would hold if the RMSNorm ran per head;
+Wan's `norm_q` / `norm_k` normalize all 24 heads together, so one head can carry most of the norm
+and its scores can reach 24 times the bound. Nothing checked the scores at run time: on the 14B
+model the same kernel produced a NaN video (low-noise expert, layer 2, head 23: scaled score 433
+against a weight bound of 31.7), and on this model it was validated on one clip only. An overflow
+gives inf / NaN; an underflow hits the kernel's 1e-30 floor on the sum and scales the row toward 0
+without an error. Const-max comes back once the kernel checks every row's softmax sum and the
+pipeline recomputes any out-of-range call with exact attention.
+
 ## `loop_engineering` branch (2026-10-28), 704x544, 81 frames, TP over 8 ranks LNC1
 
 Image `concourse-release-0461d3b:latest` pushed 2026-10-09 (torch 2.14.0, torch-neuronx 2.14.3,
