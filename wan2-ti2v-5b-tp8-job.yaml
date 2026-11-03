@@ -225,13 +225,17 @@ spec:
             - name: FAST_CTE_LB
               value: "1"
             - name: FAST_CMAX
-              value: "0"
+              value: "1"
             - name: CMAX_MAX_M
               value: "65"
             - name: FAST_CMAX_FLAT
-              value: "0"
+              value: "1"
             - name: FAST_CMAX_QK
-              value: "0"
+              value: "1"
+            - name: CMAX_CHECK
+              value: "1"
+            - name: CMAX_C
+              value: "40"
             - name: LINGBOT_CTE_VGROUP
               value: "8"
             - name: LINGBOT_CTE_KGROUP

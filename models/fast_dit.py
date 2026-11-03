@@ -171,6 +171,24 @@ def const_max_layers(blocks):
 # softmax sum is lowered (_cmax_kernel). CMAX_MAX_M = CONST_MAX_SOFTMAX_MAX (default) keeps the
 # hard <= CONST_MAX_HARD_LIMIT rule.
 CMAX_MAX_M = float(os.environ.get("CMAX_MAX_M", str(CONST_MAX_SOFTMAX_MAX)))
+# CMAX_CHECK=1 (default; FAST_CMAX needs FAST_CMAX_FLAT for it): the bound above is not a bound (the
+# QK-norm runs over all heads, so one head's scores can exceed it many times), so the const-max kernel
+# checks its own result: every query row's softmax sum must lie in [e^lo, e^hi] (CMAX_CHECK_BAND,
+# ln units; kernels/attention_cmax's module docstring). The blocks accumulate the per-call stats on
+# the device; after the denoising loop the caller asks cmax_verdict(): if any row of any call was
+# outside the band, or the latent is not finite, the layers that failed switch to exact attention_cte
+# (cmax_fallback, for the rest of the process) and the loop runs again. CMAX_CHECK=0: unchecked.
+CMAX_CHECK = os.environ.get("CMAX_CHECK", "1") == "1"
+CMAX_CHECK_BAND = tuple(float(v) for v in os.environ.get("CMAX_CHECK_BAND", "-60,78").split(","))
+assert len(CMAX_CHECK_BAND) == 2 and CMAX_CHECK_BAND[0] < CMAX_CHECK_BAND[1], CMAX_CHECK_BAND
+# CMAX_C (with CMAX_CHECK): the constant max of every const-max layer (the layers are still the ones
+# the bound above picks). With the check, the constant decides only how often a call is redone, so
+# it comes from measured scores rather than the weight bound. Over a whole generation of the example
+# clip, ln(sum_j exp(score_ij)) of every row of the 29 layers spans [-4.1, 103.9] (layer 18 / layer 25),
+# so the band holds for any c in [25.9, 55.9]; at 40 the sums span [e^-44.2, e^65.1], 15.8 and 12.9
+# inside the band. The bound's shifted maxima put layer 26's sums below e^-60 on that clip (3880 rows,
+# down to e^-63.6), so the check redid it. One constant for all layers: one graph family.
+CMAX_C = float(os.environ.get("CMAX_C", "40"))
 
 
 def cmax_softmax_max(blocks):
@@ -178,17 +196,26 @@ def cmax_softmax_max(blocks):
     _, hard = const_max_layers(blocks)
     room = CONST_MAX_HARD_LIMIT - CONST_MAX_SOFTMAX_MAX
     ms = {i: max(CONST_MAX_SOFTMAX_MAX, h - room) for i, h in enumerate(hard)}
-    return {i: m for i, m in ms.items() if m <= CMAX_MAX_M}, hard
+    chosen = {i: m for i, m in ms.items() if m <= CMAX_MAX_M}
+    if CMAX_CHECK and FAST_CMAX_FLAT:  # checked: one measured constant (CMAX_C), the band does the rest
+        chosen = {i: CMAX_C for i in chosen}
+    return chosen, hard
+
+
+def cmax_stats_init(device):
+    """CMAX_CHECK's running stats of one layer: rows outside the band, smallest sum, largest sum."""
+    return torch.tensor([0.0, float("inf"), 0.0], dtype=torch.float32).to(device)
 
 
 def _cmax_kernel():
     """nkilib's attention_const_max with the floor on its softmax sum (1e-9 upstream, against a
     division by zero) lowered to 1e-30: with a max m, a row's sum is about Sk * exp(typical score -
     m), which is below 1e-9 once m exceeds ~30 and would then be clamped. fp32 still holds 1e-30.
-    FAST_CMAX_FLAT: kernels/attention_cmax (floor 1e-30, same call signature)."""
+    FAST_CMAX_FLAT: kernels/attention_cmax (floor 1e-30, same call signature); with CMAX_CHECK its
+    checked variant, which also returns the row-sum stats."""
     if FAST_CMAX_FLAT:
-        from kernels.attention_cmax import attention_cmax
-        return attention_cmax
+        from kernels.attention_cmax import attention_cmax, attention_cmax_checked
+        return attention_cmax_checked(*CMAX_CHECK_BAND) if CMAX_CHECK else attention_cmax
     import nkilib.experimental.attention.attention_const_max as m
     m._EPS = 1e-30
     return m.attention_const_max
@@ -518,6 +545,8 @@ class _FastBlockSP(nn.Module):
         self.f32_res = self.k_ln2 is not None or self.k_ln3 is not None
         self.k_qkv = self.qkv_w = self.k_cmax_qk = None
         self.cmax = False
+        self.cmax_chk = self.use_cmax = False
+        self.k_qk_exact = None
         self.cmax_m = cmax
         if (FAST_QK_PREP and attn_impl == "cte" and batch == 1 and sa.norm_q.eps == sa.norm_k.eps
                 and sa.norm_q.global_dim == sa.norm_k.global_dim):
@@ -528,6 +557,15 @@ class _FastBlockSP(nn.Module):
             self.k_cmax = _cmax_kernel() if self.cmax else None
             self.k_qk = qk_apply_kernel(sa.head_dim, float(sa.norm_q.eps), int(sa.norm_q.global_dim),
                                         fused=FAST_QKV_CTE, q_t=self.cmax)
+            # CMAX_CHECK: the kernel returns its row-sum stats; use_cmax=False (FastWanDiT.cmax_fallback)
+            # switches the block to exact attention_cte, with q token-major (k_qk_exact) as on the
+            # layers that never take const-max
+            self.cmax_chk = self.cmax and CMAX_CHECK
+            self.use_cmax = self.cmax
+            if self.cmax_chk:
+                assert FAST_CMAX_FLAT, "CMAX_CHECK needs FAST_CMAX_FLAT=1 (kernels/attention_cmax; CMAX_CHECK=0 to run unchecked)"
+                self.k_qk_exact = qk_apply_kernel(sa.head_dim, float(sa.norm_q.eps), int(sa.norm_q.global_dim),
+                                                  fused=FAST_QKV_CTE, q_t=False)
             if FAST_QKV_CTE:  # fused [C, 3D] weight and [1, 3D] bias for nkilib qkv_cte (built on the CPU)
                 cpu = lambda t: t.detach().cpu()  # noqa: E731
                 w = torch.cat([cpu(sa.q.weight), cpu(sa.k.weight), cpu(sa.v.weight)], 0).t().contiguous()
@@ -536,7 +574,8 @@ class _FastBlockSP(nn.Module):
                 self.k_qkv = qkv_proj_kernel(sa.num_heads, sa.head_dim)
                 if self.cmax and FAST_CMAX_QK:  # qk_apply's work inside the attention kernel
                     from kernels.attention_cmax import attention_cmax_qk_kernel
-                    self.k_cmax_qk = attention_cmax_qk_kernel(float(sa.norm_q.eps), int(sa.norm_q.global_dim))
+                    self.k_cmax_qk = attention_cmax_qk_kernel(float(sa.norm_q.eps), int(sa.norm_q.global_dim),
+                                                              check=CMAX_CHECK_BAND if self.cmax_chk else None)
                 if free_unused:  # the projection reads only the fused copies now
                     for lin in (sa.q, sa.k, sa.v):
                         lin.weight = nn.Parameter(lin.weight.new_empty(0), requires_grad=False)
@@ -548,8 +587,10 @@ class _FastBlockSP(nn.Module):
             return _cte(q, k, v)
         return _sdpa(q, k, v)
 
-    def forward(self, xs, e, oh, cos, sin, ck, cv, cb=None):
-        """cb: [Lk] fp32 score bias of merged cross-attention keys (FAST_CROSS_MERGE), or None."""
+    def forward(self, xs, e, oh, cos, sin, ck, cv, cb=None, gst=None):
+        """cb: [Lk] fp32 score bias of merged cross-attention keys (FAST_CROSS_MERGE), or None.
+        gst (CMAX_CHECK blocks): this layer's running row-sum stats [3] f32 (rows outside the band,
+        smallest sum, largest sum); returns (output, updated gst), gst unchanged on exact attention."""
         blk = self.block
         sa, ca = blk.self_attn, blk.cross_attn
         n, d = sa.num_heads, sa.head_dim
@@ -574,25 +615,32 @@ class _FastBlockSP(nn.Module):
         else:
             h = blk.norm1(xs).to(torch.bfloat16) * (1 + mods[1]) + mods[0]
         hf = _ag(h)  # [Np, C]
+        st = None  # CMAX_CHECK: the const-max kernel's row-sum stats [128, 3]
         if self.k_qk is not None:
             attention_cte = _attention_cte()
             rope_cs = (cos.view(N, d // 2), sin.view(N, d // 2))
+            cmax_on = self.cmax and self.use_cmax
+            k_qk = self.k_qk if (cmax_on or self.k_qk_exact is None) else self.k_qk_exact
             if self.k_qkv is not None:  # one nkilib qkv_cte call, with the per-token sums of squares
                 qkv, qss, kss = self.k_qkv(hf.unsqueeze(0), *self.qkv_w)  # [1, Np, 3D], 2 x [1, Np, 1]
                 ss = _all_reduce(torch.cat([qss[0], kss[0]], -1))  # [Np, 2]: global sums of squares
-                if self.k_cmax_qk is not None:  # QK-norm + RoPE + const-max attention in one kernel
+                if self.k_cmax_qk is not None and cmax_on:  # QK-norm + RoPE + const-max attention in one kernel
                     o = self.k_cmax_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs,
                                        float(self.cmax_m), d ** -0.5)  # [n, N, d]
+                    if self.cmax_chk:
+                        o, st = o
                 else:
-                    qn, kn, vn = self.k_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
+                    qn, kn, vn = k_qk(qkv[0], ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
             else:
                 from kernels.qk_prep import qk_sumsq
                 q, k, v = _lin(hf, sa.q), _lin(hf, sa.k), _lin(hf, sa.v)
                 ss = _all_reduce(qk_sumsq(q, k))  # [Np, 2]: global sums of squares of q and k
-                qn, kn, vn = self.k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
-            if self.k_cmax_qk is None and self.cmax:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
+                qn, kn, vn = k_qk(q, k, v, ss, sa.norm_q.weight, sa.norm_k.weight, *rope_cs)
+            if cmax_on and self.k_cmax_qk is None:  # qn [n, d, N], kn [n, d, N], vn [n, N, d]
                 o = self.k_cmax(qn, kn, vn, float(self.cmax_m), d ** -0.5)
-            elif self.k_cmax_qk is None:
+                if self.cmax_chk:
+                    o, st = o
+            elif not cmax_on:
                 o = attention_cte(qn, kn, vn, scale=d ** -0.5, causal_mask=False)  # [n, N, d]
             y = _heads_to_tokens(o, n, N, d, Np)
         else:
@@ -651,8 +699,15 @@ class _FastBlockSP(nn.Module):
         else:
             y = _rs(_mm(blk.ffn[1](_lin(hf, blk.ffn[0])), blk.ffn[2])) + blk.ffn[2].bias
         if self.f32_res:
-            return (xs + y.float() * mods[5].float()).to(torch.bfloat16)
-        return xs + y * mods[5]
+            out = (xs + y.float() * mods[5].float()).to(torch.bfloat16)
+        else:
+            out = xs + y * mods[5]
+        if not self.cmax_chk:
+            return out
+        if st is not None:  # this call's rows outside the band, smallest and largest sum
+            gst = torch.stack([gst[0] + st[:, 0].sum(), torch.minimum(gst[1], st[:, 1].min()),
+                               torch.maximum(gst[2], st[:, 2].max())])
+        return out, gst
 
 
 class _FastPatchSP(nn.Module):
@@ -875,6 +930,8 @@ class FastWanDiT:
             impls = ["constmax" if i in chosen else "sdpa" for i in range(len(model.blocks))]
             logger.info(f"[fast_dit] const-max on {len(chosen)}/{len(impls)} layers: {sorted(chosen)}")
         self.impls = impls
+        self.cmax_chk_layers = []  # CMAX_CHECK blocks (SP path), set below
+        self.gst = {}  # their running row-sum stats on the device
         self.sp = FAST_SP and get_tp_world_size() > 1 and FAST_ATTN_IMPL != "nki"
         self.cross_kv = [torch.compile(_FastCrossKV(b), **kw) for b in model.blocks]
         if cfg_group is None:
@@ -901,6 +958,14 @@ class FastWanDiT:
                                            free_unused=True, cmax=cmax_layers.get(i)),
                               **kw)
                 for i, (b, impl) in enumerate(zip(model.blocks, impls))]
+            self.cmax_chk_layers = [i for i, b in enumerate(self.blocks) if b._orig_mod.cmax_chk]
+            if self.cmax_chk_layers:
+                import torch.distributed as dist
+                self._gloo = dist.new_group(backend="gloo") if dist.is_initialized() else None
+                self.cmax_reset()
+                logger.info(f"[fast_dit] CMAX_CHECK: every const-max call checks its rows' softmax sums "
+                            f"against [e^{CMAX_CHECK_BAND[0]:g}, e^{CMAX_CHECK_BAND[1]:g}] on layers "
+                            f"{self.cmax_chk_layers}")
             if full_o is not None and batch == 1:
                 logger.info("[fast_dit] self-attention output: all-to-all + unsharded O-projection")
             if FAST_NKI_MLP:
@@ -971,10 +1036,62 @@ class FastWanDiT:
     def _block(self, i, x, e0):
         ck, cv = self.context[i]
         if self.sp:
+            args = (x, e0, self.oh, self.cos, self.sin, ck, cv, self.cross_bias)
+            if i in self.gst:  # CMAX_CHECK block: carries this layer's running stats
+                x, self.gst[i] = self.blocks[i](*args, gst=self.gst[i])
+                return x
             if self.cross_bias is not None:
-                return self.blocks[i](x, e0, self.oh, self.cos, self.sin, ck, cv, self.cross_bias)
-            return self.blocks[i](x, e0, self.oh, self.cos, self.sin, ck, cv)
+                return self.blocks[i](*args)
+            return self.blocks[i](*args[:-1])
         return self.blocks[i](x, e0, self.cos, self.sin, ck, cv)
+
+    # ── CMAX_CHECK: the const-max layers' row-sum stats, read once per denoising loop ──
+
+    @property
+    def cmax_guarded(self):
+        return bool(self.cmax_chk_layers)
+
+    def cmax_reset(self):
+        """Start a denoising loop: zero the running stats of every checked layer."""
+        self.gst = {i: cmax_stats_init(self.device) for i in self.cmax_chk_layers}
+
+    def _cmax_active(self):
+        return [i for i in self.cmax_chk_layers if self.blocks[i]._orig_mod.use_cmax]
+
+    def cmax_verdict(self, latent):
+        """After a denoising loop (all ranks): (ok, failed layers, report). ok: no const-max row of any
+        call on any rank was outside the band and the latent is finite. Reads the stats once."""
+        import math
+        import torch.distributed as dist
+        layers = self.cmax_chk_layers
+        st = torch.stack([self.gst[i] for i in layers]).cpu()  # [n, 3]
+        nonfinite = torch.tensor([0.0 if bool(torch.isfinite(latent).all()) else 1.0])
+        fails, mins, maxs = st[:, 0].contiguous(), st[:, 1].contiguous(), st[:, 2].contiguous()
+        if self._gloo is not None:
+            for t, op in ((fails, dist.ReduceOp.SUM), (mins, dist.ReduceOp.MIN), (maxs, dist.ReduceOp.MAX),
+                          (nonfinite, dist.ReduceOp.MAX)):
+                dist.all_reduce(t, op=op, group=self._gloo)
+        active = set(self._cmax_active())
+        failed = [i for i, f in zip(layers, fails.tolist()) if f > 0 and i in active]
+        ln = lambda v: f"{math.log(v):.1f}" if v > 0 else "-inf"  # noqa: E731
+        rng = [(i, ln(a), ln(b)) for i, a, b in zip(layers, mins.tolist(), maxs.tolist()) if i in active]
+        lo_l = min(rng, key=lambda r: float(r[1]))[1] if rng else "n/a"
+        hi_l = max(rng, key=lambda r: float(r[2]))[2] if rng else "n/a"
+        report = (f"rows outside [e^{CMAX_CHECK_BAND[0]:g}, e^{CMAX_CHECK_BAND[1]:g}]: "
+                  f"{int(fails.sum().item())} on {len(failed)} of {len(active)} const-max layers {failed}; "
+                  f"ln(row sum) over all rows in [{lo_l}, {hi_l}]; latent finite: {nonfinite.item() == 0}; "
+                  f"per layer (layer, min, max) {rng}")
+        return (not failed and nonfinite.item() == 0), failed, report
+
+    def cmax_fallback(self, failed):
+        """Switch the failed layers (all const-max layers if none failed, i.e. a non-finite latent) to
+        exact attention_cte for the rest of the process. Returns the layers switched ([] = none left)."""
+        todo = [i for i in (failed or self._cmax_active()) if self.blocks[i]._orig_mod.use_cmax]
+        for i in todo:
+            self.blocks[i]._orig_mod.use_cmax = False
+        if todo:
+            logger.warning(f"[fast_dit] CMAX_CHECK: layers {todo} now use exact attention_cte")
+        return todo
 
     def _time_embed(self, t):
         """Per-frame time embedding: frame 0 (image) has t=0, other frames t."""

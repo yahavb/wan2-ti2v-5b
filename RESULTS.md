@@ -3,31 +3,69 @@
 All runs: one trn2 NeuronDevice, 10 denoising steps, CFG on, same prompt/image/seed.
 Numbers are warm runs (after compile). Measured 2026-10-10 to 2026-10-12.
 
-## Const-max attention off in the job (2026-11-03)
+## Const-max attention checks its own result (2026-11-03)
 
-The job and the validate script now set `FAST_CMAX=0 FAST_CMAX_FLAT=0 FAST_CMAX_QK=0`: exact
-`attention_cte` self-attention on all 30 layers.
+**The problem.** A constant max c is exact only while every row's exponentials exp(score - c) and
+their sums stay representable: roughly while each row's largest scaled score lies between c - 85
+and c + 78. `FAST_CMAX` picked its layers and constants from a per-head bound on the scores computed
+from the QK-norm weights, sqrt(d) * max|g_q| * max|g_k|. That bound would hold if the RMSNorm ran
+per head; Wan's `norm_q` / `norm_k` normalize all 24 heads together, so one head can carry most of
+the norm and its scores can reach 24 times the bound. Nothing checked the scores at run time: on the
+14B model the same kernel produced a NaN video (low-noise expert, layer 2, head 23: scaled score 433
+against a weight bound of 31.7), and here it was validated on one clip. An overflow gives inf / NaN;
+an underflow hits the kernel's 1e-30 floor on the sum and scales the row toward 0 without an error.
+`cfaa01f` turned const-max off in the job as a stopgap (7.2 s).
 
-| Config | Denoise | VAE | Total | step-0 vs fp32 |
-|---|---|---|---|---|
-| const-max on 29 of 30 layers (the previous default, ¶ row below) | 5.3 / 5.4s | 1.5s | 6.8 / 7.0s | 0.0470 |
-| `attention_cte` on all layers (new default) | 5.6 / 5.7s | 1.5s | **7.1 / 7.2s** | 0.0474 |
+**The fix** (`CMAX_CHECK=1`, default; `kernels/attention_cmax.py`, `models/fast_dit.py`,
+`inference_neuron_ti2v.py`):
+- The kernel checks every query row's softmax sum S = sum_j exp(score_ij - c) (the ones column next
+  to V) against [e^-60, e^78] (`CMAX_CHECK_BAND`). S <= e^78: no exponential and no partial sum
+  overflowed (all terms are positive). S >= e^-60: the largest term (>= S / 7854) is a normal fp32
+  and the terms lost to underflow are below 1e-7 of S. A NaN fails both comparisons. The sums are
+  the floored values the normalization already computes, written to a per-call buffer instead of a
+  scratch tile, so the attention output is bitwise unchanged; the floor (e^-69.1) lies below the
+  band, so a zero sum, or a NaN that the maximum drops, still fails. At the end of the call the
+  kernel returns [128, 3] stats per partition: rows outside the band, smallest and largest S.
+- Each const-max block adds its call's stats to its layer's running stats on the device (no host
+  sync). After the denoising loop the pipeline reads them once (all-reduced over the 8 ranks) and
+  checks that the latent is finite, which also covers an overflow of the numerator sum_j p_j v_j
+  (possible only if |v| > e^10.7 with S <= e^78). If any row of any call failed, the failing layers
+  switch to exact `attention_cte` for the rest of the process and the loop runs again from the same
+  start. A const-max result is never kept unchecked.
+- With the check, the constant max only decides how often a call is redone, so it comes from
+  measured scores (`CMAX_C=40` on all 29 layers, one graph family) instead of the weight bound. Over
+  one generation of the example clip, ln(sum_j exp(score_ij)) of every row spans [-4.1, 103.9]
+  (layers 18 / 25): any c in [25.9, 55.9] keeps every sum in the band. The bound's own constants
+  failed the check on this clip: layer 26 (c = 60.8) had 3880 rows below e^-60, down to e^-63.6, and
+  was redone.
 
-Runs 2 and 3 of 3, same host and device (Ohio trn2, device 3, LNC1). Video of the exact run vs the
-const-max run: 21.2 dB (worst frame 19.3, different accumulation order over 10 steps); frames 20, 50
-and 80 show the same content.
+| Config (runs 2 / 3 of 3, Ohio trn2 device 3, LNC1) | Denoise | VAE | Total | step-0 vs fp32 | rows outside the band |
+|---|---|---|---|---|---|
+| const-max, bound constants, unchecked (the previous default, ¶ row below) | 5.3 / 5.4s | 1.5s | 6.8 / 7.0s | 0.0470 | not checked |
+| `attention_cte` on all layers (`cfaa01f`, the stopgap) | 5.6 / 5.7s | 1.5s | 7.1 / 7.2s | 0.0474 | -- |
+| const-max, bound constants, checked | 5.4 / 5.5s | 1.5s | 6.9 / 7.0s | -- | run 1: 3880 on layer 26, redone; then 0 |
+| **const-max, `CMAX_C=40`, checked (new default)** | **5.4 / 5.4s** | **1.5s** | **6.9 / 6.9s** | **0.0476** | **0; sums in [e^-44.2, e^65.1]** |
 
-Why: a constant max c is exact only while every row's exponentials exp(score - c) and their sums stay
-representable, roughly while each row's largest scaled score lies between c - 85 and c + 78.
-`FAST_CMAX` picked its layers and constants from a per-head bound on the scores computed from the
-QK-norm weights, sqrt(d) * max|g_q| * max|g_k|. That bound would hold if the RMSNorm ran per head;
-Wan's `norm_q` / `norm_k` normalize all 24 heads together, so one head can carry most of the norm
-and its scores can reach 24 times the bound. Nothing checked the scores at run time: on the 14B
-model the same kernel produced a NaN video (low-noise expert, layer 2, head 23: scaled score 433
-against a weight bound of 31.7), and on this model it was validated on one clip only. An overflow
-gives inf / NaN; an underflow hits the kernel's 1e-30 floor on the sum and scales the row toward 0
-without an error. Const-max comes back once the kernel checks every row's softmax sum and the
-pipeline recomputes any out-of-range call with exact attention.
+Video vs the exact run: 21.5 dB for the new default, 21.2 dB for the previous one (worst frames 19.7
+/ 19.3, accumulation order over 10 steps); frames 20, 50 and 80 show the same content.
+
+Tests:
+- `scripts/validate/cmax_check_bench.py` (one core, 6 x 7854 x 128, both const-max kernels): the
+  checked kernel's output is bitwise equal to the unchecked one's in every case, and its count of
+  rows outside the band matches an fp64 CPU reference per partition: random inputs 0 / 0; 64
+  tokens' q scaled up 40x 384 / 384 (their S overflows to inf); c = 69 (sums near e^-59.5) 0 / 0;
+  c = 75 (every sum below the band) 47124 / 47124; one token's q NaN 6 / 6 (one row per head).
+  Kernel time 3.259 -> 3.259 ms with the constant as in the pipeline.
+- Forced failure (`CMAX_CHECK_BAND=-60,-59.9`, so every row fails): run 1 flagged all 29 layers,
+  switched them to exact attention and ran again; runs 2 and 3 run exact (7.2 / 7.3 s). The final
+  latent and frames are byte-identical to the `attention_cte` run's.
+- `CMAX_CHECK=0` keeps the unchecked kernels with the bound constants: latent and frames
+  byte-identical to the previous default's (6.8 / 7.0 s). `FAST_CMAX=0`: byte-identical to the
+  `attention_cte` run before this change (7.1 / 7.3 s).
+- Block bench, layer 0 (`sp_a2o`, the pipeline's layout): 17.34 ms checked vs 17.39 ms before the
+  change, rel-RMS vs the unsharded block 0.00541 / 0.00542; with the merged cross-attention
+  (`XMERGE=30`) 17.19 ms. `BB_DROP=attn` with `XMERGE=30`: 13.16 / 13.17 ms, same output. (`sp`,
+  and `BB_DROP=attn` without `XMERGE`, fail the same way before and after this change.)
 
 ## `loop_engineering` branch (2026-10-28), 704x544, 81 frames, TP over 8 ranks LNC1
 

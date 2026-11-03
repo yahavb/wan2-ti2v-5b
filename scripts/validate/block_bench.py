@@ -46,6 +46,17 @@ L = GRID[0] * GRID[1] * GRID[2]
 B, DIM, FFN, HEADS, D, LC = 2, 3072, 14336, 24, 128, 512
 
 
+class _BlockOut(torch.nn.Module):
+    """A CMAX_CHECK block (which takes and returns its row-sum stats) as a plain block: output only."""
+
+    def __init__(self, unit, gst):
+        super().__init__()
+        self.unit, self.gst = unit, gst
+
+    def forward(self, *args):
+        return self.unit(*args, gst=self.gst)[0]
+
+
 def _apply_drops(drops, unit, fd):
     """BB_DROP=<a,b,...> (sp variants, FAST_QK_PREP path): take parts out of the block to time them in
     place (the math is wrong; timing probes only; keep the data finite: the chip runs at its power
@@ -69,10 +80,12 @@ def _apply_drops(drops, unit, fd):
         elif name == "ar":
             fd._all_reduce = lambda t: t
         elif name == "attn":
-            unit.k_cmax = lambda qn, kn, vn, m, s: vn
+            # CMAX_CHECK: the checked kernels also return their [128, 3] stats (zeros here)
+            chk = (lambda o: (o, o.new_zeros(128, 3, dtype=torch.float32))) if unit.cmax_chk else (lambda o: o)
+            unit.k_cmax = lambda qn, kn, vn, m, s: chk(vn)
             fd._attention_cte = lambda: (lambda q, k, v, scale=None, causal_mask=False: v)
             if unit.k_cmax_qk is not None:  # FAST_CMAX_QK: the fused kernel (its QK-norm + RoPE too) -> v
-                unit.k_cmax_qk = lambda qkv, ss, wq, wk, c, s, m, sc: (
+                unit.k_cmax_qk = lambda qkv, ss, wq, wk, c, s, m, sc: chk(
                     qkv[:c.shape[0], 2 * wq.shape[0]:].reshape(c.shape[0], -1, 2 * c.shape[1]).transpose(0, 1).contiguous())
         elif name == "oT":
             fd._heads_to_tokens = lambda o, n, N, d, Np: F.pad(o.reshape(N, n * d), (0, 0, 0, Np - N))
@@ -305,6 +318,8 @@ def main():
             drops = [s for s in os.environ.get("BB_DROP", "").split(",") if s]
             if drops:
                 _apply_drops(drops, unit, fd)
+            if unit.cmax_chk:  # CMAX_CHECK: the block also takes and returns its row-sum stats
+                unit = _BlockOut(unit, fd.cmax_stats_init(dev))
             yr = F.pad(yr.reshape(N, DIM), (0, 0, 0, Np - N))[shard * S:(shard + 1) * S].float().cpu()
             n_valid = max(0, min(S, N - shard * S))
             yr32 = None

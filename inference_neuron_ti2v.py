@@ -505,64 +505,91 @@ def main():
             from models.device_unipc import DeviceFlowUniPC as _Sched
         else:
             _Sched = FlowUniPCMultistepScheduler
-        sample_scheduler = _Sched(
-            num_train_timesteps=config.num_train_timesteps,
-            shift=1, use_dynamic_shifting=False)
-        sample_scheduler.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
+        def _scheduler():
+            s = _Sched(num_train_timesteps=config.num_train_timesteps, shift=1, use_dynamic_shifting=False)
+            s.set_timesteps(NUM_STEPS, device=torch.device("cpu"), shift=config.sample_shift)
+            return s
+
+        sample_scheduler = _scheduler()
         timesteps = sample_scheduler.timesteps
 
         dump_step0 = None
         run_start = time.time()
         denoise_start = time.time()
-        for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
-            if fast_dit is not None:
-                noise_pred = fast_dit(latent, t)
-            else:
-                latent_model_input = [latent]
+        # CMAX_CHECK (models/fast_dit): the const-max layers count the rows whose softmax sum left the
+        # safe band; if any did (or the latent is not finite), those layers switch to exact attention
+        # and the loop runs again from the same start, so a const-max result is never kept unchecked.
+        cmax_guard = fast_dit is not None and fast_dit.cmax_guarded
+        g_state = seed_g.get_state()
+        while True:
+            if cmax_guard:
+                fast_dit.cmax_reset()
+            for step_idx, t in enumerate(tqdm(timesteps, disable=(rank != 0), desc=run_label)):
+                if fast_dit is not None:
+                    noise_pred = fast_dit(latent, t)
+                else:
+                    latent_model_input = [latent]
 
-                t_device = t.to(NEURON_DEVICE)
-                temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
-                temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
-                timestep = temp_ts.unsqueeze(0)
+                    t_device = t.to(NEURON_DEVICE)
+                    temp_ts = (mask2_device[0][0][:, ::2, ::2] * t_device).flatten()
+                    temp_ts = torch.cat([temp_ts, temp_ts.new_ones(seq_len - temp_ts.size(0)) * t_device])
+                    timestep = temp_ts.unsqueeze(0)
 
-                noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
+                    noise_pred_cond = model(latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = model(latent_model_input, t=timestep, **arg_null)[0]
 
-                guide_scale = config.sample_guide_scale
-                noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+                    guide_scale = config.sample_guide_scale
+                    noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
+
+                if DEVICE_SCHEDULER:
+                    if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
+                        dump_step0 = (latent.cpu(), noise_pred.cpu(), float(t))
+                    latent = sample_scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0),
+                                                   return_dict=False)[0].squeeze(0)
+                    latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
+                    continue
+                # Scheduler step on CPU
+                if STEP_TIMING:
+                    t_s0 = time.perf_counter()
+                noise_pred_cpu = noise_pred.cpu()
+                if STEP_TIMING:
+                    t_s1 = time.perf_counter()
+                if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
+                    dump_step0 = (latent.cpu(), noise_pred_cpu, float(t))  # same input in every config
+                temp_x0 = sample_scheduler.step(
+                    noise_pred_cpu.unsqueeze(0), t,
+                    latent.cpu().unsqueeze(0),
+                    return_dict=False, generator=seed_g)[0]
+                latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
+                latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
+                if STEP_TIMING and rank == 0:
+                    # wait = device still running the DiT when the host asked for the result;
+                    # host = D2H copy + CPU scheduler + H2D copy + mask blend enqueue
+                    t_s2 = time.perf_counter()
+                    logger.info(f"[step {step_idx}] wait for DiT {1e3 * (t_s1 - t_s0):.1f}ms, "
+                                f"host (D2H + scheduler + H2D) {1e3 * (t_s2 - t_s1):.1f}ms")
 
             if DEVICE_SCHEDULER:
-                if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
-                    dump_step0 = (latent.cpu(), noise_pred.cpu(), float(t))
-                latent = sample_scheduler.step(noise_pred.unsqueeze(0), t, latent.unsqueeze(0),
-                                               return_dict=False)[0].squeeze(0)
-                latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
-                continue
-            # Scheduler step on CPU
-            if STEP_TIMING:
-                t_s0 = time.perf_counter()
-            noise_pred_cpu = noise_pred.cpu()
-            if STEP_TIMING:
-                t_s1 = time.perf_counter()
-            if step_idx == 0 and DUMP_DIR and run_idx == NUM_RUNS - 1:
-                dump_step0 = (latent.cpu(), noise_pred_cpu, float(t))  # same input in every config
-            temp_x0 = sample_scheduler.step(
-                noise_pred_cpu.unsqueeze(0), t,
-                latent.cpu().unsqueeze(0),
-                return_dict=False, generator=seed_g)[0]
-            latent = temp_x0.squeeze(0).to(NEURON_DEVICE)
-            latent = (1. - mask2_device[0]) * z_img_device.expand_as(latent) + mask2_device[0] * latent
-            if STEP_TIMING and rank == 0:
-                # wait = device still running the DiT when the host asked for the result;
-                # host = D2H copy + CPU scheduler + H2D copy + mask blend enqueue
-                t_s2 = time.perf_counter()
-                logger.info(f"[step {step_idx}] wait for DiT {1e3 * (t_s1 - t_s0):.1f}ms, "
-                            f"host (D2H + scheduler + H2D) {1e3 * (t_s2 - t_s1):.1f}ms")
-
-        if DEVICE_SCHEDULER:
-            # Nothing in the loop waits for the device any more; wait here so the denoise and VAE
-            # times are each phase's own (the host would otherwise be several steps ahead).
-            torch.neuron.synchronize()
+                # Nothing in the loop waits for the device any more; wait here so the denoise and VAE
+                # times are each phase's own (the host would otherwise be several steps ahead).
+                torch.neuron.synchronize()
+            if not cmax_guard:
+                break
+            ok, failed, report = fast_dit.cmax_verdict(latent)
+            if rank == 0:
+                (logger.info if ok else logger.warning)(f"{run_label} CMAX_CHECK: {report}")
+            if ok or not fast_dit.cmax_fallback(failed):
+                if not ok and rank == 0:
+                    logger.warning(f"{run_label} CMAX_CHECK: still failing with exact attention on every "
+                                   f"layer: the problem is not the constant max")
+                break
+            if rank == 0:
+                logger.warning(f"{run_label} CMAX_CHECK: denoising again with exact attention on {failed or 'all const-max'} layers")
+            latent = latent_orig.clone()
+            seed_g.set_state(g_state)
+            sample_scheduler = _scheduler()
+            timesteps = sample_scheduler.timesteps
+            dump_step0 = None
         denoise_time = time.time() - denoise_start
         if rank == 0:
             logger.info(f"{run_label} denoising: {denoise_time:.1f}s ({denoise_time/NUM_STEPS:.2f}s/step)")

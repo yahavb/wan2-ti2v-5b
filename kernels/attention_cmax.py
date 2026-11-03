@@ -45,6 +45,19 @@ KERNEL=cmaxf).
 The floor on each row's softmax sum is 1e-30 (nkilib: 1e-9): with a constant max m a row's sum is
 about Sk * exp(typical score - m), which falls under 1e-9 once m exceeds ~30 (FAST_CMAX's shifted
 maxima, CMAX_MAX_M); fp32 holds 1e-30.
+
+wan2: check=(ln_lo, ln_hi) (the factories' argument; fast_dit's CMAX_CHECK). A constant max is
+exact only while every row's exponentials stay representable, and no bound from the weights
+guarantees that (the QK-norm runs over all heads, so one head's scores can reach n_heads times the
+per-head weight bound). So the kernel checks its own result: every row's softmax sum S (the ones
+column) must lie in [e^ln_lo, e^ln_hi]. S <= e^78 means no exponential and no partial sum
+overflowed (all terms are positive); S >= e^-60 means the largest term (>= S / Sk) is a normal float
+and the terms lost to underflow are below fp32 rounding. A NaN fails both comparisons. The sums are
+the floored values the normalization already computes (written to a per-call buffer instead of a
+scratch tile, so the output is bitwise the same): the floor (1e-30 = e^-69.1) is below the band, so
+a sum of 0, or a NaN the maximum drops, still fails. The kernel then also returns stats [128, 3]
+f32: per partition, the number of query rows outside the band, the smallest and the largest S
+(padding rows excluded). Callers redo out-of-band calls with exact attention.
 """
 
 import functools
@@ -93,6 +106,14 @@ def attention_cmax(
     _, d_k, Sk = k_hbm.shape
     Sv, d_v = v_hbm.shape[1], v_hbm.shape[2]
     softmax_scale = d ** (-0.5) if softmax_scale == None else softmax_scale
+    _check_args(q_hbm, k_hbm, v_hbm, d, d_k, d_v, Sv, Sk)
+    sm = _prepare_softmax_max(softmax_max)
+    o_hbm = nl.ndarray(shape=(Nq, Sq, d), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
+    _compute(q_hbm, k_hbm, v_hbm, o_hbm, sm, softmax_scale)
+    return o_hbm
+
+
+def _check_args(q_hbm, k_hbm, v_hbm, d, d_k, d_v, Sv, Sk):
     kernel_assert(d == _P, f"d must be pmax (128), got {d}")
     kernel_assert(d_k == d and d_v == d, f"K / V head dims must match Q, got {d_k=}, {d_v=}, {d=}")
     kernel_assert(Sv == Sk, f"V seq length must match K, got {Sv=}, {Sk=}")
@@ -101,10 +122,32 @@ def attention_cmax(
     kernel_assert(nl.num_programs() == 1, "attention_cmax: LNC1 only (one program, all heads)")
     kernel_assert(nisa.get_nc_version() < nisa.nc_version.gen4,
                   "attention_cmax: trn2 only (fp32 scores, Scalar-engine exp)")
-    sm = _prepare_softmax_max(softmax_max)
-    o_hbm = nl.ndarray(shape=(Nq, Sq, d), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
-    _compute(q_hbm, k_hbm, v_hbm, o_hbm, sm, softmax_scale)
-    return o_hbm
+
+
+@functools.lru_cache(maxsize=None)
+def attention_cmax_checked(ln_lo, ln_hi):
+    """attention_cmax with the row-sum check (module docstring): kernel(q, k, v, softmax_max,
+    softmax_scale) -> (o [N, Sq, d] bf16, stats [128, 3] f32)."""
+
+    def kernel(q_hbm, k_hbm, v_hbm, softmax_max, softmax_scale=None):
+        Nq, d, Sq = q_hbm.shape
+        _, d_k, Sk = k_hbm.shape
+        Sv, d_v = v_hbm.shape[1], v_hbm.shape[2]
+        softmax_scale = d ** (-0.5) if softmax_scale == None else softmax_scale
+        _check_args(q_hbm, k_hbm, v_hbm, d, d_k, d_v, Sv, Sk)
+        sm = _prepare_softmax_max(softmax_max)
+        o_hbm = nl.ndarray(shape=(Nq, Sq, d), dtype=q_hbm.dtype, buffer=nl.shared_hbm)
+        st_hbm = nl.ndarray(shape=(_P, 3), dtype=nl.float32, buffer=nl.shared_hbm)
+        _compute(q_hbm, k_hbm, v_hbm, o_hbm, sm, softmax_scale, check=(ln_lo, ln_hi, st_hbm))
+        return o_hbm, st_hbm
+
+    kernel.__name__ = kernel.__qualname__ = _check_name("attention_cmax_chk", ln_lo, ln_hi)
+    return nki.jit(kernel)
+
+
+def _check_name(base, ln_lo, ln_hi):
+    """NKI caches a traced kernel by name and argument shapes, so each band gets its own name."""
+    return f"{base}_{ln_lo:g}_{ln_hi:g}".replace(".", "p").replace("-", "m")
 
 
 def _prepare_softmax_max(softmax_max):
@@ -146,8 +189,8 @@ def _load_v(v_sb, src, rows, d):
              t.ap(pattern=[[stride, last_ext], [1, d]], offset=off + n_full * _P * stride))
 
 
-def _compute(q_hbm, k_hbm, v_hbm, o_hbm, softmax_max, softmax_scale):
-    """q / k [N, d, S], v [N, Sk, d], o [N, Sq, d]."""
+def _compute(q_hbm, k_hbm, v_hbm, o_hbm, softmax_max, softmax_scale, check=None):
+    """q / k [N, d, S], v [N, Sk, d], o [N, Sq, d]; check: (ln_lo, ln_hi, stats [128, 3] HBM) or None."""
     Nq, d, Sq = q_hbm.shape
     Sk = k_hbm.shape[2]
     sets = _buffer_sets(Nq, Sq, Sk, d)
@@ -168,11 +211,11 @@ def _compute(q_hbm, k_hbm, v_hbm, o_hbm, softmax_max, softmax_scale):
     load(0)
     if Nq > 1:
         load(1)
-    _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done)
+    _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done, check)
 
 
 @functools.lru_cache(maxsize=None)
-def attention_cmax_qk_kernel(eps, global_dim):
+def attention_cmax_qk_kernel(eps, global_dim, check=None):
     """FAST_CMAX_QK: models/fast_dit's qk_apply (kernels/qk_prep: QK-norm + RoPE + the head-major
     layouts) folded into attention_cmax, so the Vector engine prepares head h + 1 while the Tensor and
     Scalar engines run head h's attention (qk_apply alone: ~0.75 ms per block, Vector-bound):
@@ -183,7 +226,8 @@ def attention_cmax_qk_kernel(eps, global_dim):
     features with eps. Same per-element operations and roundings as qk_apply (fp32 products, bf16
     after the norm, after the weight and after the rotation), so the output equals qk_apply +
     attention_cmax's. Each configuration gets its own kernel name (NKI's trace cache keys a kernel by
-    name and argument shapes, not closure values)."""
+    name and argument shapes, not closure values). check=(ln_lo, ln_hi): the row-sum check (module
+    docstring); the kernel then returns (o, stats [128, 3] f32)."""
     inv_g = 1.0 / global_dim
 
     def kernel(qkv, ss, wq, wk, cos, sin, softmax_max, softmax_scale=None):
@@ -198,15 +242,21 @@ def attention_cmax_qk_kernel(eps, global_dim):
         kernel_assert(nisa.get_nc_version() < nisa.nc_version.gen4, "attention_cmax_qk: trn2 only")
         sm = _prepare_softmax_max(softmax_max)
         o_hbm = nl.ndarray(shape=(D // d, N, d), dtype=qkv.dtype, buffer=nl.shared_hbm)
-        _compute_qk(qkv, ss, wq, wk, cos, sin, o_hbm, sm, softmax_scale, eps, inv_g)
-        return o_hbm
+        chk = None
+        if check is not None:
+            st_hbm = nl.ndarray(shape=(_P, 3), dtype=nl.float32, buffer=nl.shared_hbm)
+            chk = (check[0], check[1], st_hbm)
+        _compute_qk(qkv, ss, wq, wk, cos, sin, o_hbm, sm, softmax_scale, eps, inv_g, chk)
+        return o_hbm if check is None else (o_hbm, st_hbm)
 
     name = f"attention_cmax_qk_g{global_dim}_e{eps:g}"
+    if check is not None:
+        name = _check_name(name + "_chk", *check)
     kernel.__name__ = kernel.__qualname__ = name.replace(".", "p").replace("-", "m")
     return nki.jit(kernel)
 
 
-def _compute_qk(qkv, ss, wq, wk, cos, sin, o_hbm, softmax_max, softmax_scale, eps, inv_g):
+def _compute_qk(qkv, ss, wq, wk, cos, sin, o_hbm, softmax_max, softmax_scale, eps, inv_g, check=None):
     Np, D3 = qkv.shape
     N, half = cos.shape
     d = 2 * half
@@ -313,12 +363,18 @@ def _compute_qk(qkv, ss, wq, wk, cos, sin, o_hbm, softmax_max, softmax_scale, ep
         place(0, c, prep(0, c))
     if H > 1:
         pending[(1, 0)] = prep(1, 0)
-    _pipeline(H, N, N, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done)
+    _pipeline(H, N, N, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done, check)
 
 
-def _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done):
+def _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_done, check=None):
     """Every (head, query block, KV tile) step in order, MM2 _PROLOGUE steps behind MM1 + exp across
-    block and head boundaries; after each block's normalize + store, on_block_done(global block)."""
+    block and head boundaries; after each block's normalize + store, on_block_done(global block).
+    check: (ln_lo, ln_hi, stats [128, 3] HBM) or None (the row-sum check, module docstring)."""
+    n_ot = div_ceil(Sq, _O_TILE_SIZE)  # output tiles per head
+    sums = None
+    if check is not None:  # wan2: the floored row sums of output tile t of head h in column t * Nq + h
+        sums = nl.ndarray(shape=(_P, n_ot * Nq), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=sums, value=1.0)  # padding rows of each head's last tile: inside the band
     n_kv = div_ceil(Sk, _P)
     last_ext = Sk - (n_kv - 1) * _P  # keys in the last KV tile (1..128)
     blk = nl.tile_size.gemm_moving_fmax  # 512 queries per block: one PSUM bank of fp32 scores
@@ -364,7 +420,10 @@ def _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_d
                            moving=v_sb[0:ext, i, :], accumulate=(i != 0))
         if i == n_kv - 1:  # the block's last MM2: normalize and store it
             for ot in range(n_out):
-                o_tiles[h][b * (blk // _O_TILE_SIZE) + ot, 0].store(_normalize(oa[ot]))
+                t = b * (blk // _O_TILE_SIZE) + ot
+                col = t * Nq + h
+                sum_dst = None if sums is None else sums[0:oa[ot].shape[0], col:col + 1]
+                o_tiles[h][t, 0].store(_normalize(oa[ot], sum_dst))
             on_block_done(g // n_kv)
 
     with nl.no_reorder():
@@ -374,13 +433,51 @@ def _pipeline(Nq, Sq, Sk, d, sets, o_hbm, softmax_max, softmax_scale, on_block_d
                 mm2(g - depth)
         for g in range(G - depth, G):
             mm2(g)
+    if check is not None:
+        _row_sum_check(sums, Nq, n_ot, Sq - (n_ot - 1) * _O_TILE_SIZE, *check)
 
 
-def _normalize(o_aug_psum):
-    """O = O_aug[:, :d] * (1 / max(O_aug[:, d], eps)), straight from PSUM -> [sq_tile, d] bf16 SBUF."""
+def _row_sum_check(sums, Nq, n_ot, last_rows, ln_lo, ln_hi, st_hbm):
+    """wan2: stats[p] = (rows on partition p whose sum is outside [e^ln_lo, e^ln_hi] (NaN included),
+    the smallest and the largest row sum on partition p). sums [128, n_ot * Nq]: column t * Nq + h
+    holds output tile t of head h, so the heads' last (partial) tiles are the last Nq columns; their
+    rows last_rows..127 are padding (1.0, counted as in band, left out of the min / max). Every
+    instruction starts at partition 0."""
+    import math
+    NT = n_ot * Nq
+    lo, hi = math.exp(ln_lo), math.exp(ln_hi)
+    ok = nl.ndarray(shape=(_P, NT), dtype=nl.float32, buffer=nl.sbuf)
+    ok_hi = nl.ndarray(shape=(_P, NT), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=ok, data=sums, op0=nl.greater_equal, operand0=lo)
+    nisa.tensor_scalar(dst=ok_hi, data=sums, op0=nl.less_equal, operand0=hi)
+    nisa.tensor_tensor(dst=ok, data1=ok, data2=ok_hi, op=nl.multiply)
+    n_ok = nl.ndarray(shape=(_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=n_ok, op=nl.add, data=ok, axis=1, keepdims=True)
+    st = nl.ndarray(shape=(_P, 3), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=st[:, 0:1], data=n_ok, op0=nl.multiply, operand0=-1.0, op1=nl.add,
+                       operand1=float(NT))
+    full = NT if last_rows == _P else NT - Nq  # columns whose 128 rows are all real
+    for j, op in ((1, nl.minimum), (2, nl.maximum)):
+        if full > 0:
+            nisa.tensor_reduce(dst=st[:, j:j + 1], op=op, data=sums[:, 0:full], axis=1, keepdims=True)
+        if full < NT:
+            last = nl.ndarray(shape=(_P, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=last[0:last_rows], op=op, data=sums[0:last_rows, full:NT], axis=1,
+                               keepdims=True)
+            if full > 0:
+                nisa.tensor_tensor(dst=st[0:last_rows, j:j + 1], data1=st[0:last_rows, j:j + 1],
+                                   data2=last[0:last_rows], op=op)
+            else:
+                nisa.tensor_copy(dst=st[0:last_rows, j:j + 1], src=last[0:last_rows])
+    nisa.dma_copy(dst=st_hbm, src=st)
+
+
+def _normalize(o_aug_psum, sum_dst=None):
+    """O = O_aug[:, :d] * (1 / max(O_aug[:, d], eps)), straight from PSUM -> [sq_tile, d] bf16 SBUF.
+    sum_dst: where the floored sums go (the row-sum check's buffer), else a scratch tile."""
     sq_tile = o_aug_psum.shape[0]
     d = o_aug_psum.shape[1] - 1
-    sum_exp = nl.ndarray(shape=(sq_tile, 1), dtype=nl.float32, buffer=nl.sbuf)
+    sum_exp = nl.ndarray(shape=(sq_tile, 1), dtype=nl.float32, buffer=nl.sbuf) if sum_dst is None else sum_dst
     nisa.tensor_scalar(dst=sum_exp, data=o_aug_psum[:, d:d + 1], op0=nl.maximum, operand0=_EPS)
     inv = nl.ndarray(shape=(sq_tile, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.reciprocal(dst=inv, data=sum_exp)
