@@ -14,6 +14,10 @@ _USE_NKI_VAE = os.environ.get("USE_NKI_VAE", "1") == "1"
 # VAE_COMPILE=1: torch.compile the decoder per latent-frame chunk (a handful of graphs:
 # first chunk, second chunk, steady state -- the causal feat_cache changes shape twice).
 _VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
+# VAE_COMPILE_ROLLED=1: compile ONE ResidualBlock body as a pure function and reuse it for every
+# block (a rolled loop), instead of unrolling the whole decoder into one graph (VAE_COMPILE=1).
+# Same ops as eager (F.normalize RMS_norm, cat + pad + conv3d); the rest of the decoder stays eager.
+_VAE_ROLLED = os.environ.get("VAE_COMPILE_ROLLED", "0") == "1"
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
@@ -294,6 +298,49 @@ class Resample(nn.Module):
         nn.init.zeros_(conv.bias.data)
 
 
+def _rolled_rms(x, gamma, scale):
+    return F.normalize(x, dim=1) * scale * gamma
+
+
+def _rolled_cconv(x, cache, w, b):
+    # CausalConv3d 3x3x3, padding=1: (W, W, H, H, 2 frames front, 0 back), minus cached frames
+    front = 2
+    if cache is not None:
+        x = torch.cat([cache, x], dim=2)
+        front -= cache.shape[2]
+    x = F.pad(x, (1, 1, 1, 1, front, 0))
+    return F.conv3d(x, w, b)
+
+
+def _rolled_newcache(x, old):
+    c = x[:, :, -CACHE_T:, :, :].clone()
+    if c.shape[2] < 2 and old is not None:
+        c = torch.cat([old[:, :, -1, :, :].unsqueeze(2), c], dim=2)
+    return c
+
+
+def _rolled_res_unit(x, c1, c2, g1, s1, w1, b1, g2, s2, w2, b2, wsc, bsc):
+    h = F.conv3d(x, wsc, bsc) if wsc is not None else x
+    y = F.silu(_rolled_rms(x, g1, s1))
+    n1 = _rolled_newcache(y, c1)
+    y = _rolled_cconv(y, c1, w1, b1)
+    y = F.silu(_rolled_rms(y, g2, s2))
+    n2 = _rolled_newcache(y, c2)
+    y = _rolled_cconv(y, c2, w2, b2)
+    return y + h, n1, n2
+
+
+_rolled_res_compiled = None
+
+
+def _rolled_res(*args):
+    global _rolled_res_compiled
+    if _rolled_res_compiled is None:
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        _rolled_res_compiled = torch.compile(_rolled_res_unit, backend="neuron", dynamic=False)
+    return _rolled_res_compiled(*args)
+
+
 class ResidualBlock(nn.Module):
 
     def __init__(self, in_dim, out_dim, dropout=0.0):
@@ -316,6 +363,18 @@ class ResidualBlock(nn.Module):
             if in_dim != out_dim else nn.Identity())
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
+        if _VAE_ROLLED and feat_cache is not None:
+            r = self.residual
+            sc = self.shortcut if isinstance(self.shortcut, CausalConv3d) else None
+            i = feat_idx[0]
+            out, n1, n2 = _rolled_res(
+                x, feat_cache[i], feat_cache[i + 1],
+                r[0].gamma, r[0].scale, r[2].weight, r[2].bias,
+                r[3].gamma, r[3].scale, r[6].weight, r[6].bias,
+                sc.weight if sc is not None else None, sc.bias if sc is not None else None)
+            feat_cache[i], feat_cache[i + 1] = n1, n2
+            feat_idx[0] += 2
+            return out
         h = self.shortcut(x)
         for layer in self.residual:
             if isinstance(layer, CausalConv3d) and feat_cache is not None:
