@@ -18,6 +18,19 @@ _VAE_COMPILE = os.environ.get("VAE_COMPILE", "0") == "1"
 # block (a rolled loop), instead of unrolling the whole decoder into one graph (VAE_COMPILE=1).
 # Same ops as eager (F.normalize RMS_norm, cat + pad + conv3d); the rest of the decoder stays eager.
 _VAE_ROLLED = os.environ.get("VAE_COMPILE_ROLLED", "0") == "1"
+# VAE_FIX_UPSAMPLE=1: 2x nearest upsample as repeat_interleave (a plain copy) instead of
+#   nn.Upsample, which the compiler lowers to a gather (indirect DMA issued by GpSimd).
+# VAE_FIX_RMS=1: RMS_norm as x * rsqrt(sum(x^2)) instead of F.normalize, which the compiler
+#   lowers to a GpSimd cross-lane reduce.
+_VAE_FIX_UPSAMPLE = os.environ.get("VAE_FIX_UPSAMPLE", "0") == "1"
+_VAE_FIX_RMS = os.environ.get("VAE_FIX_RMS", "0") == "1"
+
+
+def _l2_normalize(x, dim):
+    if _VAE_FIX_RMS:
+        ss = (x.float() * x.float()).sum(dim=dim, keepdim=True)
+        return (x.float() * torch.rsqrt(torch.clamp(ss, min=1e-24))).to(x.dtype)
+    return F.normalize(x, dim=dim)
 _nki_conv2d_k1 = None
 _nki_conv2d_k3 = None
 _nki_self_attn = None
@@ -163,7 +176,7 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return (F.normalize(x, dim=(1 if self.channel_first else -1)) *
+        return (_l2_normalize(x, dim=(1 if self.channel_first else -1)) *
                 self.scale * self.gamma + self.bias)
 
 
@@ -173,6 +186,10 @@ class Upsample(nn.Upsample):
         """
         Fix bfloat16 support for nearest neighbor interpolation.
         """
+        if _VAE_FIX_UPSAMPLE and x.dim() == 4 and tuple(self.scale_factor) == (2.0, 2.0) \
+                and self.mode in ("nearest", "nearest-exact"):
+            # exact for integer 2x: output pixel i reads input pixel i // 2
+            return x.repeat_interleave(2, dim=2).repeat_interleave(2, dim=3)
         return super().forward(x.float()).type_as(x)
 
 
@@ -299,7 +316,7 @@ class Resample(nn.Module):
 
 
 def _rolled_rms(x, gamma, scale):
-    return F.normalize(x, dim=1) * scale * gamma
+    return _l2_normalize(x, dim=1) * scale * gamma
 
 
 def _rolled_cconv(x, cache, w, b):
