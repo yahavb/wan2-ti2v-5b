@@ -26,8 +26,8 @@ _VAE_FIX_UPSAMPLE = os.environ.get("VAE_FIX_UPSAMPLE", "0") == "1"
 _VAE_FIX_RMS = os.environ.get("VAE_FIX_RMS", "0") == "1"
 
 
-def _l2_normalize(x, dim):
-    if _VAE_FIX_RMS:
+def _l2_normalize(x, dim, fix=None):
+    if _VAE_FIX_RMS if fix is None else fix:
         ss = (x.float() * x.float()).sum(dim=dim, keepdim=True)
         return (x.float() * torch.rsqrt(torch.clamp(ss, min=1e-24))).to(x.dtype)
     return F.normalize(x, dim=dim)
@@ -176,7 +176,10 @@ class RMS_norm(nn.Module):
         self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
 
     def forward(self, x):
-        return (_l2_normalize(x, dim=(1 if self.channel_first else -1)) *
+        # VAE_FIX_RMS applies only where _decoder_rms is set (the decoder), so the encoder's
+        # conditioning latent, and therefore the generated video, stays bit-identical.
+        return (_l2_normalize(x, dim=(1 if self.channel_first else -1),
+                              fix=_VAE_FIX_RMS and getattr(self, "_decoder_rms", False)) *
                 self.scale * self.gamma + self.bias)
 
 
@@ -316,7 +319,7 @@ class Resample(nn.Module):
 
 
 def _rolled_rms(x, gamma, scale):
-    return _l2_normalize(x, dim=1) * scale * gamma
+    return _l2_normalize(x, dim=1, fix=_VAE_FIX_RMS) * scale * gamma   # decoder only
 
 
 def _rolled_cconv(x, cache, w, b):
@@ -889,6 +892,9 @@ class Decoder3d(nn.Module):
             nn.SiLU(),
             CausalConv3d(out_dim, 12, 3, padding=1),
         )
+        for m in self.modules():
+            if isinstance(m, RMS_norm):
+                m._decoder_rms = True
 
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         if feat_cache is not None:
