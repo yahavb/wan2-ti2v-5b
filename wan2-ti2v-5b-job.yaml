@@ -25,6 +25,7 @@ spec:
             - /bin/bash
             - "-exc"
             - |
+              [ -f /opt/neuron-top-patch/neuron-monitor-top.py ] && install -m 755 /opt/neuron-top-patch/neuron-monitor-top.py "$(command -v neuron-monitor-top.py || echo /opt/aws/neuron/bin/neuron-monitor-top.py)" 2>/dev/null && echo "neuron-top: patched (preview)" || true   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
               set -euxo pipefail
 
               cd /tmp
@@ -140,6 +141,7 @@ spec:
               memory: 900Gi
               ephemeral-storage: 200Gi
           volumeMounts:
+            - {name: neuron-top-patch, mountPath: /opt/neuron-top-patch, readOnly: true}   # neuron-top-patch
             - name: dshm
               mountPath: /dev/shm
             #- name: 621547421844-ap-southeast-4-pvc
@@ -213,6 +215,8 @@ spec:
                   name: github-token
                   key: GITHUB_TOKEN
       volumes:
+        - name: neuron-top-patch   # neuron-top-patch: temporary, remove when the updated neuron-top ships in the Neuron SDK
+          configMap: {name: neuron-top-patch, optional: true}
         - name: dshm
           emptyDir:
             medium: Memory
