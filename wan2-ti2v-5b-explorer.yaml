@@ -23,7 +23,7 @@ spec:
     node-type: trn2
   containers:
     - name: explorer
-      image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+      image: public.ecr.aws/neuron/torch-neuronx:2.14.0-neuronx-py314-sdk2.33.0-ubuntu26.04
       imagePullPolicy: IfNotPresent
       command:
         - /bin/bash
